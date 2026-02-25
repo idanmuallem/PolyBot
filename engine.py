@@ -1,136 +1,238 @@
 # engine.py
-import asyncio
-import requests
-import re
-from datetime import datetime, timezone
-from py_clob_client.client import ClobClient
-from brain import calculate_fair_value, calculate_ev
+"""
+Engine: Lightweight orchestrator for the quantitative trading bot.
 
-def find_best_bitcoin_market(bad_ids=None):
-    """Hunts the CLOB API for an ACTIVE Bitcoin market, ignoring bad/closed ones."""
-    if bad_ids is None:
-        bad_ids = []
-        
-    cursor = ""
-    
-    for _ in range(15):  # Scan up to 15 pages deep
-        url = "https://clob.polymarket.com/markets"
-        params = {"next_cursor": cursor} if cursor else {}
-        
-        try:
-            resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code != 200:
-                break
-                
-            data = resp.json()
-            market_list = data.get('data', [])
-            
-            for m in market_list:
-                # 🛑 THE FIX: Ignore markets that are closed, archived, or halted
-                if not m.get('active') or m.get('closed') or not m.get('accepting_orders'):
-                    continue
-                    
-                question = m.get('question', m.get('description', ''))
-                
-                if 'Bitcoin' in question or 'BTC' in question:
-                    tokens = m.get('tokens', [])
-                    
-                    if isinstance(tokens, list) and len(tokens) >= 2:
-                        yes_token = None
-                        
-                        for t in tokens:
-                            if str(t.get('outcome', '')).lower() == 'yes':
-                                yes_token = str(t.get('token_id'))
-                                break
-                        
-                        if not yes_token:
-                            yes_token = str(tokens[0].get('token_id'))
-                            
-                        # 🛑 THE FIX: Ignore IDs that previously caused a 404 error
-                        if yes_token in bad_ids:
-                            continue
-                            
-                        strike = 100000.0
-                        price_match = re.search(r'\$(\d{1,3}(?:,\d{3})*)', question)
-                        if price_match:
-                            strike = float(price_match.group(1).replace(',', ''))
-                            
-                        return {
-                            "id": yes_token,
-                            "strike": strike,
-                            "question": question
-                        }
-                        
-            cursor = data.get('next_cursor')
-            if not cursor or cursor == "LTE=":
-                break
-                
-        except Exception as e:
-            print(f"❌ CLOB Scan Error: {e}")
-            break
-            
-    return None
+Responsibilities:
+- Instantiate hunters, brains, and executor
+- Run the main event loop (hunt -> get_live_truth -> price -> execute -> update UI)
+- Coordinate between components
+
+Data fetching:   delegated to Hunters (via get_live_truth)
+Trade execution: delegated to TradeExecutor
+Fair value calc: delegated to Brains
+"""
+
+import asyncio
+import time
+from datetime import datetime, timezone
+import os
+
+# Load .env automatically when present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+from curl_cffi import requests as crequests
+
+from hunters import get_default_hunters
+from brains import get_brain_for_asset_type
+from executor import TradeExecutor, RiskConfig
+
+ROTATION_INTERVAL = 900  # Re-scan for the best market every 15 minutes
+
 
 async def run_market_monitor(bridge, log_func):
-    client = ClobClient(host="https://clob.polymarket.com")
-    failed_ids = [] # The Blacklist memory
-    
-    bridge.status = "📡 Scanning Orderbook for ACTIVE Markets..."
-    market = find_best_bitcoin_market(failed_ids)
-    
-    if not market:
-        bridge.status = "❌ No Active BTC Markets Found"
-        return
+    """Main orchestration loop.
 
-    TOKEN_ID = market['id']
-    STRIKE_PRICE = market['strike']
-    EXPIRY_DATE = datetime(2026, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+    Delegates responsibilities:
+    - Hunters: market discovery & live data fetching
+    - Brains:  fair value calculation
+    - Executor: trade execution & risk management
 
-    bridge.status = f"🎯 Found: {market['question'][:30]}..."
+    Args:
+        bridge: State container with UI properties (status, market_poly, forecast, etc.)
+        log_func: Logging callback function
+    """
+    # ========================================
+    # SETUP: Initialize components
+    # ========================================
+    hunters = get_default_hunters()
+    executor = TradeExecutor(risk_config=RiskConfig(ev_threshold=0.15))
+
+    print(f"[ENGINE] Initialized {len(hunters)} hunters and TradeExecutor")
+    print(f"[ENGINE] EV threshold: {executor.risk_config.ev_threshold}")
 
     while True:
+        # ========================================
+        # PHASE 1: HUNT
+        # ========================================
+        market = None
+
+        for hunter in hunters:
+            hunter_name = hunter.__class__.__name__
+            print(f"[ENGINE] Trying {hunter_name}...")
+            market = hunter.hunt()
+
+            if market:
+                print(f"[ENGINE] {hunter_name} found: {market.get('market_id')}")
+                break
+
+        if not market:
+            bridge.status = "❌ No markets found. Waiting 60s..."
+            await asyncio.sleep(60)
+            continue
+
+        # ========================================
+        # PHASE 2: EXTRACT MARKET METADATA
+        # ========================================
+        TOKEN_ID = market.get("market_id")
+        STRIKE = market.get("strike_price")
+        ASSET_TYPE = market.get("asset_type")
+        QUESTION = market.get("question")
+
+        bridge.status = f"🎯 Tracking: {ASSET_TYPE} - {QUESTION[:40]}..."
+        print(f"[ENGINE] Tracking {ASSET_TYPE} => {TOKEN_ID} (strike {STRIKE})")
+
+        # ========================================
+        # PHASE 3: SELECT BRAIN
+        # ========================================
         try:
-            # 1. Fetch live Polymarket Orderbook Price
-            mid_data = client.get_midpoint(TOKEN_ID)
-            bridge.market_poly = float(mid_data.get('mid', 0.50))
-            
-            # 2. Fetch live Binance Price
-            res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
-            bridge.market_actual = float(res.json()['price'])
-            
-            # 3. Brain Calculation
-            now = datetime.now(timezone.utc)
-            days_left = max(0.01, (EXPIRY_DATE - now).total_seconds() / 86400)
-            bridge.forecast = calculate_fair_value(bridge.market_actual, STRIKE_PRICE, days_left)
-            
-            # 4. Dashboard Updates
-            bridge.ev = calculate_ev(bridge.market_poly, bridge.forecast)
-            bridge.last_update = now.strftime("%H:%M:%S")
-            bridge.status = f"🟢 Tracking: ${STRIKE_PRICE:,.0f} Market"
+            brain = get_brain_for_asset_type(ASSET_TYPE)
+            brain_name = brain.__class__.__name__
+            print(f"[ENGINE] Using {brain_name}")
+        except ValueError as e:
+            print(f"[ENGINE] Error: {e}")
+            continue
 
-            if bridge.automation_enabled and bridge.ev > 0.15:
-                log_func(f"BTC>{STRIKE_PRICE}", "BUY", bridge.market_poly, 10, "AUTO")
+        start_time = time.time()
+        EXPIRY_DATE = None
 
-            await asyncio.sleep(2)
-            
-        except Exception as e:
-            err_msg = str(e)
-            print(f"Loop Error: {err_msg}")
-            
-            # --- FIXED SELF HEALING LOGIC ---
-            if "404" in err_msg or "No orderbook" in err_msg:
-                print(f"Banning Bad ID: {TOKEN_ID[:10]}...")
-                failed_ids.append(TOKEN_ID) # Add the broken ID to the Blacklist
-                bridge.status = "⚠️ Market Expired. Hunting next..."
-                
-                # Hunt again, passing the blacklist so it finds a DIFFERENT market
-                new_market = find_best_bitcoin_market(failed_ids)
-                if new_market:
-                    TOKEN_ID = new_market['id']
-                    STRIKE_PRICE = new_market['strike']
+        # ========================================
+        # PHASE 4: LIVE TRACKING LOOP
+        # ========================================
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > ROTATION_INTERVAL:
+                print("[ENGINE] Rotation interval reached, re-hunting...")
+                break
+
+            try:
+                # --- A. Fetch Polymarket mid price ---
+                mid_url = f"https://clob.polymarket.com/midpoint?token_id={TOKEN_ID}"
+                mid_res = crequests.get(mid_url, impersonate="chrome120", timeout=5)
+                poly_price = float(mid_res.json().get("mid", 0.50))
+                bridge.market_poly = poly_price
+
+                # --- B. Fetch live value (delegated to hunter) ---
+                live_truth = _get_live_truth_via_hunter(hunter, market, ASSET_TYPE, log_func)
+                if live_truth is None:
+                    live_truth = 0.0
+
+                # --- C. Compute time to expiry ---
+                now = datetime.now(timezone.utc)
+                if EXPIRY_DATE:
+                    days_left = max(0.01, (EXPIRY_DATE - now).total_seconds() / 86400)
                 else:
-                    bridge.status = "❌ Exhausted all BTC markets."
-            else:
-                bridge.status = f"⚠️ Lag: {err_msg[:15]}..."
-                
-            await asyncio.sleep(5)
+                    days_left = 7.0  # default
+
+                # --- D. Calculate fair value (delegated to brain) ---
+                fair_value = _get_fair_value_from_brain(brain, ASSET_TYPE, live_truth, STRIKE, days_left)
+                bridge.forecast = fair_value
+
+                # --- E. Calculate EV ---
+                ev = calculate_ev(poly_price, fair_value)
+                bridge.ev = ev
+
+                # --- F. Delegate execution decision to executor ---
+                executor.evaluate_and_execute(
+                    market=market,
+                    fair_value=fair_value,
+                    ev=ev,
+                    current_poly_price=poly_price,
+                    log_func=log_func,
+                )
+
+                # --- G. Update UI ---
+                bridge.last_update = now.strftime("%H:%M:%S")
+                bridge.status = f"Tracking {ASSET_TYPE}: live={live_truth:.2f} forecast={fair_value:.3f} EV={ev:.3f}"
+                log_func("TRACK", ASSET_TYPE, TOKEN_ID, {"fair": round(fair_value, 4), "ev": round(ev, 4)})
+
+                await asyncio.sleep(2)
+
+            except Exception as e:
+                print(f"[ENGINE] Live update error: {e}")
+                await asyncio.sleep(5)
+
+
+def _get_live_truth_via_hunter(
+    hunter,
+    market: dict,
+    asset_type: str,
+    log_func,
+) -> float:
+    """Fetch live truth via the hunter's get_live_truth method.
+
+    This encapsulates API calling logic away from the engine.
+
+    Args:
+        hunter: The active hunter instance
+        market: Market dict from hunt()
+        asset_type: Asset type string
+        log_func: Logging callback
+
+    Returns:
+        Live value or None on error
+    """
+    try:
+        live_truth = hunter.get_live_truth(market)
+        if live_truth is not None:
+            print(f"[ENGINE] Live truth for {asset_type}: {live_truth}")
+        return live_truth
+    except Exception as e:
+        print(f"[ENGINE] Error getting live truth: {e}")
+        log_func("ERROR", asset_type, "N/A", str(e))
+        return None
+
+
+def _get_fair_value_from_brain(
+    brain,
+    asset_type: str,
+    live_truth: float,
+    strike: float,
+    days_left: float,
+) -> float:
+    """Calculate fair value via the brain's get_fair_value method.
+
+    Extracts symbol/location/indicator and passes to brain.
+
+    Args:
+        brain: The active brain instance
+        asset_type: Asset type string (e.g., "Crypto::BTCUSDT")
+        live_truth: Current market value
+        strike: Strike price
+        days_left: Days to expiry
+
+    Returns:
+        Fair value probability
+    """
+    try:
+        if asset_type.startswith("Crypto::"):
+            symbol = asset_type.split("::", 1)[1]
+            return brain.get_fair_value(live_truth, strike, days_left, symbol=symbol)
+        elif asset_type.startswith("Weather::"):
+            return brain.get_fair_value(live_truth, strike, days_left)
+        elif asset_type.startswith("Economy::"):
+            indicator = asset_type.split("::", 1)[1]
+            return brain.get_fair_value(live_truth, strike, days_left, indicator=indicator)
+        else:
+            return 0.5
+    except Exception as e:
+        print(f"[ENGINE] Error calculating fair value: {e}")
+        return 0.5
+
+
+def calculate_ev(market_price: float, fair_value: float) -> float:
+    """Calculate expected value.
+
+    Args:
+        market_price: Current Polymarket mid price
+        fair_value: Our calculated fair value
+
+    Returns:
+        Expected value as a fraction
+    """
+    if market_price <= 0:
+        return 0.0
+    return (fair_value - market_price) / market_price
