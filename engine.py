@@ -33,11 +33,39 @@ from executor import TradeExecutor, RiskConfig
 ROTATION_INTERVAL = 900  # Re-scan for the best market every 15 minutes
 
 
+class MarketMonitor:
+    """State keeper for the market monitoring engine.
+    
+    Maintains cooldown cache and execution state across hunt cycles.
+    """
+    
+    def __init__(self):
+        self.seen_markets = {}  # market_id: timestamp dictionary for 10-min cooldown
+    
+    def _get_active_seen_ids(self) -> list:
+        """Return list of market_ids currently in cooldown (< 10 minutes old).
+        
+        Removes expired entries (>= 600 seconds old) from the cache.
+        
+        Returns:
+            List of market_ids that should be skipped in current hunt.
+        """
+        current_time = time.time()
+        expired_ids = [
+            mid for mid, ts in self.seen_markets.items()
+            if current_time - ts >= 600  # 10 minutes = 600 seconds
+        ]
+        for mid in expired_ids:
+            del self.seen_markets[mid]
+        
+        return list(self.seen_markets.keys())
+
+
 async def run_market_monitor(bridge, log_func):
     """Main orchestration loop.
 
     Delegates responsibilities:
-    - Hunters: market discovery & live data fetching
+    - Hunters: market discovery & live data fetching (respecting cooldown cache)
     - Brains:  fair value calculation
     - Executor: trade execution & risk management
 
@@ -50,20 +78,22 @@ async def run_market_monitor(bridge, log_func):
     # ========================================
     hunters = get_default_hunters()
     executor = TradeExecutor(risk_config=RiskConfig(ev_threshold=0.15))
+    monitor = MarketMonitor()  # Initialize cooldown cache
 
     print(f"[ENGINE] Initialized {len(hunters)} hunters and TradeExecutor")
     print(f"[ENGINE] EV threshold: {executor.risk_config.ev_threshold}")
 
     while True:
         # ========================================
-        # PHASE 1: HUNT
+        # PHASE 1: HUNT (with cooldown awareness)
         # ========================================
         market = None
+        skip_ids = monitor._get_active_seen_ids()  # Get list of markets in cooldown
 
         for hunter in hunters:
             hunter_name = hunter.__class__.__name__
-            print(f"[ENGINE] Trying {hunter_name}...")
-            market = hunter.hunt()
+            print(f"[ENGINE] Trying {hunter_name}... (skipping {len(skip_ids)} cooldown markets)")
+            market = hunter.hunt(skip_ids=skip_ids)  # Pass cooldown list to hunter
 
             if market:
                 print(f"[ENGINE] {hunter_name} found: {market.get('market_id')}")
@@ -139,7 +169,15 @@ async def run_market_monitor(bridge, log_func):
                 ev = calculate_ev(poly_price, fair_value)
                 bridge.ev = ev
 
-                # --- F. Delegate execution decision to executor ---
+                # --- F. Check EV threshold and manage cooldown ---
+                if ev < executor.risk_config.ev_threshold:
+                    # Low EV: Add to cooldown cache and re-hunt
+                    monitor.seen_markets[TOKEN_ID] = time.time()
+                    print(f"[ENGINE] Market {TOKEN_ID} has low EV ({ev:.4f} < {executor.risk_config.ev_threshold}). Entering 10m cooldown. Searching for new targets...")
+                    bridge.status = f"⏸️ Low EV on {ASSET_TYPE}. Entering 10m cooldown..."
+                    break  # Exit tracking loop, go back to hunt phase
+                
+                # --- G. Delegate execution decision to executor ---
                 executor.evaluate_and_execute(
                     market=market,
                     fair_value=fair_value,
@@ -148,7 +186,7 @@ async def run_market_monitor(bridge, log_func):
                     log_func=log_func,
                 )
 
-                # --- G. Update UI ---
+                # --- H. Update UI ---
                 bridge.last_update = now.strftime("%H:%M:%S")
                 # Ensure dashboard shows the specific market question and asset
                 bridge.status = f"🎯 {ASSET_TYPE}: {QUESTION}"

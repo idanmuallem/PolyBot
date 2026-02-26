@@ -38,8 +38,14 @@ class BaseHunter(ABC):
         self.polymarket_base = polymarket_base
 
     @abstractmethod
-    def hunt(self) -> Optional[Dict[str, Any]]:
+    def hunt(self, skip_ids: list = None) -> Optional[Dict[str, Any]]:
         """Hunt for a market matching this hunter's domain.
+        
+        The skip_ids parameter allows the engine to exclude markets currently in cooldown,
+        forcing the hunter to explore alternative opportunities (e.g., Bitcoin 70k instead of 68k).
+
+        Args:
+            skip_ids: List of market_ids to skip (in cooldown). If None, defaults to [].
 
         Returns:
             A dict with keys:

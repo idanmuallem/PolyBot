@@ -189,6 +189,24 @@ class WeatherHunter(BaseHunter):
                         question = market.get("question", "")
                         current_price = float(market.get("lastTradePrice", 0) or 0)
 
+                        # Rule 0: Get token ID early for skip_ids check
+                        tokens = market.get("clobTokenIds")
+                        if isinstance(tokens, str):
+                            try:
+                                tokens = json.loads(tokens)
+                            except Exception:
+                                tokens = None
+
+                        if not (isinstance(tokens, list) and tokens):
+                            continue
+                        
+                        market_id = str(tokens[0]).strip()
+                        
+                        # Skip markets in cooldown cache
+                        if market_id in skip_ids:
+                            print(f"[WeatherHunter] Skipping {market_id} (in 10m cooldown)")
+                            continue
+
                         # Rule 1: Price floor filter - reject markets below $0.18
                         if current_price < self.PRICE_FLOOR:
                             continue
@@ -262,16 +280,7 @@ class WeatherHunter(BaseHunter):
                         if valid_strike is None:
                             continue
 
-                        # Rule 4: Get token ID
-                        tokens = market.get("clobTokenIds")
-                        if isinstance(tokens, str):
-                            try:
-                                tokens = json.loads(tokens)
-                            except Exception:
-                                tokens = None
-
-                        if not (isinstance(tokens, list) and tokens):
-                            continue
+                        # Rule 4: Token ID already extracted above for skip_ids check
 
                         # Rule 5: Extract volume and enforce MIN_VOLUME
                         volume = float(market.get("volume", 0) or 0)
@@ -309,15 +318,22 @@ class WeatherHunter(BaseHunter):
 
         return best_market
 
-    def hunt(self) -> Optional[Dict[str, Any]]:
+    def hunt(self, skip_ids: list = None) -> Optional[Dict[str, Any]]:
         """Hunt for a weather market.
 
         If API key is not set, return None immediately without attempting to hunt.
         Otherwise, tries each location in order. Returns the first valid market found.
+        Respects skip_ids list to avoid markets in 10-minute cooldown.
+
+        Args:
+            skip_ids: List of market_ids to skip (in cooldown). Defaults to [].
 
         Returns:
             Market dict or None.
         """
+        if skip_ids is None:
+            skip_ids = []
+        
         # Early exit if API key not configured
         if not self.api_key:
             if not hasattr(self, "_hunt_warning_printed"):
@@ -325,7 +341,7 @@ class WeatherHunter(BaseHunter):
                 self._hunt_warning_printed = True
             return None
 
-        print(f"[WeatherHunter] {datetime.now().isoformat()} - Starting hunt for {len(self.locations)} locations")
+        print(f"[WeatherHunter] {datetime.now().isoformat()} - Starting hunt for {len(self.locations)} locations (skipping {len(skip_ids)} cooldown markets)")
 
         for location in self.locations:
             print(f"[WeatherHunter] Trying location: {location}")

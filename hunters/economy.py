@@ -179,21 +179,26 @@ class EconomyHunter(BaseHunter):
 
         return None
 
-    def _scan_polymarket(self, anchor: float, indicator: str, max_pages: int = 5) -> Optional[Dict[str, Any]]:
+    def _scan_polymarket(self, anchor: float, indicator: str, skip_ids: list = None, max_pages: int = 5) -> Optional[Dict[str, Any]]:
         """Scan Polymarket for economy-related markets.
 
         Selection criteria:
         - Price floor: Market price must be >= $0.18 (no longshots)
         - Volume optimization: Among valid markets, select highest volume
+        - Skip cooldown markets: Ignore any market_ids in skip_ids list
 
         Args:
             anchor: Current indicator value
             indicator: Indicator name to match
+            skip_ids: List of market_ids to skip (in cooldown). Defaults to [].
             max_pages: Max pages to scan
 
         Returns:
             Market dict with highest volume, or None if no suitable market found.
         """
+        if skip_ids is None:
+            skip_ids = []
+        
         best_market = None
         highest_volume = 0.0
 
@@ -254,6 +259,24 @@ class EconomyHunter(BaseHunter):
                         # Compose full_text to include grouped/bin titles and market title
                         full_text = f"{market.get('groupItemTitle', '')} {market.get('title', '')} {question}"
 
+                        # Rule 0: Get token ID early for skip_ids check
+                        tokens = market.get("clobTokenIds")
+                        if isinstance(tokens, str):
+                            try:
+                                tokens = json.loads(tokens)
+                            except Exception:
+                                tokens = None
+
+                        if not (isinstance(tokens, list) and tokens):
+                            continue
+                        
+                        market_id = str(tokens[0]).strip()
+                        
+                        # Skip markets in cooldown cache
+                        if market_id in skip_ids:
+                            print(f"[EconomyHunter] Skipping {market_id} (in 10m cooldown)")
+                            continue
+
                         # Rule 1: Price floor filter - reject markets below PRICE_FLOOR
                         if current_price < self.PRICE_FLOOR:
                             continue
@@ -267,16 +290,7 @@ class EconomyHunter(BaseHunter):
                         if valid_strike is None:
                             continue
 
-                        # Rule 4: Get token ID
-                        tokens = market.get("clobTokenIds")
-                        if isinstance(tokens, str):
-                            try:
-                                tokens = json.loads(tokens)
-                            except Exception:
-                                tokens = None
-
-                        if not (isinstance(tokens, list) and tokens):
-                            continue
+                        # Rule 4: Token ID already extracted above for skip_ids check
 
                         # Rule 5: Extract volume and enforce MIN_VOLUME
                         volume = float(market.get("volume", 0) or 0)
@@ -312,15 +326,22 @@ class EconomyHunter(BaseHunter):
 
         return best_market
 
-    def hunt(self) -> Optional[Dict[str, Any]]:
+    def hunt(self, skip_ids: list = None) -> Optional[Dict[str, Any]]:
         """Hunt for an economy market.
 
         Tries each indicator in order. Returns the first valid market found.
+        Respects skip_ids list to avoid markets in 10-minute cooldown.
+
+        Args:
+            skip_ids: List of market_ids to skip (in cooldown). Defaults to [].
 
         Returns:
             Market dict or None.
         """
-        print(f"[EconomyHunter] {datetime.now().isoformat()} - Starting hunt for {len(self.indicators)} indicators")
+        if skip_ids is None:
+            skip_ids = []
+        
+        print(f"[EconomyHunter] {datetime.now().isoformat()} - Starting hunt for {len(self.indicators)} indicators (skipping {len(skip_ids)} cooldown markets)")
 
         for indicator in self.indicators:
             print(f"[EconomyHunter] Trying indicator: {indicator}")
@@ -332,7 +353,7 @@ class EconomyHunter(BaseHunter):
                 continue
 
             # Scan Polymarket
-            found = self._scan_polymarket(anchor_val, indicator)
+            found = self._scan_polymarket(anchor_val, indicator, skip_ids=skip_ids)
 
             if found:
                 series_id = self.FRED_SERIES_MAP.get(indicator, indicator)

@@ -113,23 +113,28 @@ class CryptoHunter(BaseHunter):
 
         return None
 
-    def _scan_polymarket(self, anchor: float, symbol: str, topic_type: str, max_pages: int = 5) -> Optional[Dict[str, Any]]:
+    def _scan_polymarket(self, anchor: float, symbol: str, topic_type: str, skip_ids: list = None, max_pages: int = 5) -> Optional[Dict[str, Any]]:
         """Scan Polymarket for markets matching this crypto anchor.
 
         Selection criteria:
         - Price floor: Market price must be >= $0.18 (no longshots)
         - Strike validation: 0.2 < (strike/anchor) < 5.0
         - Volume optimization: Among valid markets, select highest volume
+        - Skip cooldown markets: Ignore any market_ids in skip_ids list
 
         Args:
             anchor: The anchor price (e.g., BTC/USDT last price)
             symbol: Full trading symbol (e.g., "BTCUSDT") for asset_type
             topic_type: Short string to match in event titles (e.g., "BTC", "ETH")
+            skip_ids: List of market_ids to skip (in cooldown). Defaults to [].
             max_pages: Max pages to scan
 
         Returns:
             Market dict with highest volume, or None if no suitable market found.
         """
+        if skip_ids is None:
+            skip_ids = []
+        
         best_market = None
         highest_volume = 0.0
         lowest_distance = float("inf")
@@ -191,6 +196,24 @@ class CryptoHunter(BaseHunter):
                         if volume == 0:
                             volume = float(market.get("tradingVolume", 0) or 0)
 
+                        # Get token ID early for skip_ids check
+                        tokens = market.get("clobTokenIds")
+                        if isinstance(tokens, str):
+                            try:
+                                tokens = json.loads(tokens)
+                            except Exception:
+                                tokens = None
+
+                        if not (isinstance(tokens, list) and tokens):
+                            continue
+                        
+                        market_id = str(tokens[0]).strip()
+                        
+                        # Skip markets in cooldown cache
+                        if market_id in skip_ids:
+                            print(f"[CryptoHunter] Skipping {market_id} (in 10m cooldown)")
+                            continue
+
                         # Diagnostic logging BEFORE filters (if relevant to BTC/ETH)
                         if any(a in title or a in slug for a in aliases):
                             print(f"[DEBUG] Evaluating: {scannable_text} | Price: {current_price} | Vol: {volume}")
@@ -251,16 +274,7 @@ class CryptoHunter(BaseHunter):
                                 print(f"[DEBUG] Rejected: No valid strike extracted from '{scannable_text}'")
                             continue
 
-                        # Rule 4: Get token ID
-                        tokens = market.get("clobTokenIds")
-                        if isinstance(tokens, str):
-                            try:
-                                tokens = json.loads(tokens)
-                            except Exception:
-                                tokens = None
-
-                        if not (isinstance(tokens, list) and tokens):
-                            continue
+                        # Rule 4: Token ID already extracted above for skip_ids check
 
                         # Rule 5: Enforce minimum volume threshold
                         if volume < self.MIN_VOLUME:
@@ -352,15 +366,22 @@ class CryptoHunter(BaseHunter):
 
         return best
 
-    def hunt(self) -> Optional[Dict[str, Any]]:
+    def hunt(self, skip_ids: list = None) -> Optional[Dict[str, Any]]:
         """Hunt for a crypto market.
 
         Tries each symbol in order. Returns the first valid market found.
+        Respects skip_ids list to avoid markets in 10-minute cooldown.
+
+        Args:
+            skip_ids: List of market_ids to skip (in cooldown). Defaults to [].
 
         Returns:
             Market dict or None.
         """
-        print(f"[CryptoHunter] {datetime.now().isoformat()} - Starting hunt for {len(self.symbols)} symbols")
+        if skip_ids is None:
+            skip_ids = []
+        
+        print(f"[CryptoHunter] {datetime.now().isoformat()} - Starting hunt for {len(self.symbols)} symbols (skipping {len(skip_ids)} cooldown markets)")
 
         # Try each symbol and search using multiple alias terms (Bitcoin/BTC, Ethereum/ETH)
         alias_map = {
@@ -383,7 +404,7 @@ class CryptoHunter(BaseHunter):
 
             for alias in aliases:
                 print(f"[CryptoHunter] Searching Polymarket for alias: {alias}")
-                found = self._scan_polymarket(anchor_price, symbol, alias)
+                found = self._scan_polymarket(anchor_price, symbol, alias, skip_ids=skip_ids)
                 if found:
                     found["anchor_url"] = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
                     print(f"[CryptoHunter] Found market for {symbol} (alias={alias}): {found['market_id']}")
