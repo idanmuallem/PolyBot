@@ -31,6 +31,16 @@ class EconomyHunter(BaseHunter):
         "DFF": "DFF",  # Effective Federal Funds Rate
     }
 
+    # Keyword -> canonical indicator mapping (synonyms)
+    KEYWORD_INDICATOR_MAP = {
+        "inflation": "CPI",
+        "cpi": "CPI",
+        "consumer price": "CPI",
+        "fed funds": "FedRate",
+        "fed rate": "FedRate",
+        "federal funds": "FedRate",
+    }
+
     DEFAULT_INDICATORS = ["FedRate"]
 
     def __init__(self, indicators: Optional[list] = None, **kwargs):
@@ -119,7 +129,7 @@ class EconomyHunter(BaseHunter):
     def _extract_valid_strike(question: str, anchor_val: float) -> Optional[float]:
         """Extract a valid strike from the market question.
 
-        For economy indicators, look for percentage/rate patterns.
+        For economy indicators, look for percentage (e.g., "5.25%") or basis points (e.g., "25 bps").
 
         Args:
             question: Market question text
@@ -128,14 +138,44 @@ class EconomyHunter(BaseHunter):
         Returns:
             Valid strike or None.
         """
-        # Look for percentage/rate patterns like "3.5%", "4.25", etc.
-        matches = re.finditer(r"(\d{1,3}(?:\.\d{1,2})?)\s*(%)?", question)
-        for match in matches:
-            val = float(match.group(1))
+        candidates = []
 
-            # Reasonable strike: within 5 units of current value
-            if abs(val - anchor_val) < 5.0:
-                return val
+        # Pattern 1: Percentage with optional decimal (e.g., "5.25%", "5%", "5.25 percent")
+        pct_pattern = re.compile(r"(\d{1,4}(?:\.\d{1,2})?)\s*(%|percent)")
+        for match in pct_pattern.finditer(question):
+            try:
+                val = float(match.group(1))
+                candidates.append(val)
+            except Exception:
+                pass
+
+        # Pattern 2: Basis points (e.g., "25 bps", "25bps", "250 bp")
+        bps_pattern = re.compile(r"(\d{1,4})\s*bps?\b")
+        for match in bps_pattern.finditer(question):
+            try:
+                bps_val = float(match.group(1))
+                # Convert basis points to percentage: 100 bps = 1%
+                candidates.append(bps_val / 100.0)
+            except Exception:
+                pass
+
+        # Pattern 3: Plain decimal (e.g., "5.25", "4") near percentage context
+        decimal_pattern = re.compile(r"(\d{1,3}(?:\.\d{1,2})?)(?=\s|$|(\+|\-|rate|percent|level))")
+        for match in decimal_pattern.finditer(question):
+            try:
+                val = float(match.group(1))
+                # Reject obvious years or very large numbers
+                if val > 100:
+                    continue
+                candidates.append(val)
+            except Exception:
+                pass
+
+        # Filter candidates: keep those within ~5 units of the anchor
+        valid_strikes = [c for c in candidates if abs(c - anchor_val) < 5.0]
+        if valid_strikes:
+            # Return the first (or most precise) candidate
+            return valid_strikes[0]
 
         return None
 
@@ -181,10 +221,29 @@ class EconomyHunter(BaseHunter):
                     title = event.get("title", "").lower()
                     slug = event.get("slug", "").lower()
 
-                    # Match indicator in title or slug
-                    indicator_lower = indicator.lower()
-                    if indicator_lower not in title and indicator_lower not in slug:
+                    # Determine which indicator the event is about using keywords
+                    matched_indicator = None
+                    # Keyword matches take precedence (e.g., 'inflation' -> CPI)
+                    for kw, canon in self.KEYWORD_INDICATOR_MAP.items():
+                        if kw in title or kw in slug:
+                            matched_indicator = canon
+                            break
+
+                    # Fallback: look for the explicit indicator name
+                    if matched_indicator is None:
+                        indicator_lower = indicator.lower()
+                        if indicator_lower in title or indicator_lower in slug:
+                            matched_indicator = indicator
+
+                    if matched_indicator is None:
                         continue
+
+                    # If matched indicator differs, refresh anchor using the matched series
+                    if matched_indicator != indicator:
+                        anchor = self._get_fred_value(matched_indicator)
+                        if anchor is None:
+                            # cannot resolve anchor for the matched indicator
+                            continue
 
                     for market in event.get("markets", []):
                         if market.get("closed"):
@@ -192,17 +251,19 @@ class EconomyHunter(BaseHunter):
 
                         question = market.get("question", "")
                         current_price = float(market.get("lastTradePrice", 0) or 0)
+                        # Compose full_text to include grouped/bin titles and market title
+                        full_text = f"{market.get('groupItemTitle', '')} {market.get('title', '')} {question}"
 
-                        # Rule 1: Price floor filter - reject markets below $0.18
+                        # Rule 1: Price floor filter - reject markets below PRICE_FLOOR
                         if current_price < self.PRICE_FLOOR:
                             continue
 
-                        # Rule 2: Price ceiling - reject markets at or above $1.00
-                        if current_price >= 1.0:
+                        # Rule 2: Price ceiling - reject markets priced above PRICE_CEILING
+                        if current_price > self.PRICE_CEILING:
                             continue
 
-                        # Rule 3: Extract strike
-                        valid_strike = self._extract_valid_strike(question, anchor)
+                        # Rule 3: Extract strike from full_text (captures group/bin values)
+                        valid_strike = self._extract_valid_strike(full_text, anchor)
                         if valid_strike is None:
                             continue
 
@@ -217,21 +278,29 @@ class EconomyHunter(BaseHunter):
                         if not (isinstance(tokens, list) and tokens):
                             continue
 
-                        # Rule 5: Extract volume
+                        # Rule 5: Extract volume and enforce MIN_VOLUME
                         volume = float(market.get("volume", 0) or 0)
                         if volume == 0:
                             volume = float(market.get("liquidity", 0) or 0)
                         if volume == 0:
                             volume = float(market.get("tradingVolume", 0) or 0)
 
+                        if volume < self.MIN_VOLUME:
+                            continue
+
                         # Rule 6: Select market with highest volume
                         if volume > highest_volume:
                             highest_volume = volume
+                            market_name = f"{event.get('title', '')} - {market.get('groupItemTitle', '')}".strip()
+                            if not market_name.strip(" -"):
+                                market_name = question
+
                             best_market = {
                                 "market_id": str(tokens[0]).strip(),
-                                "asset_type": f"Economy::{indicator}",
+                                "asset_type": f"Economy::{matched_indicator}",
                                 "strike_price": valid_strike,
                                 "question": question,
+                                "market_name": market_name,
                                 "anchor_url": None,
                                 "initial_price": current_price,
                                 "volume": volume,

@@ -80,9 +80,12 @@ async def run_market_monitor(bridge, log_func):
         TOKEN_ID = market.get("market_id")
         STRIKE = market.get("strike_price")
         ASSET_TYPE = market.get("asset_type")
-        QUESTION = market.get("question")
+        # Prefer the composed market_name (includes event title and group/bin info)
+        QUESTION = market.get("market_name", market.get("question"))
 
-        bridge.status = f"🎯 Tracking: {ASSET_TYPE} - {QUESTION[:40]}..."
+        bridge.status = f"🎯 {ASSET_TYPE}: {QUESTION[:60]}..."
+        bridge.market_question = QUESTION
+        bridge.market_asset_type = ASSET_TYPE
         print(f"[ENGINE] Tracking {ASSET_TYPE} => {TOKEN_ID} (strike {STRIKE})")
 
         # ========================================
@@ -119,6 +122,7 @@ async def run_market_monitor(bridge, log_func):
                 live_truth = _get_live_truth_via_hunter(hunter, market, ASSET_TYPE, log_func)
                 if live_truth is None:
                     live_truth = 0.0
+                bridge.market_actual = live_truth
 
                 # --- C. Compute time to expiry ---
                 now = datetime.now(timezone.utc)
@@ -128,7 +132,7 @@ async def run_market_monitor(bridge, log_func):
                     days_left = 7.0  # default
 
                 # --- D. Calculate fair value (delegated to brain) ---
-                fair_value = _get_fair_value_from_brain(brain, ASSET_TYPE, live_truth, STRIKE, days_left)
+                fair_value = _get_fair_value_from_brain(brain, ASSET_TYPE, live_truth, STRIKE, days_left, market)
                 bridge.forecast = fair_value
 
                 # --- E. Calculate EV ---
@@ -146,8 +150,10 @@ async def run_market_monitor(bridge, log_func):
 
                 # --- G. Update UI ---
                 bridge.last_update = now.strftime("%H:%M:%S")
-                bridge.status = f"Tracking {ASSET_TYPE}: live={live_truth:.2f} forecast={fair_value:.3f} EV={ev:.3f}"
-                log_func("TRACK", ASSET_TYPE, TOKEN_ID, {"fair": round(fair_value, 4), "ev": round(ev, 4)})
+                # Ensure dashboard shows the specific market question and asset
+                bridge.status = f"🎯 {ASSET_TYPE}: {QUESTION}"
+                market_name = market.get("market_name", market.get("question", "Unknown"))
+                log_func("TRACK", ASSET_TYPE, TOKEN_ID, {"fair": round(fair_value, 4), "ev": round(ev, 4)}, market_name=market_name)
 
                 await asyncio.sleep(2)
 
@@ -182,7 +188,8 @@ def _get_live_truth_via_hunter(
         return live_truth
     except Exception as e:
         print(f"[ENGINE] Error getting live truth: {e}")
-        log_func("ERROR", asset_type, "N/A", str(e))
+        market_name = market.get("market_name", market.get("question", "Unknown"))
+        log_func("ERROR", asset_type, "N/A", str(e), market_name=market_name)
         return None
 
 
@@ -192,6 +199,7 @@ def _get_fair_value_from_brain(
     live_truth: float,
     strike: float,
     days_left: float,
+    market: dict,
 ) -> float:
     """Calculate fair value via the brain's get_fair_value method.
 
@@ -212,7 +220,13 @@ def _get_fair_value_from_brain(
             symbol = asset_type.split("::", 1)[1]
             return brain.get_fair_value(live_truth, strike, days_left, symbol=symbol)
         elif asset_type.startswith("Weather::"):
-            return brain.get_fair_value(live_truth, strike, days_left)
+            # Pass through range metadata if present
+            kwargs = {}
+            if market.get("strike_low") is not None:
+                kwargs["strike_low"] = market.get("strike_low")
+            if market.get("strike_high") is not None:
+                kwargs["strike_high"] = market.get("strike_high")
+            return brain.get_fair_value(live_truth, strike, days_left, **kwargs)
         elif asset_type.startswith("Economy::"):
             indicator = asset_type.split("::", 1)[1]
             return brain.get_fair_value(live_truth, strike, days_left, indicator=indicator)

@@ -52,15 +52,20 @@ class WeatherHunter(BaseHunter):
     def _get_openweather_temperature(self, location: str) -> Optional[float]:
         """Fetch current temperature from OpenWeather API.
 
+        If OPENWEATHER_API_KEY is not set, return None (do not use fake data).
+
         Args:
             location: City name (e.g., "Miami")
 
         Returns:
-            Temperature in Celsius or None on failure.
+            Temperature in Celsius or None on failure or missing API key.
         """
         if not self.api_key:
-            print("[WeatherHunter] OPENWEATHER_API_KEY not set, using fallback")
-            return self._get_fake_temperature(location)
+            # Print warning once instead of using fallback
+            if not hasattr(self, "_api_key_warning_printed"):
+                print("[WeatherHunter] WARNING: OPENWEATHER_API_KEY not set. Weather hunting disabled.")
+                self._api_key_warning_printed = True
+            return None
 
         try:
             url = (
@@ -75,8 +80,8 @@ class WeatherHunter(BaseHunter):
         except Exception as e:
             print(f"[WeatherHunter] Failed to fetch temp for {location}: {e}")
 
-        # Fallback to fake data
-        return self._get_fake_temperature(location)
+        # No fallback: return None on error
+        return None
 
     @staticmethod
     def _get_fake_temperature(location: str) -> float:
@@ -171,7 +176,10 @@ class WeatherHunter(BaseHunter):
                     # Match location in title or slug
                     if location.lower() not in title and location.lower() not in slug:
                         continue
-                    if "weather" not in title and "weather" not in slug and "temperature" not in title:
+                    
+                    # Expanded keywords to catch "Miami High", "NYC Temp", etc.
+                    valid_keywords = ["weather", "temperature", "temp", "high", "low", "precipitation", "rain", "snow", "degree"]
+                    if not any(k in title or k in slug for k in valid_keywords):
                         continue
 
                     for market in event.get("markets", []):
@@ -189,8 +197,68 @@ class WeatherHunter(BaseHunter):
                         if current_price >= 1.0:
                             continue
 
-                        # Rule 3: Extract strike
-                        valid_strike = self._extract_valid_strike(question, anchor)
+                        # Rule 3: Extract strike or strike-range from question or outcomes
+                        valid_strike = None
+                        strike_low = None
+                        strike_high = None
+
+                        # First try to detect explicit ranges in outcomes or question
+                        def parse_range(text: str):
+                            if not text:
+                                return None
+                            # Range like '74-75F' or '74 - 75 °F'
+                            m = re.search(r"(\d{1,3})\s*[-–]\s*(\d{1,3})(?:\s*°\s*|)\s*([FCf])?", text)
+                            if m:
+                                a = float(m.group(1))
+                                b = float(m.group(2))
+                                unit = m.group(3)
+                                if unit and unit.upper() == "F":
+                                    a = (a - 32) * 5 / 9
+                                    b = (b - 32) * 5 / 9
+                                return (min(a, b), max(a, b))
+
+                            # '80F or higher' or 'above 80F' patterns
+                            m2 = re.search(r"(?:above|greater than|at least|or higher)\s*(\d{1,3})(?:\s*°\s*|)\s*([FCf])?", text, re.IGNORECASE)
+                            if m2:
+                                a = float(m2.group(1))
+                                unit = m2.group(2)
+                                if unit and unit.upper() == "F":
+                                    a = (a - 32) * 5 / 9
+                                return (a, None)
+
+                            return None
+
+                        # Check question first
+                        pr = parse_range(question)
+                        if pr:
+                            strike_low, strike_high = pr
+                            if strike_high is None:
+                                valid_strike = strike_low
+                            else:
+                                valid_strike = (strike_low + strike_high) / 2
+
+                        # If not in question, scan outcomes for ranges or explicit numbers
+                        if valid_strike is None:
+                            outcomes = market.get("outcomes") or []
+                            for o in outcomes:
+                                text = None
+                                if isinstance(o, dict):
+                                    text = o.get("name") or o.get("label") or o.get("title")
+                                else:
+                                    text = str(o)
+
+                                pr = parse_range(text)
+                                if pr:
+                                    strike_low, strike_high = pr
+                                    if strike_high is None:
+                                        valid_strike = strike_low
+                                    else:
+                                        valid_strike = (strike_low + strike_high) / 2
+                                    break
+
+                        # Fallback: try extracting a single-value strike from the question
+                        if valid_strike is None:
+                            valid_strike = self._extract_valid_strike(question, anchor)
                         if valid_strike is None:
                             continue
 
@@ -205,17 +273,20 @@ class WeatherHunter(BaseHunter):
                         if not (isinstance(tokens, list) and tokens):
                             continue
 
-                        # Rule 5: Extract volume
+                        # Rule 5: Extract volume and enforce MIN_VOLUME
                         volume = float(market.get("volume", 0) or 0)
                         if volume == 0:
                             volume = float(market.get("liquidity", 0) or 0)
                         if volume == 0:
                             volume = float(market.get("tradingVolume", 0) or 0)
 
+                        if volume < getattr(self, "MIN_VOLUME", 0):
+                            continue
+
                         # Rule 6: Select market with highest volume
                         if volume > highest_volume:
                             highest_volume = volume
-                            best_market = {
+                            bm = {
                                 "market_id": str(tokens[0]).strip(),
                                 "asset_type": f"Weather::{location}",
                                 "strike_price": valid_strike,
@@ -224,6 +295,13 @@ class WeatherHunter(BaseHunter):
                                 "initial_price": current_price,
                                 "volume": volume,
                             }
+                            # attach range metadata if present
+                            if strike_low is not None:
+                                bm["strike_low"] = strike_low
+                            if strike_high is not None:
+                                bm["strike_high"] = strike_high
+
+                            best_market = bm
 
             except Exception as e:
                 print(f"[WeatherHunter] Scan error on page {page}: {e}")
@@ -234,11 +312,19 @@ class WeatherHunter(BaseHunter):
     def hunt(self) -> Optional[Dict[str, Any]]:
         """Hunt for a weather market.
 
-        Tries each location in order. Returns the first valid market found.
+        If API key is not set, return None immediately without attempting to hunt.
+        Otherwise, tries each location in order. Returns the first valid market found.
 
         Returns:
             Market dict or None.
         """
+        # Early exit if API key not configured
+        if not self.api_key:
+            if not hasattr(self, "_hunt_warning_printed"):
+                print("[WeatherHunter] Skipping hunt: OPENWEATHER_API_KEY not configured.")
+                self._hunt_warning_printed = True
+            return None
+
         print(f"[WeatherHunter] {datetime.now().isoformat()} - Starting hunt for {len(self.locations)} locations")
 
         for location in self.locations:
@@ -256,7 +342,7 @@ class WeatherHunter(BaseHunter):
             if found:
                 found["anchor_url"] = (
                     f"https://api.openweathermap.org/data/2.5/weather?"
-                    f"q={location}&units=metric&appid={self.api_key or 'N/A'}"
+                    f"q={location}&units=metric&appid={self.api_key}"
                 )
                 print(f"[WeatherHunter] Found market for {location}: {found['market_id']}")
                 self._anchor_value = anchor_temp

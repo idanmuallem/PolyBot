@@ -51,6 +51,18 @@ class WeatherBrain(BaseBrain):
             Probability (CDF value) in [0.0, 1.0]
         """
         std_dev = kwargs.get("std_dev", self.std_dev)
+
+        # Support range-based strikes: if 'strike_low' and/or 'strike_high' provided,
+        # compute interval probability. For open-ended 'above' ranges, provide
+        # 'strike_low' with 'strike_high' == None.
+        strike_low = kwargs.get("strike_low")
+        strike_high = kwargs.get("strike_high")
+
+        if strike_low is not None and strike_high is not None:
+            return self._calculate_prob_range(live_truth, strike_low, strike_high, std_dev)
+        if strike_low is not None and strike_high is None:
+            return self._calculate_prob_above(live_truth, strike_low, std_dev)
+
         return self._calculate_prob(live_truth, strike, std_dev)
 
     @staticmethod
@@ -75,7 +87,40 @@ class WeatherBrain(BaseBrain):
             std_dev = 0.1  # Avoid division by zero
 
         # Z-score
-        z = (current_temp - strike_temp) / std_dev
+        z = (strike_temp - current_temp) / std_dev
 
-        # Return CDF: P(T > strike) = P(Z > z_score)
-        return float(norm.cdf(z))
+        # Return P(T > strike) = 1 - CDF(z)
+        return float(1.0 - norm.cdf(z))
+
+    @staticmethod
+    def _calculate_prob_range(
+        current_temp: float,
+        strike_low: float,
+        strike_high: float,
+        std_dev: float = 2.0
+    ) -> float:
+        """Calculate probability that temperature falls within [strike_low, strike_high].
+
+        Uses P(low <= T <= high) = CDF((high-mean)/sd) - CDF((low-mean)/sd).
+        """
+        if std_dev <= 0:
+            std_dev = 0.1
+
+        low_z = (strike_low - current_temp) / std_dev
+        high_z = (strike_high - current_temp) / std_dev
+        return float(norm.cdf(high_z) - norm.cdf(low_z))
+
+    @staticmethod
+    def _calculate_prob_above(
+        current_temp: float,
+        strike_low: float,
+        std_dev: float = 2.0
+    ) -> float:
+        """Calculate probability that temperature is above strike_low.
+
+        Uses P(T > strike_low) = 1 - CDF((strike_low - mean)/sd).
+        """
+        if std_dev <= 0:
+            std_dev = 0.1
+        z = (strike_low - current_temp) / std_dev
+        return float(1.0 - norm.cdf(z))

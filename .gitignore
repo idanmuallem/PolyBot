@@ -1,2 +1,7 @@
 .env
 trades.db
+__pycache__/
+.venv/
+*.pyc
+.vscode/
+*.db

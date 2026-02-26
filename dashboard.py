@@ -8,6 +8,26 @@ import time
 from datetime import datetime
 from engine import run_market_monitor
 
+# --- UI CONFIG ---
+# Must be the first Streamlit command
+st.set_page_config(page_title="PolyBot Quant Pro", page_icon="🛰️", layout="wide")
+
+# --- DB INIT ---
+def init_db():
+    with sqlite3.connect("trades.db") as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                market TEXT,
+                side TEXT,
+                price TEXT,
+                size TEXT,
+                status TEXT
+            )
+        """)
+init_db()
+
 # --- DATA BRIDGE ---
 class DataBridge:
     def __init__(self):
@@ -18,20 +38,19 @@ class DataBridge:
         self.status = "📡 Discovery Phase..."
         self.last_update = "N/A"
         self.automation_enabled = False
+        self.market_question = "Waiting for market..."
+        self.market_asset_type = "N/A"
 
 @st.cache_resource
 def get_bridge(): return DataBridge()
 bridge = get_bridge()
 
-def log_trade(m, s, p, sz, stts):
+def log_trade(m, s, p, sz, stts="N/A", market_name="Unknown"):
     try:
         with sqlite3.connect("trades.db", timeout=10) as conn:
             conn.execute("INSERT INTO trades (timestamp, market, side, price, size, status) VALUES (?,?,?,?,?,?)", 
-                         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), m, s, p, sz, stts))
+                         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(market_name), str(s), str(p), str(sz), str(stts)))
     except Exception as e: print(f"Log Error: {e}")
-
-# --- UI CONFIG ---
-st.set_page_config(page_title="PolyBot Quant Pro", page_icon="🛰️", layout="wide")
 
 # Starts the engine loop in the background
 if "engine_started" not in st.session_state:
@@ -54,14 +73,26 @@ st.divider()
 
 # --- CORE MARKET DATA ---
 st.subheader("📊 Live Market Analysis")
+st.caption(f"**Market:** {bridge.market_question}")
+
+def format_live_value(asset_type, value):
+    if asset_type.startswith("Crypto"):
+        return f"${value:,.2f}"
+    elif asset_type.startswith("Weather"):
+        return f"{value:.1f}°C"
+    elif asset_type.startswith("Economy"):
+        return f"{value:.2f}%"
+    else:
+        return f"{value:,.2f}"
+
 with st.container(border=True):
     m1, m2, m3, m4 = st.columns(4)
     
-    m1.metric("Binance BTC", f"${bridge.market_actual:,.2f}")
+    asset_name = bridge.market_asset_type.split("::")[-1]
+    m1.metric(f"Live: {asset_name}", format_live_value(bridge.market_asset_type, bridge.market_actual))
     m2.metric("Polymarket Price", f"${bridge.market_poly:.3f}")
     m3.metric("Math-Fair Value", f"{bridge.forecast:.1%}")
     
-    # Delta coloring automatically switches based on positive/negative
     edge_color = "normal" if bridge.ev < 0.15 else "inverse"
     m4.metric("Trading Edge (EV)", f"{bridge.ev:.2%}", delta=f"{bridge.ev:.2%}", delta_color=edge_color)
 
@@ -85,11 +116,13 @@ with st.container(border=True):
             df = pd.read_sql_query("SELECT * FROM trades ORDER BY id DESC LIMIT 15", conn)
         
         if not df.empty:
+            # Convert all columns to string to avoid pyarrow type conversion errors
+            df = df.astype(str)
             st.dataframe(df, width='stretch', hide_index=True)
         else:
             st.info("No trades logged yet. The engine is scanning for arbitrage opportunities...")
-    except Exception:
-        st.warning("Ledger is busy updating...")
+    except Exception as e:
+        st.warning(f"Ledger is busy updating... ({str(e)[:50]})")
 
 # UI Heartbeat
 time.sleep(2)

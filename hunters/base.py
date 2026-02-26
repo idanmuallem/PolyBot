@@ -21,10 +21,11 @@ class BaseHunter(ABC):
     - Strike validation: Strict ratio check (0.2 < spot_ratio < 5.0) to avoid absurd strikes
     """
 
-    PRICE_FLOOR = 0.18  # Minimum acceptable market price (no longshots below this)
-    PRICE_CEILING = 0.99  # Maximum acceptable market price
+    PRICE_FLOOR = 0.10  # Minimum acceptable market price (no longshots below this)
+    PRICE_CEILING = 0.85  # Maximum acceptable market price (ignore markets > 0.85)
+    MIN_VOLUME = 250  # Minimum volume required to consider a market active
     STRIKE_RATIO_MIN = 0.2  # Min ratio of strike to anchor (0.2x = 5:1 downside max)
-    STRIKE_RATIO_MAX = 5.0  # Max ratio of strike to anchor (5x = 1:5 upside max)
+    STRIKE_RATIO_MAX = 2.0  # Max ratio of strike to anchor (2x = allow moderately far strikes)
 
     POLYMARKET_BASE = "https://gamma-api.polymarket.com/events"
 
