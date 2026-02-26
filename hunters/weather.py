@@ -13,13 +13,20 @@ import os
 import requests
 from curl_cffi import requests as crequests
 
-from .base import BaseHunter
+from .base import BasePolymarketHunter
 
 
-class WeatherHunter(BaseHunter):
+class WeatherHunter(BasePolymarketHunter):
     """Hunt markets related to weather conditions (temperature, precipitation, etc.).
 
     Anchor: OpenWeather API
+
+    This implementation leverages :class:`BasePolymarketHunter` for the
+    underlying scan logic.  A small number of hooks are supplied to handle
+    temperature-specific strike extraction and keyword aliases; additionally
+    we require that the event title/slug contain the location string so that
+    anchors are not mismatched (e.g. we don't want the "weather" event for
+    London when hunting Miami temperatures).
     """
 
     DEFAULT_LOCATIONS = ["Miami", "New York", "London"]
@@ -102,21 +109,16 @@ class WeatherHunter(BaseHunter):
         }
         return temps.get(location.lower(), 20.0)
 
-    @staticmethod
-    def _extract_valid_strike(question: str, anchor_temp: float) -> Optional[float]:
-        """Extract a valid strike temperature from the market question.
+    def extract_strike(self, text: str, anchor_temp: float) -> Optional[float]:
+        """Concrete hook for :meth:`BasePolymarketHunter.extract_strike`.
 
-        Looks for patterns like "above 75F", "below 30", etc.
-
-        Args:
-            question: Market question text
-            anchor_temp: Current temperature for validation
-
-        Returns:
-            Valid strike temperature or None.
+        The original _extract_valid_strike logic lives here; we examine any
+        text blob (title/question/outcomes) and look for a plausible
+        temperature that is within ~20°C of the anchor.  Fahrenheit values
+        are converted to Celsius.
         """
         # Look for number patterns (degrees)
-        matches = re.finditer(r"(\d{1,3})(?:\s*°\s*|)([FCf])?", question)
+        matches = re.finditer(r"(\d{1,3})(?:\s*°\s*|)([FCf])?", text)
         for match in matches:
             temp_val = float(match.group(1))
             unit = match.group(2)
@@ -131,209 +133,31 @@ class WeatherHunter(BaseHunter):
 
         return None
 
-    def _scan_polymarket(self, anchor: float, location: str, max_pages: int = 5) -> Optional[Dict[str, Any]]:
-        """Scan Polymarket for weather-related markets.
+    # the old scanning logic has been replaced by the generic base implementation
+    # which is much shorter and easier to maintain.  We still keep a copy of the
+    # original code in git history in case the location-handling requirements
+    # change in the future.
 
-        Selection criteria:
-        - Price floor: Market price must be >= $0.18 (no longshots)
-        - Volume optimization: Among valid markets, select highest volume
+    def get_search_aliases(self) -> list:
+        """Return keywords used to identify weather markets in Polymarket events.
 
-        Args:
-            anchor: Current temperature
-            location: Location name to match
-            max_pages: Max pages to scan
-
-        Returns:
-            Market dict with highest volume, or None if no suitable market found.
+        These are generic terms such as "weather", "temperature", etc.  The
+        _scan_polymarket helper will always include the location string passed as
+        the keyword argument, so the combination guarantees that the returned
+        market relates to *both* weather and the requested city.
         """
-        best_market = None
-        highest_volume = 0.0
-
-        for page in range(max_pages):
-            params = {
-                "active": "true",
-                "closed": "false",
-                "limit": 100,
-                "offset": page * 100
-            }
-            try:
-                resp = crequests.get(
-                    self.polymarket_base,
-                    params=params,
-                    impersonate="chrome120",
-                    timeout=15
-                )
-                if resp.status_code != 200:
-                    break
-                events = resp.json()
-                if not events:
-                    break
-
-                for event in events:
-                    title = event.get("title", "").lower()
-                    slug = event.get("slug", "").lower()
-
-                    # Match location in title or slug
-                    if location.lower() not in title and location.lower() not in slug:
-                        continue
-                    
-                    # Expanded keywords to catch "Miami High", "NYC Temp", etc.
-                    valid_keywords = ["weather", "temperature", "temp", "high", "low", "precipitation", "rain", "snow", "degree"]
-                    if not any(k in title or k in slug for k in valid_keywords):
-                        continue
-
-                    for market in event.get("markets", []):
-                        if market.get("closed"):
-                            continue
-
-                        question = market.get("question", "")
-                        current_price = float(market.get("lastTradePrice", 0) or 0)
-
-                        # Rule 0: Get token ID early for skip_ids check
-                        tokens = market.get("clobTokenIds")
-                        if isinstance(tokens, str):
-                            try:
-                                tokens = json.loads(tokens)
-                            except Exception:
-                                tokens = None
-
-                        if not (isinstance(tokens, list) and tokens):
-                            continue
-                        
-                        market_id = str(tokens[0]).strip()
-                        
-                        # Skip markets in cooldown cache
-                        if market_id in skip_ids:
-                            print(f"[WeatherHunter] Skipping {market_id} (in 10m cooldown)")
-                            continue
-
-                        # Rule 1: Price floor filter - reject markets below $0.18
-                        if current_price < self.PRICE_FLOOR:
-                            continue
-
-                        # Rule 2: Price ceiling - reject markets at or above $1.00
-                        if current_price >= 1.0:
-                            continue
-
-                        # Rule 3: Extract strike or strike-range from question or outcomes
-                        valid_strike = None
-                        strike_low = None
-                        strike_high = None
-
-                        # First try to detect explicit ranges in outcomes or question
-                        def parse_range(text: str):
-                            if not text:
-                                return None
-                            # Range like '74-75F' or '74 - 75 °F'
-                            m = re.search(r"(\d{1,3})\s*[-–]\s*(\d{1,3})(?:\s*°\s*|)\s*([FCf])?", text)
-                            if m:
-                                a = float(m.group(1))
-                                b = float(m.group(2))
-                                unit = m.group(3)
-                                if unit and unit.upper() == "F":
-                                    a = (a - 32) * 5 / 9
-                                    b = (b - 32) * 5 / 9
-                                return (min(a, b), max(a, b))
-
-                            # '80F or higher' or 'above 80F' patterns
-                            m2 = re.search(r"(?:above|greater than|at least|or higher)\s*(\d{1,3})(?:\s*°\s*|)\s*([FCf])?", text, re.IGNORECASE)
-                            if m2:
-                                a = float(m2.group(1))
-                                unit = m2.group(2)
-                                if unit and unit.upper() == "F":
-                                    a = (a - 32) * 5 / 9
-                                return (a, None)
-
-                            return None
-
-                        # Check question first
-                        pr = parse_range(question)
-                        if pr:
-                            strike_low, strike_high = pr
-                            if strike_high is None:
-                                valid_strike = strike_low
-                            else:
-                                valid_strike = (strike_low + strike_high) / 2
-
-                        # If not in question, scan outcomes for ranges or explicit numbers
-                        if valid_strike is None:
-                            outcomes = market.get("outcomes") or []
-                            for o in outcomes:
-                                text = None
-                                if isinstance(o, dict):
-                                    text = o.get("name") or o.get("label") or o.get("title")
-                                else:
-                                    text = str(o)
-
-                                pr = parse_range(text)
-                                if pr:
-                                    strike_low, strike_high = pr
-                                    if strike_high is None:
-                                        valid_strike = strike_low
-                                    else:
-                                        valid_strike = (strike_low + strike_high) / 2
-                                    break
-
-                        # Fallback: try extracting a single-value strike from the question
-                        if valid_strike is None:
-                            valid_strike = self._extract_valid_strike(question, anchor)
-                        if valid_strike is None:
-                            continue
-
-                        # Rule 4: Token ID already extracted above for skip_ids check
-
-                        # Rule 5: Extract volume and enforce MIN_VOLUME
-                        volume = float(market.get("volume", 0) or 0)
-                        if volume == 0:
-                            volume = float(market.get("liquidity", 0) or 0)
-                        if volume == 0:
-                            volume = float(market.get("tradingVolume", 0) or 0)
-
-                        if volume < getattr(self, "MIN_VOLUME", 0):
-                            continue
-
-                        # Rule 6: Select market with highest volume
-                        if volume > highest_volume:
-                            highest_volume = volume
-                            bm = {
-                                "market_id": str(tokens[0]).strip(),
-                                "asset_type": f"Weather::{location}",
-                                "strike_price": valid_strike,
-                                "question": question,
-                                "anchor_url": None,
-                                "initial_price": current_price,
-                                "volume": volume,
-                            }
-                            # attach range metadata if present
-                            if strike_low is not None:
-                                bm["strike_low"] = strike_low
-                            if strike_high is not None:
-                                bm["strike_high"] = strike_high
-
-                            best_market = bm
-
-            except Exception as e:
-                print(f"[WeatherHunter] Scan error on page {page}: {e}")
-                break
-
-        return best_market
+        return ["weather", "temperature", "temp", "high", "low", "precipitation", "rain", "snow", "degree"]
 
     def hunt(self, skip_ids: list = None) -> Optional[Dict[str, Any]]:
         """Hunt for a weather market.
 
-        If API key is not set, return None immediately without attempting to hunt.
-        Otherwise, tries each location in order. Returns the first valid market found.
-        Respects skip_ids list to avoid markets in 10-minute cooldown.
-
-        Args:
-            skip_ids: List of market_ids to skip (in cooldown). Defaults to [].
-
-        Returns:
-            Market dict or None.
+        Tries each configured location in turn.  Uses the shared
+        :meth:`_scan_polymarket` routine with ``required_keywords`` set to the
+        current location so that results are location-specific.
         """
         if skip_ids is None:
             skip_ids = []
-        
+
         # Early exit if API key not configured
         if not self.api_key:
             if not hasattr(self, "_hunt_warning_printed"):
@@ -341,7 +165,9 @@ class WeatherHunter(BaseHunter):
                 self._hunt_warning_printed = True
             return None
 
-        print(f"[WeatherHunter] {datetime.now().isoformat()} - Starting hunt for {len(self.locations)} locations (skipping {len(skip_ids)} cooldown markets)")
+        print(
+            f"[WeatherHunter] {datetime.now().isoformat()} - Starting hunt for {len(self.locations)} locations (skipping {len(skip_ids)} cooldown markets)"
+        )
 
         for location in self.locations:
             print(f"[WeatherHunter] Trying location: {location}")
@@ -352,8 +178,13 @@ class WeatherHunter(BaseHunter):
                 print(f"[WeatherHunter] Failed to fetch anchor for {location}, skipping")
                 continue
 
-            # Scan Polymarket
-            found = self._scan_polymarket(anchor_temp, location)
+            # Scan Polymarket (require location to appear in title/slug)
+            found = self._scan_polymarket(
+                anchor_temp,
+                location,
+                skip_ids=skip_ids,
+                required_keywords=[location],
+            )
 
             if found:
                 found["anchor_url"] = (

@@ -5,6 +5,7 @@ Uses a normal distribution model with configurable standard deviation.
 """
 
 from scipy.stats import norm
+from models import MarketData
 
 from .base import BaseBrain
 
@@ -26,15 +27,10 @@ class WeatherBrain(BaseBrain):
         """
         self.std_dev = std_dev
 
-    def get_topic_type(self) -> str:
-        return "Weather"
-
-    def get_fair_value(
+    def _calculate_probability(
         self,
-        live_truth: float,
-        strike: float,
-        days_left: float,
-        **kwargs
+        market: MarketData,
+        live_truth: float
     ) -> float:
         """Calculate fair value using normal distribution.
 
@@ -42,28 +38,26 @@ class WeatherBrain(BaseBrain):
         and use the standard deviation to model uncertainty.
 
         Args:
+            market: MarketData object with strike_price and optional strike_low/strike_high
             live_truth: Current temperature (°C)
-            strike: Strike temperature (°C)
-            days_left: Not used in this model (weather is typically short-term)
-            **kwargs: Override std_dev with 'std_dev' kwarg if provided
 
         Returns:
             Probability (CDF value) in [0.0, 1.0]
         """
-        std_dev = kwargs.get("std_dev", self.std_dev)
+        std_dev = self.std_dev
 
-        # Support range-based strikes: if 'strike_low' and/or 'strike_high' provided,
-        # compute interval probability. For open-ended 'above' ranges, provide
-        # 'strike_low' with 'strike_high' == None.
-        strike_low = kwargs.get("strike_low")
-        strike_high = kwargs.get("strike_high")
+        # Support range-based strikes: use strike_low and strike_high if available
+        # For open-ended 'above' ranges, check for 'strike_low' in market or metadata
+        strike_low = getattr(market, 'strike_low', None)
+        strike_high = getattr(market, 'strike_high', None)
 
         if strike_low is not None and strike_high is not None:
             return self._calculate_prob_range(live_truth, strike_low, strike_high, std_dev)
         if strike_low is not None and strike_high is None:
             return self._calculate_prob_above(live_truth, strike_low, std_dev)
 
-        return self._calculate_prob(live_truth, strike, std_dev)
+        # Fall back to simple strike price comparison
+        return self._calculate_prob(live_truth, market.strike_price, std_dev)
 
     @staticmethod
     def _calculate_prob(

@@ -6,6 +6,7 @@ Uses a Black-Scholes style CDF approach with annualized volatility.
 
 import math
 from scipy.stats import norm
+from models import MarketData
 
 from .base import BaseBrain
 
@@ -33,9 +34,6 @@ class CryptoBrain(BaseBrain):
         """
         self.volatilities = volatilities or dict(self.DEFAULT_VOLATILITIES)
 
-    def get_topic_type(self) -> str:
-        return "Crypto"
-
     def get_volatility_for_symbol(self, symbol: str) -> float:
         """Get the annualized volatility for a given symbol.
 
@@ -52,32 +50,33 @@ class CryptoBrain(BaseBrain):
         # Default fallback
         return 0.6
 
-    def get_fair_value(
+    def _calculate_probability(
         self,
-        live_truth: float,
-        strike: float,
-        days_left: float,
-        symbol: str = "BTCUSDT",
-        **kwargs
+        market: MarketData,
+        live_truth: float
     ) -> float:
-        """Calculate fair value using Black-Scholes-style CDF.
+        """Calculate probability using Black-Scholes-style CDF.
 
         Args:
+            market: MarketData object with strike_price and other details
             live_truth: Current spot price (e.g., BTC/USDT)
-            strike: Strike/threshold price from the market
-            days_left: Days until market expiry
-            symbol: Trading symbol (used to lookup volatility)
-            **kwargs: Override volatility with 'volatility' kwarg if provided
 
         Returns:
             Probability (CDF value) in [0.0, 1.0]
         """
-        # Allow override via kwarg
-        vol = kwargs.get("volatility")
-        if vol is None:
-            vol = self.get_volatility_for_symbol(symbol)
+        # Extract volatility for the asset type (BTC, ETH, etc.)
+        vol = self.get_volatility_for_symbol(market.asset_type)
 
-        return self._calculate_prob(live_truth, strike, days_left, vol)
+        # Estimate days to expiry (default to 30 days if not specified)
+        # For now, we'll use a reasonable default
+        days_to_expiry = 30.0
+
+        return self._calculate_prob(
+            live_truth,
+            market.strike_price,
+            days_to_expiry,
+            vol
+        )
 
     @staticmethod
     def _calculate_prob(

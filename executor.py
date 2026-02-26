@@ -7,6 +7,7 @@ Handles position sizing, risk checks, and trade firing.
 
 from typing import Optional, Dict, Any, Callable
 from dataclasses import dataclass
+from models import MarketData
 
 
 @dataclass
@@ -39,7 +40,7 @@ class TradeExecutor:
 
     def evaluate_and_execute(
         self,
-        market: Dict[str, Any],
+        market: MarketData,
         fair_value: float,
         ev: float,
         current_poly_price: float,
@@ -48,7 +49,7 @@ class TradeExecutor:
         """Evaluate market conditions and execute trade if criteria are met.
 
         Args:
-            market: Market dict with keys like market_id, asset_type, question
+            market: MarketData object with market_id, asset_type, question, etc.
             fair_value: Fair value probability (our calculated price)
             ev: Expected value (fair_value - market_price) / market_price
             current_poly_price: Current Polymarket mid price
@@ -57,8 +58,8 @@ class TradeExecutor:
         Returns:
             True if trade was executed, False otherwise
         """
-        asset_type = market.get("asset_type", "Unknown")
-        token_id = market.get("market_id", "N/A")
+        asset_type = market.asset_type
+        token_id = market.market_id
 
         # ========================================
         # 1. Check EV threshold
@@ -107,21 +108,26 @@ class TradeExecutor:
         self.trade_count_today += 1
         return True
 
-    def _validate_market(self, market: Dict[str, Any], log_func: Callable) -> bool:
+    def _validate_market(self, market: MarketData, log_func: Callable) -> bool:
         """Validate market conditions before execution.
 
         Args:
-            market: Market data
+            market: MarketData object
             log_func: Logging callback
 
         Returns:
             True if market is valid for trading
         """
         # Check required fields
-        required_fields = ["market_id", "asset_type", "strike_price", "question"]
-        for field in required_fields:
-            if field not in market or market[field] is None:
-                log_func("VALIDATE", "Market", "Unknown", f"Missing {field}")
+        required_fields = [
+            ("market_id", market.market_id),
+            ("asset_type", market.asset_type),
+            ("strike_price", market.strike_price),
+            ("question", market.question),
+        ]
+        for field_name, field_value in required_fields:
+            if field_value is None:
+                log_func("VALIDATE", "Market", "Unknown", f"Missing {field_name}")
                 return False
 
         return True

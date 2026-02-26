@@ -6,6 +6,7 @@ Uses a normal distribution model with historical volatility scaling.
 
 import math
 from scipy.stats import norm
+from models import MarketData
 
 from .base import BaseBrain
 
@@ -33,9 +34,6 @@ class EconomyBrain(BaseBrain):
         """
         self.hist_volatilities = hist_volatilities or dict(self.DEFAULT_HIST_VOLATILITY)
 
-    def get_topic_type(self) -> str:
-        return "Economy"
-
     def get_volatility_for_indicator(self, indicator: str) -> float:
         """Get the historical volatility for a given indicator.
 
@@ -47,32 +45,32 @@ class EconomyBrain(BaseBrain):
         """
         return self.hist_volatilities.get(indicator, 0.5)
 
-    def get_fair_value(
+    def _calculate_probability(
         self,
-        live_truth: float,
-        strike: float,
-        days_left: float,
-        indicator: str = "FedRate",
-        **kwargs
+        market: MarketData,
+        live_truth: float
     ) -> float:
-        """Calculate fair value using historical volatility model.
+        """Calculate probability using historical volatility model.
 
         Args:
+            market: MarketData object with strike_price and other details
             live_truth: Current indicator value (e.g., Fed rate = 5.25)
-            strike: Strike/threshold value from the market
-            days_left: Days until market expiry
-            indicator: Indicator name (used to lookup volatility)
-            **kwargs: Override hist_vol with 'hist_vol' kwarg if provided
 
         Returns:
             Probability (CDF value) in [0.0, 1.0]
         """
-        # Allow override via kwarg
-        hist_vol = kwargs.get("hist_vol")
-        if hist_vol is None:
-            hist_vol = self.get_volatility_for_indicator(indicator)
+        # Extract volatility for the indicator (FedRate, CPI, etc.)
+        hist_vol = self.get_volatility_for_indicator(market.asset_type)
 
-        return self._calculate_prob(live_truth, strike, days_left, hist_vol)
+        # Estimate days to expiry (default to 365 days if not specified)
+        days_to_expiry = 365.0
+
+        return self._calculate_prob(
+            live_truth,
+            market.strike_price,
+            days_to_expiry,
+            hist_vol
+        )
 
     @staticmethod
     def _calculate_prob(

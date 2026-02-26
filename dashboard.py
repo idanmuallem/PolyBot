@@ -85,12 +85,20 @@ def format_live_value(asset_type, value):
     else:
         return f"{value:,.2f}"
 
+def format_polymarket_price(value):
+    """Format Polymarket price as cents (0.51 -> 51¢)."""
+    if value:
+        cents = round(value * 100)  # Convert to cents
+        return f"{cents}¢"
+    else:
+        return "0¢"
+
 with st.container(border=True):
     m1, m2, m3, m4 = st.columns(4)
     
     asset_name = bridge.market_asset_type.split("::")[-1]
     m1.metric(f"Live: {asset_name}", format_live_value(bridge.market_asset_type, bridge.market_actual))
-    m2.metric("Polymarket Price", f"${bridge.market_poly:.3f}")
+    m2.metric("Polymarket Price", format_polymarket_price(bridge.market_poly))
     m3.metric("Math-Fair Value", f"{bridge.forecast:.1%}")
     
     edge_color = "normal" if bridge.ev < 0.15 else "inverse"
