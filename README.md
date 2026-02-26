@@ -1,27 +1,94 @@
-# 🛰️ PolyBot: Quantitative Arbitrage Terminal
+# 🤖 PolyBot: Quantitative Prediction Market Arbitrageur
 
-A high-performance, asynchronous trading dashboard designed to hunt and visualize probability-based arbitrage opportunities between the **Binance Spot Market** and the **Polymarket Central Limit Order Book (CLOB)**.
+PolyBot is a modular, high-performance trading framework designed to identify, evaluate, and execute trades on Polymarket. By combining real-time data from global anchors (Binance, FRED) with quantitative probability models, PolyBot automates the search for positive Expected Value (+EV) opportunities.
 
-![PolyBot Terminal](https://img.shields.io/badge/Status-Active-brightgreen) ![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B)
+## 🌟 Key Features
 
-## 🧠 How it Works
+- **Multi-Asset Hunting:** Specialized "Hunters" for Crypto (Price Action), Economy (Interest Rates/CPI), and Weather.
+- **Quantitative "Brains":** Real-time probability estimation using Black-Scholes models and Normal Distribution curves.
+- **Smart Risk Management:** Automated position sizing using the Kelly Criterion to maximize compound growth while protecting the bankroll.
+- **Precision Deep Scanning:** Advanced text-parsing engine that concatenates group market headers with sub-market outcomes to extract strikes accurately.
+- **Memory & Cooldowns:** Built-in 10-minute cooldown cache to prevent the bot from getting "stuck" on low-EV markets.
+- **Risk Ceilings:** Global daily USD spending limits and per-trade "Half-Kelly" safety clamps.
 
-PolyBot operates on the premise of **latency exploitation and probability pricing**. 
-1. **The Engine (Hunter):** Bypasses standard API rate limits to directly scan the Polymarket CLOB for active, high-volume Bitcoin prediction markets (e.g., *"Will BTC reach $100k?"*).
-2. **The Brain:** Pulls the live global truth (Binance Spot BTC price) and calculates the mathematical Fair Value of the Polymarket contract using Cumulative Distribution Functions (CDF).
-3. **The Edge:** Continuously compares the Polymarket Orderbook Midpoint against the Math-Fair Value. If Polymarket lags behind a sudden Binance price movement, the Expected Value (EV) spikes, signaling a trading edge.
+## 🏗️ Architecture & Techniques
 
-## 🚀 Key Features
+The project follows a strict Separation of Concerns (SoC) architecture, making it highly modular and easy to extend:
 
-* **Auto-Discovery:** Automatically parses stringified JSON from Polymarket's Gamma/Events API to find active, liquid markets without manual Token ID configuration.
-* **Self-Healing Logic:** Automatically blacklists dead, expired, or halted orderbooks and hunts for the next available market.
-* **Asynchronous Processing:** The data engine runs on a background `asyncio` thread, allowing the UI to remain highly responsive.
-* **Execution Ledger:** A local SQLite database (`trades.db`) logs all simulated paper trades seamlessly.
-* **Quant-Style UI:** Built with Streamlit, utilizing native metrics, delta color-coding, and layout containers for a professional trading desk feel.
+- **Network Layer (`/clients`):** Isolated API clients for Polymarket, Binance, and the Federal Reserve (FRED).
+- **Parsing Layer (`/parsers`):** Specialized regex engines that translate messy market strings into clean numeric strikes.
+- **The Scouting Layer (`/hunters`):** Uses the Template Method Pattern to scan thousands of markets, filtering by liquidity (min volume) and price floors.
+- **The Quant Layer (`/brains`):** Statistical engines that calculate "Fair Value" versus Market Price.
+- **The Orchestrator (`engine.py`):** The central nervous system that manages the flow of `MarketData` and `TradeSignal` objects between layers.
 
-## 🛠️ Installation & Setup
+## 🧰 Tech Stack
 
-**1. Clone the repository:**
+- **Language:** Python 3.10+
+- **Networking:** `curl_cffi` (for impersonating browser TLS fingerprints to bypass API blocks)
+- **Math:** NumPy, SciPy (for cumulative distribution functions)
+- **Formatting:** LaTeX-style math for financial modeling
+
+## 🚀 Getting Started
+
+### 1) Prerequisites
+
+- Python 3.10 or higher
+- A Polymarket account (API keys required for execution)
+- Optional: FRED API key for economic data
+
+### 2) Installation
+
 ```bash
-git clone [https://github.com/YOUR-USERNAME/polybot.git](https://github.com/YOUR-USERNAME/polybot.git)
-cd polybot
+# Clone the repository
+git clone https://github.com/yourusername/PolyBot.git
+cd PolyBot
+
+# Create and activate a virtual environment
+python -m venv .venv
+# On Windows:
+.venv\Scripts\activate
+# On macOS/Linux:
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### 3) Configuration
+
+Create a `.env` file in the root directory:
+
+```env
+POLYMARKET_API_KEY=your_key
+BINANCE_API_KEY=your_key
+FRED_API_KEY=your_key
+DAILY_LIMIT_USD=100.0
+MAX_RISK_PER_TRADE=0.05
+```
+
+## 🛠️ Manual & Activation
+
+### Running a Quick Hunt
+
+To run a single scan across all hunters and view current opportunities in your terminal:
+
+```bash
+python run_hunt_once.py
+```
+
+### Starting the Live Bot
+
+To launch the full engine with the real-time dashboard:
+
+```bash
+python dashboard.py
+```
+
+### Developer Mode (Debugging)
+
+To see the bot's internal thought process (regex matches, EV math, and filter rejections), ensure `DEBUG=True` is set in your environment. This outputs logs like:
+
+```text
+[DEBUG] Evaluating: Bitcoin above 68,000 | Price: 0.63 | Fair: 0.44 | EV: -29%
+[ENGINE] Market has low EV. Entering 10m cooldown.
+```
