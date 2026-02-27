@@ -7,7 +7,7 @@ Uses PolymarketClient for API access and BinanceClient for price data.
 from datetime import datetime
 from typing import Optional
 
-from models import MarketData
+from core.models import MarketData
 from parsers.crypto import extract_crypto_strike
 from clients.polymarket import PolymarketClient
 from clients.binance import BinanceClient

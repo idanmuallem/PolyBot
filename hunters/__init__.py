@@ -11,12 +11,14 @@ from .base import BaseHunter
 from .crypto import CryptoHunter
 from .weather import WeatherHunter
 from .economy import EconomyHunter
+from .polymarket_scanner import PolymarketScannerHunter
 
 __all__ = [
     "BaseHunter",
     "CryptoHunter",
     "WeatherHunter",
     "EconomyHunter",
+    "PolymarketScannerHunter",
 ]
 
 

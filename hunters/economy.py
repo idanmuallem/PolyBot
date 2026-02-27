@@ -7,7 +7,7 @@ Uses FredClient for economic data and PolymarketClient for market discovery.
 from datetime import datetime
 from typing import Optional
 
-from models import MarketData
+from core.models import MarketData
 from parsers.economy import extract_economy_strike
 from clients.fred import FredClient
 from clients.polymarket import PolymarketClient

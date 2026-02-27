@@ -8,12 +8,13 @@ This package contains specialized brains for different asset types:
 """
 
 from .base import BaseBrain
-from .crypto import CryptoBrain
+from .crypto import CryptoBrain, HybridCryptoBrain
 from .weather import WeatherBrain
 from .economy import EconomyBrain
 
 __all__ = [
     "BaseBrain",
+    "HybridCryptoBrain",
     "CryptoBrain",
     "WeatherBrain",
     "EconomyBrain",
@@ -35,7 +36,7 @@ def get_brain_for_asset_type(asset_type: str) -> BaseBrain:
     asset_type = asset_type.split("::")[0].strip().lower()
 
     if asset_type == "crypto":
-        return CryptoBrain()
+        return HybridCryptoBrain()
     elif asset_type == "weather":
         return WeatherBrain()
     elif asset_type == "economy":

@@ -5,7 +5,7 @@ Uses a normal distribution model with configurable standard deviation.
 """
 
 from scipy.stats import norm
-from models import MarketData
+from core.models import MarketData
 
 from .base import BaseBrain
 

@@ -1,0 +1,15 @@
+# Canonical dependency file for cross-machine setup
+# Install with: pip install -r requirements.txt
+
+streamlit==1.54.0
+plotly==5.24.1
+pandas==2.3.3
+numpy==2.4.2
+scipy==1.17.0
+python-dotenv==1.2.1
+curl_cffi==0.14.0
+requests==2.32.5
+py-clob-client==0.34.6
+py_builder_signing_sdk==0.0.2
+py_order_utils==0.3.2
+pytest==9.0.2

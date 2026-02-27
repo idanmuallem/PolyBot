@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 @dataclass
 class MarketData:
@@ -9,6 +10,7 @@ class MarketData:
     market_name: str
     initial_price: float
     volume: float
+    expiry_date: Optional[str] = None
 
 
 @dataclass
@@ -17,3 +19,15 @@ class TradeSignal:
     expected_value: float  # (fair - price) / price
     kelly_size: float      # fraction of bankroll to risk
     is_tradable: bool      # meets EV threshold and positive kelly
+    realized_pnl: float = 0.0
+
+
+@dataclass
+class Position:
+    market_id: str
+    token_id: str
+    initial_price: float
+    current_price: float
+    shares: float
+    value: float
+    pnl_percent: float

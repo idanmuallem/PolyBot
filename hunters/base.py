@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List
 import json
 from curl_cffi import requests as crequests
-from models import MarketData
+from core.models import MarketData
 
 
 class BaseHunter(ABC):

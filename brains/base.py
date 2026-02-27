@@ -8,7 +8,67 @@ while subclasses implement _calculate_probability().
 """
 
 from abc import ABC, abstractmethod
-from models import MarketData, TradeSignal
+import re
+from datetime import datetime, timezone
+from core.models import MarketData, TradeSignal
+
+
+def calculate_tte(expiry_date) -> float:
+    """Return time-to-expiry in days as float.
+
+    Accepts datetime objects, epoch timestamps, or common date strings.
+    If parsing fails, returns a conservative default of 30 days.
+    """
+    default_days = 30.0
+    if expiry_date is None:
+        return default_days
+
+    now = datetime.now(timezone.utc)
+
+    if isinstance(expiry_date, datetime):
+        target = expiry_date if expiry_date.tzinfo else expiry_date.replace(tzinfo=timezone.utc)
+        return max(0.0, (target - now).total_seconds() / 86400.0)
+
+    if isinstance(expiry_date, (int, float)):
+        try:
+            target = datetime.fromtimestamp(float(expiry_date), tz=timezone.utc)
+            return max(0.0, (target - now).total_seconds() / 86400.0)
+        except Exception:
+            return default_days
+
+    text = str(expiry_date).strip()
+    if not text:
+        return default_days
+
+    # try iso format first
+    try:
+        normalized = text.replace("Z", "+00:00")
+        target = datetime.fromisoformat(normalized)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        return max(0.0, (target - now).total_seconds() / 86400.0)
+    except Exception:
+        pass
+
+    # common date patterns in market titles/questions
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y", "%b %d, %Y", "%B %d, %Y"):
+        try:
+            target = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            return max(0.0, (target - now).total_seconds() / 86400.0)
+        except Exception:
+            continue
+
+    # Extract an embedded date if present
+    match = re.search(r"(20\d{2}[-/]\d{1,2}[-/]\d{1,2})", text)
+    if match:
+        extracted = match.group(1).replace("/", "-")
+        try:
+            target = datetime.strptime(extracted, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            return max(0.0, (target - now).total_seconds() / 86400.0)
+        except Exception:
+            pass
+
+    return default_days
 
 
 class BaseBrain(ABC):

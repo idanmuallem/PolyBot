@@ -6,7 +6,7 @@ Uses a normal distribution model with historical volatility scaling.
 
 import math
 from scipy.stats import norm
-from models import MarketData
+from core.models import MarketData
 
 from .base import BaseBrain
 
