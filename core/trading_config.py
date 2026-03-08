@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import os
 
 
-DEFAULT_MIN_EV = 0.05
+DEFAULT_MIN_EV = 0.20
 
 
 @dataclass
