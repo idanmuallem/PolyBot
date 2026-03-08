@@ -55,7 +55,7 @@ class CryptoHunter(BasePolymarketHunter):
         """Return all crypto-related aliases used for Polymarket event matching."""
         return ["bitcoin", "btc", "ethereum", "eth", "solana", "sol"]
 
-    def hunt(self, skip_ids: list = None, add_cooldown_func=None) -> Optional[MarketData]:
+    def hunt(self, skip_ids: list = None, add_cooldown_func=None, log_func=None) -> Optional[MarketData]:
         """Hunt for a crypto market.
 
         Tries each symbol in order. Returns the highest-volume market found.
@@ -101,6 +101,7 @@ class CryptoHunter(BasePolymarketHunter):
                     alias,
                     skip_ids=skip_ids,
                     add_cooldown_func=add_cooldown_func,
+                    log_func=log_func,
                 )
                 if found and found.volume > highest_volume:
                     highest_volume = found.volume

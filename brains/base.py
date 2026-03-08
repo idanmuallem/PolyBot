@@ -10,6 +10,7 @@ while subclasses implement _calculate_probability().
 from abc import ABC, abstractmethod
 import re
 from datetime import datetime, timezone
+from core.trading_config import DEFAULT_MIN_EV
 from core.models import MarketData, TradeSignal
 
 
@@ -104,7 +105,7 @@ class BaseBrain(ABC):
         self,
         market: MarketData,
         live_truth: float,
-        min_ev: float = 0.15
+        min_ev: float = DEFAULT_MIN_EV
     ) -> TradeSignal:
         """Evaluate a market and generate a trade signal.
 

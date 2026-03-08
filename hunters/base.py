@@ -64,6 +64,7 @@ class BasePolymarketHunter(BaseHunter):
         max_pages: int = 5,
         required_keywords: list = None,
         add_cooldown_func=None,
+        log_func=None,
     ) -> Optional[MarketData]:
         """Generic Polymarket scanner used by all derived hunters.
 
@@ -167,6 +168,7 @@ class BasePolymarketHunter(BaseHunter):
                         if not (isinstance(tokens, list) and tokens):
                             continue
                         market_id = str(tokens[0]).strip()
+                        no_market_id = str(tokens[1]).strip() if len(tokens) > 1 else None
                         if market_id in skip_ids:
                             print(f"[{self.__class__.__name__}] SKIP cooldown | {candidate_name} | id={market_id}")
                             continue
@@ -242,6 +244,7 @@ class BasePolymarketHunter(BaseHunter):
                                 market_name=market_name,
                                 initial_price=current_price,
                                 volume=volume,
+                                no_market_id=no_market_id,
                             )
                             print(
                                 f"[{self.__class__.__name__}] SELECT best-candidate | {market_name} | "

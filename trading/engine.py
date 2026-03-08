@@ -23,7 +23,7 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
     """Run lightweight monitor loop with modular delegation."""
     config = TradingConfig.from_env()
     loop_delay = float(delay) if delay is not None else float(config.loop_delay_seconds)
-    min_ev_threshold = 0.20
+    min_ev_threshold = float(config.min_ev)
     allocation_fraction = 0.10
 
     executor = TradeExecutor(risk_config=RiskConfig(ev_threshold=config.min_ev))
@@ -61,11 +61,19 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
         asset_type = prepared["asset_type"]
         question = prepared["question"]
         model_used = prepared["model_used"]
-        poly_price = float(prepared["poly_price"])
+        price_yes = float(prepared["poly_price"])
 
         my_hunter.mark_seen(token_id)
 
-        if float(signal.expected_value) < float(min_ev_threshold):
+        ev_yes = (float(signal.fair_value) / float(price_yes) - 1.0) if price_yes > 0 else -1.0
+        price_no = max(1e-9, 1.0 - float(price_yes))
+        fair_no = 1.0 - float(signal.fair_value)
+        ev_no = (fair_no / price_no - 1.0) if price_no > 0 else -1.0
+
+        best_side = "YES" if ev_yes > ev_no else "NO"
+        final_ev = max(ev_yes, ev_no)
+
+        if float(final_ev) < float(min_ev_threshold):
             log_func(
                 "REJECTED",
                 asset_type,
@@ -73,7 +81,10 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
                 {
                     "market_name": question,
                     "reason": "EV below dynamic threshold",
-                    "ev": round(float(signal.expected_value), 4),
+                    "ev_yes": round(float(ev_yes), 4),
+                    "ev_no": round(float(ev_no), 4),
+                    "side": best_side,
+                    "ev": round(float(final_ev), 4),
                     "threshold": min_ev_threshold,
                 },
             )
@@ -103,9 +114,10 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
         executed = executor.evaluate_and_execute(
             market=prepared["market"],
             fair_value=float(signal.fair_value),
-            ev=float(signal.expected_value),
-            current_poly_price=poly_price,
+            ev=float(final_ev),
+            current_poly_price=price_yes,
             bet_amount_usd=float(bet_amount),
+            side=best_side,
             log_func=log_func,
         )
 
@@ -123,7 +135,10 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
                 "market_name": question,
                 "model_used": model_used,
                 "fair": round(float(signal.fair_value), 4),
-                "ev": round(float(signal.expected_value), 4),
+                "ev": round(float(final_ev), 4),
+                "ev_yes": round(float(ev_yes), 4),
+                "ev_no": round(float(ev_no), 4),
+                "side": best_side,
                 "kelly": round(float(signal.kelly_size), 4),
                 "bet_usd": round(float(bet_amount), 2),
                 "executed": bool(executed),

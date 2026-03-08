@@ -9,6 +9,7 @@ import os
 import logging
 from typing import Optional, Dict, Any, Callable, List
 from dataclasses import dataclass
+from core.trading_config import DEFAULT_MIN_EV
 from core.models import MarketData, Position
 
 try:
@@ -27,7 +28,7 @@ except Exception:
 @dataclass
 class RiskConfig:
     """Risk management configuration."""
-    ev_threshold: float = 0.15  # Minimum EV to execute trade
+    ev_threshold: float = DEFAULT_MIN_EV  # Minimum EV to execute trade
     max_position_size: float = 1.0  # Max position as fraction of capital
     max_daily_trades: int = 10  # Max trades per day
     stop_loss_pct: float = 0.05  # Stop loss percentage
@@ -179,6 +180,7 @@ class TradeExecutor:
                         shares=shares,
                         value=value,
                         pnl_percent=pnl_percent,
+                        side=str(raw.get("outcome") or raw.get("side") or "UNKNOWN"),
                     )
                 )
         except Exception as exc:
@@ -193,22 +195,34 @@ class TradeExecutor:
         shares: float,
         bet_amount: float,
         asset_type: str,
+        side: str,
+        no_token_id: Optional[str],
         log_func: Callable,
     ) -> bool:
         """Execute a live order or simulate it based on configuration."""
+        execution_side = str(side or "YES").upper()
+        execution_token_id = str(token_id)
+        execution_price = float(current_poly_price)
+
+        if execution_side == "NO":
+            if no_token_id:
+                execution_token_id = str(no_token_id)
+            execution_price = max(1e-6, 1.0 - float(current_poly_price))
+
         if self.dry_run:
             print(
-                f"[DRY-RUN] Simulation: Would have purchased {shares} of {token_id} "
-                f"for ${bet_amount}."
+                f"[DRY-RUN] Simulation: Would have purchased {shares} of {execution_token_id} "
+                f"({execution_side}) for ${bet_amount}."
             )
             log_func(
                 "DRY-RUN",
                 asset_type,
-                token_id,
+                execution_token_id,
                 {
-                    "price": current_poly_price,
+                    "price": execution_price,
                     "shares": shares,
                     "bet_amount_usd": bet_amount,
+                    "side": execution_side,
                 },
             )
             return True
@@ -217,21 +231,22 @@ class TradeExecutor:
             log_func(
                 "PAPER-TRADE",
                 asset_type,
-                token_id,
+                execution_token_id,
                 {
-                    "price": current_poly_price,
+                    "price": execution_price,
                     "shares": shares,
                     "bet_amount_usd": bet_amount,
                     "reason": "No live CLOB client configured",
+                    "side": execution_side,
                 },
             )
             return True
 
         order = OrderArgs(
-            price=current_poly_price,
+            price=execution_price,
             size=shares,
             side=BUY,
-            token_id=token_id,
+            token_id=execution_token_id,
         )
         try:
             resp = self.client.create_and_post_order(order)
@@ -242,15 +257,15 @@ class TradeExecutor:
             log_func(
                 "LIVE-TRADE",
                 asset_type,
-                token_id,
-                {"success": live_success, "response": resp},
+                execution_token_id,
+                {"success": live_success, "response": resp, "side": execution_side, "price": execution_price},
             )
             return live_success
         except Exception as exc:
             log_func(
                 "LIVE-TRADE-ERROR",
                 asset_type,
-                token_id,
+                execution_token_id,
                 f"Order failed: {exc}",
             )
             return False
@@ -326,6 +341,7 @@ class TradeExecutor:
         ev: float,
         current_poly_price: float,
         bet_amount_usd: float,
+        side: str,
         log_func: Callable,
     ) -> bool:
         """Evaluate market conditions and execute trade if criteria are met.
@@ -343,6 +359,15 @@ class TradeExecutor:
         """
         asset_type = market.asset_type
         token_id = market.market_id
+        execution_side = str(side or "YES").upper()
+
+        execution_token_id = token_id
+        execution_price = float(current_poly_price)
+        execution_fair_value = float(fair_value)
+        if execution_side == "NO":
+            execution_token_id = str(getattr(market, "no_market_id", None) or token_id)
+            execution_price = max(1e-6, 1.0 - float(current_poly_price))
+            execution_fair_value = 1.0 - float(fair_value)
 
         # ========================================
         # 1. Check EV threshold
@@ -376,22 +401,22 @@ class TradeExecutor:
         # ========================================
         # 5. Execute trade
         # ========================================
-        if current_poly_price <= 0:
+        if execution_price <= 0:
             log_func(
                 "EXECUTION",
                 asset_type,
-                token_id,
-                f"Invalid market price for execution: {current_poly_price}",
+                execution_token_id,
+                f"Invalid market price for execution: {execution_price}",
             )
             return False
 
-        shares = round(bet_amount_usd / current_poly_price, 2)
+        shares = round(bet_amount_usd / execution_price, 2)
 
         if shares <= 0:
             log_func(
                 "EXECUTION",
                 asset_type,
-                token_id,
+                execution_token_id,
                 f"Calculated zero shares for bet_amount_usd={bet_amount_usd}",
             )
             return False
@@ -399,23 +424,26 @@ class TradeExecutor:
         log_func(
             "AUTO-TRADE",
             asset_type,
-            token_id,
+            execution_token_id,
             {
-                "market_price": current_poly_price,
-                "fair_value": fair_value,
+                "market_price": execution_price,
+                "fair_value": execution_fair_value,
                 "ev": round(ev, 4),
                 "position_size": position_size,
                 "bet_amount_usd": bet_amount_usd,
                 "shares": shares,
+                "side": execution_side,
             },
         )
 
         executed = self.execute_trade(
             token_id=token_id,
-            current_poly_price=current_poly_price,
+            current_poly_price=float(current_poly_price),
             shares=shares,
             bet_amount=bet_amount_usd,
             asset_type=asset_type,
+            side=execution_side,
+            no_token_id=getattr(market, "no_market_id", None),
             log_func=log_func,
         )
 

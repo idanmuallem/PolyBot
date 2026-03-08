@@ -8,8 +8,26 @@ from datetime import datetime
 import pandas as pd
 
 
-DEFAULT_DB_PATH = os.path.join("trading", "trades.db")
+DEFAULT_DB_PATH = "/app/trades.db"
+FALLBACK_DB_PATH = os.path.join("trading", "trades.db")
 LEGACY_DB_PATH = os.path.join("trades.db", "trades.db")
+
+
+def _parse_payload_value(payload_value):
+    if isinstance(payload_value, dict):
+        return payload_value
+    if payload_value is None:
+        return {}
+    payload_text = str(payload_value).strip()
+    if not payload_text:
+        return {}
+    try:
+        return ast.literal_eval(payload_text)
+    except Exception:
+        try:
+            return json.loads(payload_text)
+        except Exception:
+            return {}
 
 
 def _normalize_db_path(db_path: str) -> str:
@@ -23,7 +41,13 @@ def _normalize_db_path(db_path: str) -> str:
 
     parent = os.path.dirname(normalized)
     if parent:
-        os.makedirs(parent, exist_ok=True)
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception:
+            normalized = FALLBACK_DB_PATH
+            fallback_parent = os.path.dirname(normalized)
+            if fallback_parent:
+                os.makedirs(fallback_parent, exist_ok=True)
 
     return normalized
 
@@ -130,7 +154,7 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str = DEFAU
 
 def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Time", "Action", "Market Name", "Price", "Fair Value", "EV", "Bet ($)", "Shares", "Token"])
+        return pd.DataFrame(columns=["Time", "Action", "Side", "Market Name", "Price", "Fair Value", "EV", "Bet ($)", "Shares", "Token"])
 
     transformed = df.copy()
 
@@ -141,23 +165,7 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
     else:
         transformed["Token"] = "-"
 
-    def _parse_payload(payload_value):
-        if isinstance(payload_value, dict):
-            return payload_value
-        if payload_value is None:
-            return {}
-        payload_text = str(payload_value).strip()
-        if not payload_text:
-            return {}
-        try:
-            return ast.literal_eval(payload_text)
-        except Exception:
-            try:
-                return json.loads(payload_text)
-            except Exception:
-                return {}
-
-    parsed_payload = transformed["payload"].apply(_parse_payload) if "payload" in transformed.columns else pd.Series([{}] * len(transformed))
+    parsed_payload = transformed["payload"].apply(_parse_payload_value) if "payload" in transformed.columns else pd.Series([{}] * len(transformed))
 
     transformed["Market Name"] = parsed_payload.apply(lambda p: p.get("market_name") if isinstance(p, dict) else None)
     transformed["Price"] = parsed_payload.apply(lambda p: p.get("price", p.get("market_price")) if isinstance(p, dict) else None)
@@ -167,6 +175,7 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
     transformed["Shares"] = parsed_payload.apply(lambda p: p.get("shares") if isinstance(p, dict) else None)
     transformed["Model Used"] = parsed_payload.apply(lambda p: p.get("model_used") if isinstance(p, dict) else None)
     transformed["Reject Reason"] = parsed_payload.apply(lambda p: p.get("reason") if isinstance(p, dict) else None)
+    transformed["Side"] = parsed_payload.apply(lambda p: p.get("side") if isinstance(p, dict) else None)
 
     def _reject_metrics(payload):
         if not isinstance(payload, dict):
@@ -174,6 +183,8 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
         numeric_keys = [
             "ev",
+            "ev_yes",
+            "ev_no",
             "threshold",
             "required_amount",
             "current_balance",
@@ -216,6 +227,7 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
         "Time",
         "Action",
         "Asset",
+        "Side",
         "Market Name",
         "Reject Reason",
         "Reject Metrics",
@@ -247,3 +259,120 @@ def fetch_latest_history(limit: int = 50, db_path: str = DEFAULT_DB_PATH) -> pd.
             params=(limit,),
         )
     return process_logs_for_display(history_df)
+
+
+def get_trade_stats(db_path: str = DEFAULT_DB_PATH) -> dict:
+    db_file = _normalize_db_path(db_path)
+    with sqlite3.connect(db_file, timeout=10) as conn:
+        trade_df = pd.read_sql_query(
+            """
+            SELECT level, payload
+            FROM hunt_history
+            WHERE level IN ('LIVE-TRADE', 'DRY-RUN', 'PAPER-TRADE', 'AUTO-TRADE', 'TAKE-PROFIT', 'STOP-LOSS')
+            """,
+            conn,
+        )
+
+    if trade_df.empty:
+        return {
+            "win_rate": 0.0,
+            "total_trades": 0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+        }
+
+    payloads = trade_df["payload"].apply(_parse_payload_value)
+
+    realized_win = []
+    realized_loss = []
+    for level, payload in zip(trade_df["level"], payloads):
+        if not isinstance(payload, dict):
+            continue
+
+        price = float(payload.get("price", 0.0) or 0.0)
+        shares = float(payload.get("shares", 0.0) or 0.0)
+        gross_value = price * shares
+
+        if level == "TAKE-PROFIT" and gross_value > 0:
+            realized_win.append(gross_value)
+        elif level == "STOP-LOSS" and gross_value > 0:
+            realized_loss.append(gross_value)
+
+    trade_execution_levels = {"LIVE-TRADE", "DRY-RUN", "PAPER-TRADE", "AUTO-TRADE"}
+    total_trades = int(trade_df["level"].isin(trade_execution_levels).sum())
+    win_events = len(realized_win)
+    loss_events = len(realized_loss)
+    denom = win_events + loss_events
+    win_rate = (float(win_events) / float(denom) * 100.0) if denom > 0 else 0.0
+
+    return {
+        "win_rate": round(win_rate, 2),
+        "total_trades": total_trades,
+        "avg_win": round(sum(realized_win) / len(realized_win), 2) if realized_win else 0.0,
+        "avg_loss": round(sum(realized_loss) / len(realized_loss), 2) if realized_loss else 0.0,
+    }
+
+
+def get_equity_curve(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+    db_file = _normalize_db_path(db_path)
+    with sqlite3.connect(db_file, timeout=10) as conn:
+        track_df = pd.read_sql_query(
+            """
+            SELECT id, timestamp, payload
+            FROM hunt_history
+            WHERE level = 'TRACK'
+            ORDER BY id ASC
+            """,
+            conn,
+        )
+
+    if track_df.empty:
+        return pd.DataFrame(columns=["timestamp", "total_equity"])
+
+    payloads = track_df["payload"].apply(_parse_payload_value)
+    track_df["total_equity"] = payloads.apply(
+        lambda payload: float(payload.get("total_equity")) if isinstance(payload, dict) and payload.get("total_equity") is not None else None
+    )
+    track_df = track_df.dropna(subset=["total_equity"])
+    if track_df.empty:
+        return pd.DataFrame(columns=["timestamp", "total_equity"])
+
+    track_df["timestamp"] = pd.to_datetime(track_df["timestamp"], errors="coerce")
+    track_df = track_df.dropna(subset=["timestamp"])
+    return track_df[["timestamp", "total_equity"]]
+
+
+def get_system_throughput(db_path: str = DEFAULT_DB_PATH) -> dict:
+    db_file = _normalize_db_path(db_path)
+    with sqlite3.connect(db_file, timeout=10) as conn:
+        throughput_df = pd.read_sql_query(
+            """
+            SELECT level, payload
+            FROM hunt_history
+            WHERE DATE(timestamp) = DATE('now', 'localtime')
+            """,
+            conn,
+        )
+
+    if throughput_df.empty:
+        return {
+            "total_scanned": 0,
+            "total_rejected": 0,
+            "timeouts_errors": 0,
+        }
+
+    level_series = throughput_df["level"].astype(str)
+    payload_series = throughput_df["payload"].astype(str).str.lower()
+
+    total_scanned = int(level_series.isin(["TRACK", "FILTERED", "SCAN-SKIP", "REJECTED"]).sum())
+    total_rejected = int((level_series == "REJECTED").sum())
+    timeouts_errors = int(
+        level_series.str.contains("ERROR", na=False).sum()
+        + payload_series.str.contains("timeout", na=False).sum()
+    )
+
+    return {
+        "total_scanned": total_scanned,
+        "total_rejected": total_rejected,
+        "timeouts_errors": timeouts_errors,
+    }

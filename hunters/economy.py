@@ -69,7 +69,7 @@ class EconomyHunter(BasePolymarketHunter):
         aliases.update(name.lower() for name in self.fred_client.FRED_SERIES_MAP.keys())
         return list(aliases)
 
-    def hunt(self, skip_ids: list = None, add_cooldown_func=None) -> Optional[MarketData]:
+    def hunt(self, skip_ids: list = None, add_cooldown_func=None, log_func=None) -> Optional[MarketData]:
         """Hunt for an economy market.
 
         Attempts each configured indicator in order.
@@ -102,6 +102,7 @@ class EconomyHunter(BasePolymarketHunter):
                 indicator,
                 skip_ids=skip_ids,
                 add_cooldown_func=add_cooldown_func,
+                log_func=log_func,
             )
 
             if found:

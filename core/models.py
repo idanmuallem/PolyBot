@@ -11,6 +11,7 @@ class MarketData:
     initial_price: float
     volume: float
     expiry_date: Optional[str] = None
+    no_market_id: Optional[str] = None
 
 
 @dataclass
@@ -31,3 +32,4 @@ class Position:
     shares: float
     value: float
     pnl_percent: float
+    side: str = "UNKNOWN"

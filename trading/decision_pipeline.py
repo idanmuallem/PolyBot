@@ -81,6 +81,7 @@ class ExecuteHandler(DecisionHandler):
             ev=context.signal.expected_value,
             current_poly_price=context.poly_price,
             bet_amount_usd=context.actual_bet_usd,
+            side="YES",
             log_func=log_func,
         )
         context.executed = executed

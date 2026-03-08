@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: us-east-1
-  ECR_REPOSITORY: polybot
-  EC2_INSTANCE_ID: i-0xxxxxxxxxxxx  # REPLACE with your actual EC2 Instance ID
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: polybot/main
+  EC2_INSTANCE_ID: i-0180454c9417597f9
 
 jobs:
   build-and-push:
@@ -55,7 +55,8 @@ jobs:
             --parameters 'commands=[
               "aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin 979667333506.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com",
               "docker pull 979667333506.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest",
-              "docker stop ${{ env.ECR_REPOSITORY }} || true",
-              "docker rm ${{ env.ECR_REPOSITORY }} || true",
-              "docker run -d --name ${{ env.ECR_REPOSITORY }} -p 80:8000 979667333506.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest"
+              "docker stop polybot || true",
+              "docker rm polybot || true",
+              "touch /home/ec2-user/trades.db && chmod 666 /home/ec2-user/trades.db",
+              "docker run -d --name polybot -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db --env-file /home/ec2-user/.env 979667333506.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest"
             ]'
