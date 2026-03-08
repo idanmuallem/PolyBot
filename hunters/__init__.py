@@ -30,6 +30,4 @@ def get_default_hunters() -> list:
     """
     return [
         CryptoHunter(),
-        WeatherHunter(),
-        EconomyHunter(),
     ]

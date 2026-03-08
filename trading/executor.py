@@ -52,7 +52,7 @@ class TradeExecutor:
         self.risk_config = risk_config or RiskConfig()
         self.trade_count_today = 0
         self.client = None
-        self.proxy_address = os.getenv("PROXY_WALLET_ADDRESS")
+        self.proxy_address = os.getenv("PROXY_WALLET_ADDRESS") or os.getenv("POLY_ADDRESS")
         self.dry_run = str(os.getenv("DRY_RUN", "True")).strip().lower() in (
             "1",
             "true",
@@ -78,7 +78,10 @@ class TradeExecutor:
                 funder=proxy_address,
                 signature_type=1,
             )
-            creds = temp_client.create_or_derive_api_key()
+            if hasattr(temp_client, "create_or_derive_api_key"):
+                creds = temp_client.create_or_derive_api_key()
+            else:
+                creds = temp_client.create_or_derive_api_creds()
             self.client = ClobClient(
                 host="https://clob.polymarket.com",
                 chain_id=137,
@@ -101,8 +104,13 @@ class TradeExecutor:
         Returns:
             Balance value used by engine balance guard.
         """
+        paper_balance = float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
+
+        if self.dry_run:
+            return paper_balance
+
         if self.client is None:
-            return float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
+            return paper_balance
 
         try:
             if hasattr(self.client, "get_balance_allowance"):
@@ -125,7 +133,7 @@ class TradeExecutor:
         except Exception as exc:
             logging.warning(f"Could not fetch live balance from CLOB client: {exc}")
 
-        return 0.0
+        return paper_balance if self.dry_run else 0.0
 
     def get_open_positions(self) -> List[Position]:
         """Fetch current open positions and calculate mark-to-mid PnL."""

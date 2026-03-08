@@ -1,0 +1,11 @@
+services:
+  polybot:
+    build: .
+    container_name: polybot
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./trades.db:/app/trades.db
+    restart: unless-stopped

@@ -1,13 +1,54 @@
 import ast
 import json
+import os
+import shutil
 import sqlite3
 from datetime import datetime
 
 import pandas as pd
 
 
-def init_db(db_path: str = "trades.db"):
-    with sqlite3.connect(db_path) as conn:
+DEFAULT_DB_PATH = os.path.join("trading", "trades.db")
+LEGACY_DB_PATH = os.path.join("trades.db", "trades.db")
+
+
+def _normalize_db_path(db_path: str) -> str:
+    normalized = str(db_path or DEFAULT_DB_PATH)
+
+    if os.path.normpath(normalized) == os.path.normpath("trades.db"):
+        normalized = DEFAULT_DB_PATH
+
+    if os.path.isdir(normalized):
+        normalized = os.path.join(normalized, "trades.db")
+
+    parent = os.path.dirname(normalized)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    return normalized
+
+
+def _migrate_legacy_db_if_needed(target_db_path: str):
+    legacy_db = os.path.normpath(LEGACY_DB_PATH)
+    target_db = os.path.normpath(target_db_path)
+
+    if target_db == legacy_db:
+        return
+
+    if os.path.exists(target_db):
+        return
+
+    if os.path.exists(legacy_db):
+        parent = os.path.dirname(target_db)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        shutil.copy2(legacy_db, target_db)
+
+
+def init_db(db_path: str = DEFAULT_DB_PATH):
+    db_file = _normalize_db_path(db_path)
+    _migrate_legacy_db_if_needed(db_file)
+    with sqlite3.connect(db_file) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS hunt_history (
@@ -22,7 +63,8 @@ def init_db(db_path: str = "trades.db"):
         )
 
 
-def log_event(bridge, level, asset_type, token_id, payload, db_path: str = "trades.db"):
+def log_event(bridge, level, asset_type, token_id, payload, db_path: str = DEFAULT_DB_PATH):
+    db_file = _normalize_db_path(db_path)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     payload_str = str(payload)
 
@@ -40,7 +82,7 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str = "trad
     print(f"[{ts}] [{level}] [{asset_type}] [{token_id}] {payload_pretty}")
 
     try:
-        with sqlite3.connect(db_path, timeout=10) as conn:
+        with sqlite3.connect(db_file, timeout=10) as conn:
             conn.execute(
                 """
                 INSERT INTO hunt_history (timestamp, level, asset_type, token_id, payload)
@@ -124,6 +166,37 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
     transformed["Bet ($)"] = parsed_payload.apply(lambda p: p.get("bet_usd", p.get("bet_amount_usd")) if isinstance(p, dict) else None)
     transformed["Shares"] = parsed_payload.apply(lambda p: p.get("shares") if isinstance(p, dict) else None)
     transformed["Model Used"] = parsed_payload.apply(lambda p: p.get("model_used") if isinstance(p, dict) else None)
+    transformed["Reject Reason"] = parsed_payload.apply(lambda p: p.get("reason") if isinstance(p, dict) else None)
+
+    def _reject_metrics(payload):
+        if not isinstance(payload, dict):
+            return None
+
+        numeric_keys = [
+            "ev",
+            "threshold",
+            "required_amount",
+            "current_balance",
+            "market_price",
+            "fair_value",
+            "position_size",
+            "bet_amount_usd",
+            "shares",
+            "volume",
+        ]
+
+        parts = []
+        for key in numeric_keys:
+            if key in payload and payload.get(key) is not None:
+                try:
+                    value = float(payload.get(key))
+                    parts.append(f"{key}={value:.4f}")
+                except Exception:
+                    parts.append(f"{key}={payload.get(key)}")
+
+        return " | ".join(parts) if parts else None
+
+    transformed["Reject Metrics"] = parsed_payload.apply(_reject_metrics)
 
     transformed["Price"] = pd.to_numeric(transformed["Price"], errors="coerce")
     transformed["Fair Value"] = pd.to_numeric(transformed["Fair Value"], errors="coerce")
@@ -139,14 +212,35 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
     transformed = transformed.drop(columns=[c for c in ["payload", "token_id", "timestamp_dt"] if c in transformed.columns])
 
-    desired_order = ["Time", "Action", "Asset", "Market Name", "Model Used", "Price", "Fair Value", "EV", "Bet ($)", "Shares", "Token"]
+    desired_order = [
+        "Time",
+        "Action",
+        "Asset",
+        "Market Name",
+        "Reject Reason",
+        "Reject Metrics",
+        "Model Used",
+        "Price",
+        "Fair Value",
+        "EV",
+        "Bet ($)",
+        "Shares",
+        "Token",
+    ]
     transformed = transformed[[c for c in desired_order if c in transformed.columns]]
-    return transformed.fillna("-")
+
+    numeric_cols = ["Price", "Fair Value", "EV", "Bet ($)", "Shares"]
+    text_cols = [col for col in transformed.columns if col not in numeric_cols]
+    for col in text_cols:
+        transformed[col] = transformed[col].fillna("-")
+
+    return transformed
 
 
-def fetch_latest_history(limit: int = 50, db_path: str = "trades.db") -> pd.DataFrame:
+def fetch_latest_history(limit: int = 50, db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
     """Return display-ready latest history rows."""
-    with sqlite3.connect(db_path, timeout=10) as conn:
+    db_file = _normalize_db_path(db_path)
+    with sqlite3.connect(db_file, timeout=10) as conn:
         history_df = pd.read_sql_query(
             "SELECT timestamp, level, asset_type, token_id, payload FROM hunt_history ORDER BY id DESC LIMIT ?",
             conn,

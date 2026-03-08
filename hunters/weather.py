@@ -148,7 +148,7 @@ class WeatherHunter(BasePolymarketHunter):
         """
         return ["weather", "temperature", "temp", "high", "low", "precipitation", "rain", "snow", "degree"]
 
-    def hunt(self, skip_ids: list = None) -> Optional[Dict[str, Any]]:
+    def hunt(self, skip_ids: list = None, add_cooldown_func=None) -> Optional[Dict[str, Any]]:
         """Hunt for a weather market.
 
         Tries each configured location in turn.  Uses the shared
@@ -184,6 +184,7 @@ class WeatherHunter(BasePolymarketHunter):
                 location,
                 skip_ids=skip_ids,
                 required_keywords=[location],
+                add_cooldown_func=add_cooldown_func,
             )
 
             if found:

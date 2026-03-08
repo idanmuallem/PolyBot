@@ -1,8 +1,16 @@
 from dataclasses import asdict
+import inspect
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+
+def _stretch_kwargs(api_fn):
+    params = inspect.signature(api_fn).parameters
+    if "width" in params:
+        return {"width": "stretch"}
+    return {"use_container_width": True}
 
 
 def render_kpis(bridge):
@@ -33,8 +41,14 @@ def render_ev_chart(bridge):
         labels={"market_name": "Market", "ev": "Expected Value"},
         template="plotly_dark",
     )
-    fig.update_layout(xaxis_tickangle=-20)
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        xaxis_tickangle=-20,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis={"showgrid": False},
+        yaxis={"showgrid": False},
+    )
+    st.plotly_chart(fig, **_stretch_kwargs(st.plotly_chart))
 
 
 def render_positions(bridge):
@@ -60,11 +74,11 @@ def render_positions(bridge):
             "value": "${:,.2f}",
             "pnl_percent": "{:.2f}%",
         }
-    ).applymap(
+    ).map(
         lambda v: "color: #16a34a" if v > 0 else ("color: #dc2626" if v < 0 else ""),
         subset=["pnl_percent"],
     )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, hide_index=True, **_stretch_kwargs(st.dataframe))
 
 
 def render_history_table(data_manager):
@@ -84,21 +98,34 @@ def render_history_table(data_manager):
             color = color_map.get(str(action_value), "#e5e7eb")
             return f"color: {color}; font-weight: 600;"
 
+        def _style_ev(value) -> str:
+            try:
+                ev = float(value)
+            except Exception:
+                return ""
+            if ev >= 0.50:
+                return "color: #22c55e; font-weight: 700;"
+            if ev <= 0:
+                return "color: #ef4444;"
+            return ""
+
         styled_df = display_df.style
-        if "EV" in display_df.columns:
-            styled_df = styled_df.background_gradient(subset=["EV"], cmap="RdYlGn")
         if "Action" in display_df.columns:
-            styled_df = styled_df.applymap(_style_action, subset=["Action"])
+            styled_df = styled_df.map(_style_action, subset=["Action"])
+        if "EV" in display_df.columns:
+            styled_df = styled_df.map(_style_ev, subset=["EV"])
 
         st.dataframe(
             styled_df,
-            use_container_width=True,
             hide_index=True,
+            **_stretch_kwargs(st.dataframe),
             column_config={
                 "Time": st.column_config.TextColumn("Time"),
                 "Action": st.column_config.TextColumn("Action"),
                 "Asset": st.column_config.TextColumn("Asset"),
                 "Market Name": st.column_config.TextColumn("Market Name"),
+                "Reject Reason": st.column_config.TextColumn("Reject Reason"),
+                "Reject Metrics": st.column_config.TextColumn("Reject Metrics"),
                 "Model Used": st.column_config.TextColumn("Model Used"),
                 "Price": st.column_config.NumberColumn("Price", format="%.3f"),
                 "Fair Value": st.column_config.NumberColumn("Fair Value", format="%.3f"),

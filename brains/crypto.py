@@ -235,5 +235,6 @@ class HybridCryptoBrain(BaseBrain):
         return float(norm.cdf(d2))
 
 
-    # Backward compatibility for existing imports/factory usage
-    CryptoBrain = HybridCryptoBrain
+
+# Backward compatibility for existing imports/factory usage
+CryptoBrain = HybridCryptoBrain

@@ -52,7 +52,7 @@ class BasePolymarketHunter(BaseHunter):
     # independently of non-Polymarket hunters.
     PRICE_FLOOR = 0.10
     PRICE_CEILING = 0.85
-    MIN_VOLUME = 250
+    MIN_VOLUME = 50000
     STRIKE_RATIO_MIN = 0.2
     STRIKE_RATIO_MAX = 2.0
 
@@ -63,6 +63,7 @@ class BasePolymarketHunter(BaseHunter):
         skip_ids: list = None,
         max_pages: int = 5,
         required_keywords: list = None,
+        add_cooldown_func=None,
     ) -> Optional[MarketData]:
         """Generic Polymarket scanner used by all derived hunters.
 
@@ -151,6 +152,10 @@ class BasePolymarketHunter(BaseHunter):
                         if market.get("closed"):
                             continue
 
+                        candidate_name = (
+                            f"{event.get('title','')} - {market.get('groupItemTitle','')}"
+                        ).strip(" -") or market.get("question", "unknown")
+
                         # extract token id early so we can honour skip_ids
                         tokens = market.get("clobTokenIds")
                         if isinstance(tokens, str):
@@ -163,6 +168,7 @@ class BasePolymarketHunter(BaseHunter):
                             continue
                         market_id = str(tokens[0]).strip()
                         if market_id in skip_ids:
+                            print(f"[{self.__class__.__name__}] SKIP cooldown | {candidate_name} | id={market_id}")
                             continue
 
                         # price filters - try multiple field names for compatibility
@@ -172,9 +178,18 @@ class BasePolymarketHunter(BaseHunter):
                             price_fields = {k: v for k, v in market.items() if 'price' in k.lower()}
                             if price_fields:
                                 print(f"[{self.__class__.__name__}] Available price fields: {price_fields}")
-                        print(f"[{self.__class__.__name__}] Market {market_id} has price: {current_price} (lastTradePrice={market.get('lastTradePrice')})")
+                        print(
+                            f"[{self.__class__.__name__}] CANDIDATE | {candidate_name} | id={market_id} | "
+                            f"price={current_price}"
+                        )
                         if current_price < self.PRICE_FLOOR or current_price > self.PRICE_CEILING:
-                            print(f"[{self.__class__.__name__}] Price {current_price} outside bounds [{self.PRICE_FLOOR}, {self.PRICE_CEILING}]")
+                            print(
+                                f"[{self.__class__.__name__}] REJECT price-bounds | {candidate_name} | "
+                                f"id={market_id} | price={current_price} outside "
+                                f"[{self.PRICE_FLOOR}, {self.PRICE_CEILING}]"
+                            )
+                            if add_cooldown_func:
+                                add_cooldown_func(market_id)
                             continue
 
                         # allow subclass to adjust anchor/keyword if needed
@@ -190,6 +205,9 @@ class BasePolymarketHunter(BaseHunter):
 
                         valid_strike = self.extract_strike(full_text, anchor)
                         if valid_strike is None:
+                            print(f"[{self.__class__.__name__}] REJECT no-strike | {candidate_name} | id={market_id}")
+                            if add_cooldown_func:
+                                add_cooldown_func(market_id)
                             continue
 
                         # volume requirement
@@ -200,6 +218,12 @@ class BasePolymarketHunter(BaseHunter):
                             volume = float(market.get("tradingVolume", 0) or 0)
 
                         if volume < self.MIN_VOLUME:
+                            print(
+                                f"[{self.__class__.__name__}] REJECT low-volume | {candidate_name} | "
+                                f"id={market_id} | volume={volume} < {self.MIN_VOLUME}"
+                            )
+                            if add_cooldown_func:
+                                add_cooldown_func(market_id)
                             continue
 
                         if volume > highest_volume:
@@ -219,7 +243,10 @@ class BasePolymarketHunter(BaseHunter):
                                 initial_price=current_price,
                                 volume=volume,
                             )
-                            print(f"[{self.__class__.__name__}] Created MarketData: id={market_id}, initial_price={current_price}, strike={valid_strike}, volume={volume}")
+                            print(
+                                f"[{self.__class__.__name__}] SELECT best-candidate | {market_name} | "
+                                f"id={market_id} | price={current_price} | strike={valid_strike} | volume={volume}"
+                            )
 
             except Exception as e:
                 print(f"[{self.__class__.__name__}] Scan error on page {page}: {e}")
@@ -242,7 +269,7 @@ class BasePolymarketHunter(BaseHunter):
         pass
 
     @abstractmethod
-    def hunt(self, skip_ids: list = None) -> Optional[MarketData]:
+    def hunt(self, skip_ids: list = None, add_cooldown_func=None) -> Optional[MarketData]:
         """Hunt for a market matching this hunter's domain.
         
         The skip_ids parameter allows the engine to exclude markets currently in cooldown,
@@ -250,6 +277,7 @@ class BasePolymarketHunter(BaseHunter):
 
         Args:
             skip_ids: List of market_ids to skip (in cooldown). If None, defaults to [].
+            add_cooldown_func: Optional callback accepting market_id for cooldown tracking.
 
         Returns:
             A MarketData object with market details, or None if no suitable market is found.

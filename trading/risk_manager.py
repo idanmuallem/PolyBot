@@ -1,6 +1,3 @@
-from typing import Any
-
-
 class PortfolioManager:
     def __init__(self, bridge, executor, config):
         self.bridge = bridge
@@ -14,6 +11,47 @@ class PortfolioManager:
         self.bridge.current_portfolio = positions
         self.bridge.open_position_value = sum(p.value for p in positions)
         self.bridge.total_pnl = sum((p.current_price - p.initial_price) * p.shares for p in positions)
+
+    def free_up_capital(self, required_amount: float, log_func) -> bool:
+        self._refresh_portfolio()
+
+        if float(self.bridge.current_balance) >= float(required_amount):
+            return True
+
+        weakest_first = sorted(
+            list(self.bridge.current_portfolio),
+            key=lambda position: float(getattr(position, "pnl_percent", 0.0)),
+        )
+
+        for position in weakest_first:
+            token_id = str(position.token_id)
+            shares = float(position.shares)
+            current_price = float(position.current_price)
+            position_value = float(getattr(position, "value", shares * current_price))
+
+            sold = self.executor.sell_position(token_id, shares, current_price, log_func)
+            if not sold:
+                continue
+
+            self.bridge.current_balance = float(self.bridge.current_balance) + max(0.0, position_value)
+            log_func(
+                "OPPORTUNITY-SWAP",
+                "Portfolio",
+                token_id,
+                {
+                    "message": f"Liquidated {token_id} to free up capital for high-EV trade.",
+                    "freed_value": round(position_value, 4),
+                    "required_amount": round(float(required_amount), 4),
+                    "current_balance": round(float(self.bridge.current_balance), 4),
+                },
+            )
+
+            if float(self.bridge.current_balance) >= float(required_amount):
+                self._refresh_portfolio()
+                return True
+
+        self._refresh_portfolio()
+        return float(self.bridge.current_balance) >= float(required_amount)
 
     def manage_portfolio(self, log_func):
         self._refresh_portfolio()

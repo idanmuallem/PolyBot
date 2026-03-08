@@ -1,42 +1,57 @@
 import re
 from typing import Optional
 
-# regex mirrors original pattern from CryptoHunter; allows optional '$' and
-# skips absurdly large numbers by later ratio filtering.
-_PATTERN = re.compile(r"(?:\$)?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*([kKmMbB])?")
-
-
 def extract_crypto_strike(text: str, anchor: float) -> Optional[float]:
-    """Scan ``text`` for a plausible crypto strike value.
+    """Extract the most logical crypto strike from market text."""
+    if not text:
+        return None
 
-    The function returns the first candidate whose ratio to ``anchor`` lies
-    within the STRIKE_RATIO bounds (0.2–2.0).  If ``anchor`` is zero or
-    missing, only syntactic extraction is performed.
-    """
-    candidates = []
-    for match in _PATTERN.finditer(text):
-        try:
-            base = float(match.group(1).replace(",", ""))
-        except Exception:
-            continue
-        suffix = (match.group(2) or "").lower()
-        if suffix == "k":
-            base *= 1_000
-        elif suffix == "m":
-            base *= 1_000_000
-        elif suffix == "b":
-            base *= 1_000_000_000
-        candidates.append(base)
+    clean_text = text.upper()
 
-    # Ratio bounds for crypto strikes
-    STRIKE_RATIO_MIN = 0.2
-    STRIKE_RATIO_MAX = 2.0
+    # 1. Strip out future years so they aren't confused as prices
+    for y in ["2024", "2025", "2026", "2027", "2028"]:
+        clean_text = clean_text.replace(y, "")
 
-    for val in candidates:
-        try:
-            ratio = val / anchor if anchor else 0
-        except Exception:
-            continue
-        if STRIKE_RATIO_MIN < ratio < STRIKE_RATIO_MAX:
-            return val
-    return None
+    # 2. Strip out currency symbols and commas
+    clean_text = clean_text.replace(",", "").replace("$", "")
+
+    # 3. Convert M (Millions) and B (Billions) into standard zeroes
+    clean_text = re.sub(r'(\d+)M', r'\g<1>000000', clean_text)
+    clean_text = re.sub(r'(\d+)B', r'\g<1>000000000', clean_text)
+
+    # 4. Extract all remaining numbers
+    matches = re.findall(r"(\d+(?:\.\d+)?)", clean_text)
+
+    if not matches:
+        print(f"[Parser] FAILED to extract strike from: {text}")
+        return None
+
+    try:
+        numbers = [float(m) for m in matches]
+        valid_candidates = []
+
+        # 5. Sanity Check: Throw out dates and noise using a ratio
+        for num in numbers:
+            if anchor and anchor > 0:
+                ratio = num / anchor
+                # The strike must be between 5% and 5,000% of the live price
+                # e.g., If BTC is 65k, this allows strikes from $3,250 to $3.25 Million
+                # This instantly deletes dates like "31" (ratio = 0.0004)
+                if 0.05 <= ratio <= 50.0:
+                    valid_candidates.append(num)
+            else:
+                valid_candidates.append(num)
+
+        if not valid_candidates:
+            print(f"[Parser] FAILED sanity check (all numbers were dates/noise): {text}")
+            return None
+
+        # 6. Now pick the valid number closest to the live price
+        if anchor and anchor > 0:
+            return min(valid_candidates, key=lambda x: abs(x - anchor))
+        else:
+            return max(valid_candidates)
+
+    except Exception as e:
+        print(f"[Parser] Exception during parsing: {e}")
+        return None

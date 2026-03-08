@@ -3,7 +3,7 @@ import threading
 
 import streamlit as st
 
-from orchestration.engine import run_market_monitor
+from trading.engine import run_market_monitor
 import ui.data_manager as data_manager
 from core.bridge import get_bridge
 from ui.components import (
@@ -54,10 +54,9 @@ with st.sidebar:
         st.warning("Watch-Only mode enabled by Balance Guard")
 
 # PERFORMANCE: placeholders for partial redraws
-kpi_placeholder = st.empty()
-chart_placeholder = st.empty()
-positions_placeholder = st.empty()
-history_placeholder = st.empty()
+row1_placeholder = st.empty()
+row2_placeholder = st.empty()
+row3_placeholder = st.empty()
 
 
 def _render_dashboard_snapshot():
@@ -65,21 +64,19 @@ def _render_dashboard_snapshot():
     if current_token:
         bridge.market_name_by_token[current_token] = bridge.market_question
 
-    with kpi_placeholder.container():
-        with st.container():
-            render_kpis(bridge)
+    with row1_placeholder.container():
+        render_kpis(bridge)
 
-    with chart_placeholder.container():
-        with st.container():
+    with row2_placeholder.container():
+        col1, col2 = st.columns([1, 1])
+        with col1:
             render_ev_chart(bridge)
-
-    with positions_placeholder.container():
-        with st.container():
+        with col2:
             render_positions(bridge)
 
-    with history_placeholder.container():
-        with st.container():
-            render_history_table(data_manager)
+    with row3_placeholder.container():
+        st.divider()
+        render_history_table(data_manager)
 
 
 if hasattr(st, "fragment"):
