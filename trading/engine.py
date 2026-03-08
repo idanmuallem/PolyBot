@@ -73,6 +73,10 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
         best_side = "YES" if ev_yes > ev_no else "NO"
         final_ev = max(ev_yes, ev_no)
 
+        diagnostic_msg = f"[EV-MATH] YES(P: {price_yes:.3f}, FV: {float(signal.fair_value):.3f}, EV: {ev_yes:.2f}) | NO(P: {price_no:.3f}, FV: {fair_no:.3f}, EV: {ev_no:.2f}) | PICK: {best_side}"
+        print(diagnostic_msg)
+        bridge.terminal_logs.appendleft(diagnostic_msg)
+
         if float(final_ev) < float(min_ev_threshold):
             log_func(
                 "REJECTED",

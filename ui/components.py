@@ -169,6 +169,13 @@ def render_trade_stats(data_manager):
     c2.metric("Total Trades", f"{int(stats.get('total_trades', 0))}")
     c3.metric("Avg Win ($)", f"${float(stats.get('avg_win', 0.0)):,.2f}")
     c4.metric("Avg Loss ($)", f"${float(stats.get('avg_loss', 0.0)):,.2f}")
+    
+    st.markdown("##### Side Attribution")
+    y1, y2, n1, n2 = st.columns(4)
+    y1.metric("✅ YES Trades", f"{int(stats.get('total_yes_trades', 0))}")
+    y2.metric("YES Win Rate", f"{float(stats.get('yes_win_rate', 0.0)):.2f}%")
+    n1.metric("🔶 NO Trades", f"{int(stats.get('total_no_trades', 0))}")
+    n2.metric("NO Win Rate", f"{float(stats.get('no_win_rate', 0.0)):.2f}%")
 
 
 def render_system_throughput(data_manager, bridge):

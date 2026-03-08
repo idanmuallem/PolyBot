@@ -305,11 +305,59 @@ def get_trade_stats(db_path: str = DEFAULT_DB_PATH) -> dict:
     denom = win_events + loss_events
     win_rate = (float(win_events) / float(denom) * 100.0) if denom > 0 else 0.0
 
+    yes_trades = 0
+    no_trades = 0
+    yes_wins = 0
+    no_wins = 0
+    yes_losses = 0
+    no_losses = 0
+
+    for idx, (level, payload) in enumerate(zip(trade_df["level"], payloads)):
+        if not isinstance(payload, dict):
+            continue
+        if level not in trade_execution_levels:
+            continue
+        
+        side = str(payload.get("side", "")).upper()
+        if side == "YES":
+            yes_trades += 1
+        elif side == "NO":
+            no_trades += 1
+
+    for level, payload in zip(trade_df["level"], payloads):
+        if not isinstance(payload, dict):
+            continue
+        side = str(payload.get("side", "")).upper()
+        
+        price = float(payload.get("price", 0.0) or 0.0)
+        shares = float(payload.get("shares", 0.0) or 0.0)
+        gross_value = price * shares
+        
+        if level == "TAKE-PROFIT" and gross_value > 0:
+            if side == "YES":
+                yes_wins += 1
+            elif side == "NO":
+                no_wins += 1
+        elif level == "STOP-LOSS" and gross_value > 0:
+            if side == "YES":
+                yes_losses += 1
+            elif side == "NO":
+                no_losses += 1
+
+    yes_denom = yes_wins + yes_losses
+    no_denom = no_wins + no_losses
+    yes_win_rate = (float(yes_wins) / float(yes_denom) * 100.0) if yes_denom > 0 else 0.0
+    no_win_rate = (float(no_wins) / float(no_denom) * 100.0) if no_denom > 0 else 0.0
+
     return {
         "win_rate": round(win_rate, 2),
         "total_trades": total_trades,
         "avg_win": round(sum(realized_win) / len(realized_win), 2) if realized_win else 0.0,
         "avg_loss": round(sum(realized_loss) / len(realized_loss), 2) if realized_loss else 0.0,
+        "total_yes_trades": yes_trades,
+        "yes_win_rate": round(yes_win_rate, 2),
+        "total_no_trades": no_trades,
+        "no_win_rate": round(no_win_rate, 2),
     }
 
 
