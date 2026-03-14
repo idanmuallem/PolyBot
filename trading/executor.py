@@ -9,6 +9,7 @@ import os
 import logging
 from typing import Optional, Dict, Any, Callable, List
 from dataclasses import dataclass
+import requests
 from core.trading_config import DEFAULT_MIN_EV
 from core.models import MarketData, Position
 
@@ -53,16 +54,22 @@ class TradeExecutor:
         self.risk_config = risk_config or RiskConfig()
         self.trade_count_today = 0
         self.client = None
-        self.proxy_address = os.getenv("PROXY_WALLET_ADDRESS") or os.getenv("POLY_ADDRESS")
-        self.dry_run = str(os.getenv("DRY_RUN", "True")).strip().lower() in (
+        self.proxy_address = os.getenv("PROXY_WALLET_ADDRESS")
+        self.paper_trade_mode = str(os.getenv("PAPER_TRADE_MODE", "False")).strip().lower() in (
             "1",
             "true",
             "yes",
             "on",
         )
+        self.dry_run = str(os.getenv("DRY_RUN", "True")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ) or self.paper_trade_mode
 
         proxy_address = self.proxy_address
-        private_key = os.getenv("POLYGON_PRIVATE_KEY")
+        private_key = os.getenv("POLYMARKET_PRIVATE_KEY")
 
         if not CLOB_IMPORT_OK:
             logging.warning(
@@ -96,7 +103,7 @@ class TradeExecutor:
         else:
             logging.warning(
                 "TradeExecutor running in Paper Trading mode: "
-                "missing PROXY_WALLET_ADDRESS and/or POLYGON_PRIVATE_KEY"
+                "missing PROXY_WALLET_ADDRESS and/or POLYMARKET_PRIVATE_KEY"
             )
 
     def get_balance(self) -> float:
@@ -137,13 +144,25 @@ class TradeExecutor:
         return paper_balance if self.dry_run else 0.0
 
     def get_open_positions(self) -> List[Position]:
-        """Fetch current open positions and calculate mark-to-mid PnL."""
-        if self.client is None or not self.proxy_address:
+        """Fetch current open positions and calculate mark-to-mid PnL.
+
+        Uses Polymarket Data API because py-clob-client does not expose
+        a stable positions listing method across versions.
+        """
+        if not self.proxy_address:
             return []
 
         positions: List[Position] = []
         try:
-            raw_positions = self.client.get_positions(user=self.proxy_address)
+            wallet_address = str(self.proxy_address)
+            url = f"https://gamma-api.polymarket.com/positions?user={wallet_address}"
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            raw_positions = response.json()
+
+            if isinstance(raw_positions, dict):
+                raw_positions = raw_positions.get("positions", [])
+
             if not isinstance(raw_positions, list):
                 return []
 
@@ -159,21 +178,25 @@ class TradeExecutor:
                 if shares <= 0:
                     continue
 
+                current_value = float(raw.get("currentValue") or raw.get("current_value") or 0.0)
                 initial_price = float(raw.get("avgPrice") or raw.get("entry_price") or raw.get("initial_price") or 0.0)
-                try:
-                    midpoint_resp = self.client.get_midpoint(token_id)
-                    current_price = float(midpoint_resp) if midpoint_resp is not None else initial_price
-                except Exception:
-                    current_price = initial_price
 
-                value = shares * current_price
+                if current_value > 0.0 and shares > 0.0:
+                    current_price = current_value / shares
+                    value = current_value
+                else:
+                    current_price = initial_price
+                    value = shares * current_price
+
                 pnl_percent = 0.0
                 if initial_price > 0:
                     pnl_percent = ((current_price - initial_price) / initial_price) * 100
 
+                live_ev = pnl_percent / 100.0 if abs(pnl_percent) > 1.0 else pnl_percent
+
                 positions.append(
                     Position(
-                        market_id=str(raw.get("condition_id") or raw.get("market_id") or token_id),
+                        market_id=str(raw.get("conditionId") or raw.get("condition_id") or raw.get("market_id") or token_id),
                         token_id=token_id,
                         initial_price=initial_price,
                         current_price=current_price,
@@ -181,6 +204,7 @@ class TradeExecutor:
                         value=value,
                         pnl_percent=pnl_percent,
                         side=str(raw.get("outcome") or raw.get("side") or "UNKNOWN"),
+                        live_ev=float(live_ev),
                     )
                 )
         except Exception as exc:

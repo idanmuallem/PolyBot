@@ -33,3 +33,4 @@ class Position:
     value: float
     pnl_percent: float
     side: str = "UNKNOWN"
+    live_ev: float = 0.0

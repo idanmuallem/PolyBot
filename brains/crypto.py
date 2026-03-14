@@ -78,19 +78,42 @@ class HybridCryptoBrain(BaseBrain):
         )
 
     def evaluate_fair_value(self, market: MarketData, live_truth: float, volatility: float) -> float:
-        """Select pricing model based on time-to-expiry (TTE)."""
+        """Select pricing model based on time-to-expiry (TTE) with safe fallback.
+
+        If the selected primary model fails or returns an extreme probability,
+        we explicitly fall back to Black-Scholes. Returned values are clamped so
+        the engine never receives exact 0.0 or 1.0.
+        """
         tte_days = calculate_tte(getattr(market, "expiry_date", None))
 
-        if tte_days < 1.0:
-            self.last_model_used = "short_term"
-            return self._price_short_term(live_truth, market.strike_price)
+        try:
+            if tte_days < 1.0:
+                self.last_model_used = "short_term"
+                fair_value = self._price_short_term(live_truth, market.strike_price)
+            elif tte_days < 30.0:
+                self.last_model_used = "standard_bs"
+                fair_value = self._price_standard_bs(live_truth, market.strike_price, tte_days, volatility)
+            else:
+                self.last_model_used = "heston_fft"
+                fair_value = self._price_heston_fft(live_truth, market.strike_price, tte_days, volatility)
+        except Exception:
+            self.last_model_used = "black_scholes_fallback"
+            fair_value = self._price_black_scholes(market, live_truth)
 
-        if tte_days < 30.0:
-            self.last_model_used = "standard_bs"
-            return self._price_standard_bs(live_truth, market.strike_price, tte_days, volatility)
+        # Treat extreme probabilities from numerical models as unstable and fallback.
+        if fair_value < 0.001 or fair_value > 0.999:
+            self.last_model_used = "black_scholes_fallback"
+            fair_value = self._price_black_scholes(market, live_truth)
 
-        self.last_model_used = "heston_fft"
-        return self._price_heston_fft(live_truth, market.strike_price, tte_days, volatility)
+        fair_value = max(0.001, min(0.999, float(fair_value)))
+        return fair_value
+
+    def _price_black_scholes(self, market: MarketData, live_truth: float) -> float:
+        """Safe Black-Scholes fallback used when primary model output is unstable."""
+        strike_price = float(getattr(market, "strike_price", 0.0) or 0.0)
+        tte_days = calculate_tte(getattr(market, "expiry_date", None))
+        volatility = self.get_volatility_for_symbol(str(getattr(market, "asset_type", "")))
+        return self._price_standard_bs(float(live_truth), strike_price, float(tte_days), float(volatility))
 
     def _price_short_term(self, current_price: float, strike_price: float) -> float:
         """Simple short-term trend/technical approximation.

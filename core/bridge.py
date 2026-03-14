@@ -14,8 +14,12 @@ class DataBridge:
         self.last_update = "N/A"
         self.market_question = "Waiting for market..."
         self.market_asset_type = "N/A"
+        self.starting_balance = 0.0
         self.current_balance = 0.0
         self.daily_spend = 0.0
+        self.spent_today = 0.0
+        self.start_of_day_equity = 0.0
+        self.state_bootstrap_source = "uninitialized"
         self.watch_only = False
         self.live_trading = False
         self.opportunity_map = {}

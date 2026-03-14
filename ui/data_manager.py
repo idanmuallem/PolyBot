@@ -11,6 +11,9 @@ import pandas as pd
 DEFAULT_DB_PATH = "/app/trades.db"
 FALLBACK_DB_PATH = os.path.join("trading", "trades.db")
 LEGACY_DB_PATH = os.path.join("trades.db", "trades.db")
+SECONDARY_FALLBACK_DB_PATH = "trades.db"
+
+_ACTIVE_DB_PATH = None
 
 
 def _parse_payload_value(payload_value):
@@ -69,26 +72,78 @@ def _migrate_legacy_db_if_needed(target_db_path: str):
         shutil.copy2(legacy_db, target_db)
 
 
+def _candidate_db_paths(db_path: str):
+    global _ACTIVE_DB_PATH
+
+    candidates = []
+    if _ACTIVE_DB_PATH:
+        candidates.append(_ACTIVE_DB_PATH)
+    candidates.extend(
+        [
+            db_path,
+            DEFAULT_DB_PATH,
+            FALLBACK_DB_PATH,
+            SECONDARY_FALLBACK_DB_PATH,
+        ]
+    )
+
+    normalized = []
+    seen = set()
+    for candidate in candidates:
+        path = _normalize_db_path(candidate)
+        if path not in seen:
+            seen.add(path)
+            normalized.append(path)
+    return normalized
+
+
+def _open_connection_with_fallback(db_path: str, timeout: int = 10):
+    global _ACTIVE_DB_PATH
+
+    last_error = None
+    for candidate in _candidate_db_paths(db_path):
+        try:
+            with sqlite3.connect(candidate, timeout=timeout) as conn:
+                conn.execute("SELECT 1")
+            _ACTIVE_DB_PATH = candidate
+            return sqlite3.connect(candidate, timeout=timeout)
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+
+    raise sqlite3.OperationalError(
+        f"unable to open database file for all candidates: {_candidate_db_paths(db_path)} | last_error={last_error}"
+    )
+
+
 def init_db(db_path: str = DEFAULT_DB_PATH):
-    db_file = _normalize_db_path(db_path)
-    _migrate_legacy_db_if_needed(db_file)
-    with sqlite3.connect(db_file) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS hunt_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                level TEXT,
-                asset_type TEXT,
-                token_id TEXT,
-                payload TEXT
-            )
-            """
-        )
+    for candidate in _candidate_db_paths(db_path):
+        _migrate_legacy_db_if_needed(candidate)
+        try:
+            with sqlite3.connect(candidate, timeout=10) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS hunt_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT,
+                        level TEXT,
+                        asset_type TEXT,
+                        token_id TEXT,
+                        payload TEXT
+                    )
+                    """
+                )
+            global _ACTIVE_DB_PATH
+            _ACTIVE_DB_PATH = candidate
+            return
+        except sqlite3.OperationalError:
+            continue
+
+    raise sqlite3.OperationalError(
+        f"unable to open database file for all candidates: {_candidate_db_paths(db_path)}"
+    )
 
 
 def log_event(bridge, level, asset_type, token_id, payload, db_path: str = DEFAULT_DB_PATH):
-    db_file = _normalize_db_path(db_path)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     payload_str = str(payload)
 
@@ -106,7 +161,7 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str = DEFAU
     print(f"[{ts}] [{level}] [{asset_type}] [{token_id}] {payload_pretty}")
 
     try:
-        with sqlite3.connect(db_file, timeout=10) as conn:
+        with _open_connection_with_fallback(db_path, timeout=10) as conn:
             conn.execute(
                 """
                 INSERT INTO hunt_history (timestamp, level, asset_type, token_id, payload)
@@ -251,8 +306,7 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
 def fetch_latest_history(limit: int = 50, db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
     """Return display-ready latest history rows."""
-    db_file = _normalize_db_path(db_path)
-    with sqlite3.connect(db_file, timeout=10) as conn:
+    with _open_connection_with_fallback(db_path, timeout=10) as conn:
         history_df = pd.read_sql_query(
             "SELECT timestamp, level, asset_type, token_id, payload FROM hunt_history ORDER BY id DESC LIMIT ?",
             conn,
@@ -262,8 +316,7 @@ def fetch_latest_history(limit: int = 50, db_path: str = DEFAULT_DB_PATH) -> pd.
 
 
 def get_trade_stats(db_path: str = DEFAULT_DB_PATH) -> dict:
-    db_file = _normalize_db_path(db_path)
-    with sqlite3.connect(db_file, timeout=10) as conn:
+    with _open_connection_with_fallback(db_path, timeout=10) as conn:
         trade_df = pd.read_sql_query(
             """
             SELECT level, payload
@@ -362,8 +415,7 @@ def get_trade_stats(db_path: str = DEFAULT_DB_PATH) -> dict:
 
 
 def get_equity_curve(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
-    db_file = _normalize_db_path(db_path)
-    with sqlite3.connect(db_file, timeout=10) as conn:
+    with _open_connection_with_fallback(db_path, timeout=10) as conn:
         track_df = pd.read_sql_query(
             """
             SELECT id, timestamp, payload
@@ -391,8 +443,7 @@ def get_equity_curve(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
 
 
 def get_system_throughput(db_path: str = DEFAULT_DB_PATH) -> dict:
-    db_file = _normalize_db_path(db_path)
-    with sqlite3.connect(db_file, timeout=10) as conn:
+    with _open_connection_with_fallback(db_path, timeout=10) as conn:
         throughput_df = pd.read_sql_query(
             """
             SELECT level, payload

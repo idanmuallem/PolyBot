@@ -1,4 +1,8 @@
 import asyncio
+import ast
+import json
+import os
+import sqlite3
 import threading
 
 import streamlit as st
@@ -21,7 +25,123 @@ from ui.components import (
 st.set_page_config(page_title="PolyBot Quant Pro", page_icon="🛰️", layout="wide")
 bridge = get_bridge()
 
-data_manager.init_db()
+
+def _as_bool(raw_value: str, default: bool) -> bool:
+    if raw_value is None:
+        return default
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_runtime_env() -> dict:
+    required = ["POLYMARKET_PRIVATE_KEY", "PROXY_WALLET_ADDRESS"]
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        raise ValueError(
+            "Missing required environment variables: "
+            + ", ".join(missing)
+            + ". Pass them at runtime with --env-file."
+        )
+
+    return {
+        "dry_run": _as_bool(os.getenv("DRY_RUN", "true"), True),
+        "paper_trade_mode": _as_bool(os.getenv("PAPER_TRADE_MODE", "false"), False),
+        "daily_limit_usd": float(os.getenv("DAILY_LIMIT_USD", "100.0")),
+        "paper_balance_usd": float(os.getenv("PAPER_BALANCE_USD", "1000.0")),
+        "trades_db_path": os.getenv("TRADES_DB_PATH", "/app/trades.db"),
+    }
+
+
+def _parse_payload(payload_text: str) -> dict:
+    if payload_text is None:
+        return {}
+    text = str(payload_text).strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        try:
+            return ast.literal_eval(text)
+        except Exception:
+            return {}
+
+
+def _restore_runtime_state(db_path: str, fallback_starting_balance: float) -> dict:
+    state = {
+        "starting_balance": float(fallback_starting_balance),
+        "current_balance": float(fallback_starting_balance),
+        "start_of_day_equity": 0.0,
+        "spent_today": 0.0,
+        "source": "default",
+    }
+
+    if not os.path.exists(db_path):
+        return state
+
+    try:
+        with sqlite3.connect(db_path, timeout=10) as conn:
+            rows = conn.execute(
+                """
+                SELECT level, payload
+                FROM hunt_history
+                WHERE level IN ('LOOP-SUMMARY', 'TRACK')
+                ORDER BY id DESC
+                LIMIT 250
+                """
+            ).fetchall()
+    except Exception:
+        return state
+
+    for level, payload in rows:
+        payload_obj = _parse_payload(payload)
+        if not isinstance(payload_obj, dict):
+            continue
+
+        if state["source"] == "default":
+            for key in ("cash", "current_balance", "available_cash", "total_equity"):
+                if payload_obj.get(key) is not None:
+                    try:
+                        value = float(payload_obj.get(key))
+                        if value > 0:
+                            state["current_balance"] = value
+                            state["starting_balance"] = value
+                            state["source"] = f"db:{level}:{key}"
+                            break
+                    except Exception:
+                        continue
+
+        if payload_obj.get("start_of_day_equity") is not None:
+            try:
+                state["start_of_day_equity"] = float(payload_obj.get("start_of_day_equity"))
+            except Exception:
+                pass
+
+        if payload_obj.get("spent_today") is not None:
+            try:
+                state["spent_today"] = float(payload_obj.get("spent_today"))
+            except Exception:
+                pass
+
+        if state["source"] != "default" and state["start_of_day_equity"] > 0:
+            break
+
+    return state
+
+
+runtime_env = _validate_runtime_env()
+data_manager.init_db(runtime_env["trades_db_path"])
+restored_state = _restore_runtime_state(
+    db_path=runtime_env["trades_db_path"],
+    fallback_starting_balance=runtime_env["paper_balance_usd"],
+)
+
+bridge.starting_balance = float(restored_state["starting_balance"])
+bridge.current_balance = float(restored_state["current_balance"])
+bridge.start_of_day_equity = float(restored_state["start_of_day_equity"])
+bridge.spent_today = float(restored_state["spent_today"])
+bridge.daily_spend = float(restored_state["spent_today"])
+bridge.state_bootstrap_source = str(restored_state["source"])
+bridge.live_trading = not (bool(runtime_env["dry_run"]) or bool(runtime_env["paper_trade_mode"]))
 
 
 def dashboard_log_event(level, asset_type, token_id, payload):
@@ -41,7 +161,14 @@ def dashboard_log_event(level, asset_type, token_id, payload):
         for key in keys[:100]:
             bridge.seen_markets.pop(key, None)
 
-    data_manager.log_event(bridge, level, asset_type, token_id, payload)
+    data_manager.log_event(
+        bridge,
+        level,
+        asset_type,
+        token_id,
+        payload,
+        db_path=runtime_env["trades_db_path"],
+    )
 
 
 if "engine_started" not in st.session_state:

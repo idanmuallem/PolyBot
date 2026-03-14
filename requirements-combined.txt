@@ -1,2 +1,0 @@
-# Single source of truth for dependencies
--r requirements.txt
