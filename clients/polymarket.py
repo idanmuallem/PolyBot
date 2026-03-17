@@ -3,6 +3,13 @@ from typing import List, Dict, Any
 
 from curl_cffi import requests as crequests
 
+try:
+    from py_clob_client.client import ClobClient  # type: ignore[reportMissingImports]
+    CLOB_IMPORT_OK = True
+except Exception:
+    ClobClient = Any  # type: ignore
+    CLOB_IMPORT_OK = False
+
 class PolymarketClient:
     """Wrapper around the Polymarket gamma‑api for event searching."""
 
@@ -43,3 +50,56 @@ class PolymarketClient:
         if not events:
             return []
         return events
+
+    def get_proxy_balance(self, proxy_address: str, private_key: str) -> float:
+        """Fetch proxy wallet USDC balance from Polymarket CLOB API.
+
+        Raises an exception when credentials are missing or a balance cannot be
+        resolved, so callers can show an explicit connection error state.
+        """
+        if not proxy_address or not private_key:
+            raise ValueError("Missing POLY_ADDRESS and/or POLYGON_PRIVATE_KEY")
+        if not CLOB_IMPORT_OK:
+            raise RuntimeError("py-clob-client is not available")
+
+        temp_client = ClobClient(
+            host="https://clob.polymarket.com",
+            chain_id=137,
+            key=private_key,
+            funder=proxy_address,
+            signature_type=1,
+        )
+        if hasattr(temp_client, "create_or_derive_api_key"):
+            creds = temp_client.create_or_derive_api_key()
+        else:
+            creds = temp_client.create_or_derive_api_creds()
+
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            chain_id=137,
+            key=private_key,
+            creds=creds,
+            funder=proxy_address,
+            signature_type=1,
+        )
+
+        if hasattr(client, "get_balance_allowance"):
+            resp = client.get_balance_allowance(params={"signature_type": 1, "funder": proxy_address})
+            if isinstance(resp, dict):
+                balance_section = resp.get("balance") if isinstance(resp.get("balance"), dict) else resp
+                for key in ("usdc", "USDC", "available", "amount", "balance"):
+                    if key in balance_section:
+                        return float(balance_section[key])
+
+        if hasattr(client, "get_balance"):
+            resp = client.get_balance()
+            if isinstance(resp, dict):
+                for key in ("usdc", "USDC", "available_balance", "available", "amount", "balance"):
+                    if key in resp:
+                        return float(resp[key])
+
+        raise RuntimeError("Unable to resolve balance from Polymarket API")
+
+    def get_balance(self, proxy_address: str, private_key: str) -> float:
+        """Compatibility alias for callers expecting get_balance()."""
+        return self.get_proxy_balance(proxy_address=proxy_address, private_key=private_key)

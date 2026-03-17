@@ -16,6 +16,7 @@ class DataBridge:
         self.market_asset_type = "N/A"
         self.starting_balance = 0.0
         self.current_balance = 0.0
+        self.balance_connection_error = False
         self.daily_spend = 0.0
         self.spent_today = 0.0
         self.start_of_day_equity = 0.0

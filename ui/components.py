@@ -17,7 +17,12 @@ def _stretch_kwargs(api_fn):
 def render_kpis(bridge):
     st.subheader("📌 Portfolio KPIs")
     k1, k2, k3 = st.columns([2, 1, 1])
-    k1.metric("Current Balance", f"${bridge.current_balance:,.2f}")
+    current_balance_label = (
+        "$0.00 (Connection Error)"
+        if bool(getattr(bridge, "balance_connection_error", False))
+        else f"${float(getattr(bridge, 'current_balance', 0.0)):,.2f}"
+    )
+    k1.metric("Current Balance", current_balance_label)
     k2.metric("Open Position Value", f"${bridge.open_position_value:,.2f}")
     k3.metric("Total PnL", f"${bridge.total_pnl:,.2f}")
 

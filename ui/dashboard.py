@@ -4,11 +4,13 @@ import json
 import os
 import sqlite3
 import threading
+import time
 
 import streamlit as st
 
 from trading.engine import run_market_monitor
 import ui.data_manager as data_manager
+from clients.polymarket import PolymarketClient
 from core.bridge import get_bridge
 from ui.components import (
     render_equity_curve,
@@ -128,20 +130,43 @@ def _restore_runtime_state(db_path: str, fallback_starting_balance: float) -> di
     return state
 
 
+def _fetch_live_balance() -> tuple[float, bool]:
+    proxy_address = str(os.getenv("POLY_ADDRESS", "")).strip()
+    private_key = str(os.getenv("POLYGON_PRIVATE_KEY", "")).strip()
+    try:
+        balance = float(
+            PolymarketClient().get_proxy_balance(
+                proxy_address=proxy_address,
+                private_key=private_key,
+            )
+        )
+        return max(0.0, balance), True
+    except Exception as exc:
+        bridge.terminal_logs.appendleft(f"[BALANCE-ERROR] {exc}")
+        return 0.0, False
+
+
 runtime_env = _validate_runtime_env()
 data_manager.init_db(runtime_env["trades_db_path"])
 restored_state = _restore_runtime_state(
     db_path=runtime_env["trades_db_path"],
-    fallback_starting_balance=runtime_env["paper_balance_usd"],
+    fallback_starting_balance=0.0,
 )
 
+live_balance, live_balance_ok = _fetch_live_balance()
+
 bridge.starting_balance = float(restored_state["starting_balance"])
-bridge.current_balance = float(restored_state["current_balance"])
+bridge.current_balance = float(live_balance)
+bridge.balance_connection_error = not bool(live_balance_ok)
 bridge.start_of_day_equity = float(restored_state["start_of_day_equity"])
 bridge.spent_today = float(restored_state["spent_today"])
 bridge.daily_spend = float(restored_state["spent_today"])
 bridge.state_bootstrap_source = str(restored_state["source"])
 bridge.live_trading = not (bool(runtime_env["dry_run"]) or bool(runtime_env["paper_trade_mode"]))
+bridge.last_balance_sync_at = time.time()
+
+if bridge.starting_balance <= 0.0:
+    bridge.starting_balance = float(live_balance)
 
 
 def dashboard_log_event(level, asset_type, token_id, payload):
@@ -210,6 +235,14 @@ row4_placeholder = st.empty()
 
 
 def _render_dashboard_snapshot():
+    now_ts = time.time()
+    last_sync = float(getattr(bridge, "last_balance_sync_at", 0.0) or 0.0)
+    if (now_ts - last_sync) >= 15.0:
+        live_balance, live_balance_ok = _fetch_live_balance()
+        bridge.current_balance = float(live_balance)
+        bridge.balance_connection_error = not bool(live_balance_ok)
+        bridge.last_balance_sync_at = now_ts
+
     current_token = str(getattr(bridge, "current_token_id", ""))
     if current_token:
         bridge.market_name_by_token[current_token] = bridge.market_question
