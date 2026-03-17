@@ -55,7 +55,7 @@ jobs:
             "docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest",
             "docker stop polybot || true",
             "docker rm polybot || true",
-            "touch /home/ec2-user/trades.db && chmod 666 /home/ec2-user/trades.db",
-            "docker run -d --name polybot --restart always -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest",
-            "docker image prune -af"
+            "touch /home/ec2-user/trades.db",
+            "chmod 666 /home/ec2-user/trades.db",
+            "docker run -d --name polybot --restart always -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
           ]'
