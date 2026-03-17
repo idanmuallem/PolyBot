@@ -27,7 +27,7 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
     min_ev_threshold = float(config.min_ev)
     allocation_fraction = 0.10
     max_bet_size_usd = float(config.max_bet_size_usd)
-    min_trade_usd = 5.0
+    safe_minimum = min(1.0, float(config.max_bet_size_usd))
 
     executor = TradeExecutor(risk_config=RiskConfig(ev_threshold=config.min_ev))
     restored_balance = float(getattr(bridge, "current_balance", 0.0) or 0.0)
@@ -145,14 +145,14 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
             my_hunter.mark_seen(token_id)
             continue
 
-        target_bet_unclamped = float(total_equity) * float(allocation_fraction)
-        target_bet = min(float(target_bet_unclamped), float(max_bet_size_usd))
+        target_bet = float(total_equity) * float(allocation_fraction)
+        bet_amount = min(float(target_bet), float(max_bet_size_usd))
         available_cash = float(cash_balance)
         freed_cash = 0.0
 
-        if float(available_cash) < float(target_bet):
+        if float(available_cash) < float(bet_amount):
             print(
-                f"[ENGINE] Insufficient cash (${available_cash:.2f}) for target bet (${target_bet:.2f}). "
+                f"[ENGINE] Insufficient cash (${available_cash:.2f}) for target bet (${bet_amount:.2f}). "
                 "Triggering portfolio optimization..."
             )
             try:
@@ -169,9 +169,9 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
             available_cash = float(available_cash) + float(freed_cash)
             bridge.current_balance = float(available_cash)
 
-        planned_bet = min(float(target_bet), float(allowed_remaining))
+        planned_bet = min(float(bet_amount), float(allowed_remaining))
 
-        if float(allowed_remaining) < float(min_trade_usd):
+        if float(allowed_remaining) < float(safe_minimum):
             reason_msg = f"REJECTED: daily_limit_reached (Spent: ${float(spent_today):.2f} / Cap: ${float(daily_cap):.2f})"
             print(f"[REJECTED] {reason_msg}")
             log_func(
@@ -194,8 +194,8 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
 
         bet_amount = min(float(planned_bet), float(available_cash))
 
-        if float(bet_amount) < float(min_trade_usd):
-            needed = max(float(min_trade_usd), float(planned_bet))
+        if float(bet_amount) < float(safe_minimum):
+            needed = max(float(safe_minimum), float(planned_bet))
             reason_msg = f"REJECTED: insufficient_cash (Available: ${float(available_cash):.2f} / Needed: ${float(needed):.2f})"
             print(f"[REJECTED] {reason_msg}")
             log_func(
@@ -207,7 +207,7 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
                     "reason": "insufficient_cash",
                     "message": reason_msg,
                     "target_bet": round(float(target_bet), 4),
-                    "target_bet_unclamped": round(float(target_bet_unclamped), 4),
+                    "target_bet_unclamped": round(float(target_bet), 4),
                     "max_bet_size_usd": round(float(max_bet_size_usd), 4),
                     "bet_amount": round(float(bet_amount), 4),
                     "needed": round(float(needed), 4),
@@ -259,8 +259,8 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
                 "total_equity": round(float(total_equity), 4),
                 "allocation_fraction": allocation_fraction,
                 "max_bet_size_usd": round(float(max_bet_size_usd), 2),
-                "target_bet_unclamped": round(float(target_bet_unclamped), 2),
-                "target_bet_usd": round(float(target_bet), 2),
+                "target_bet_unclamped": round(float(target_bet), 2),
+                "target_bet_usd": round(float(bet_amount), 2),
                 "available_cash": round(float(available_cash), 2),
                 "freed_cash": round(float(freed_cash), 2),
                 "allowed_remaining": round(float(allowed_remaining), 2),
