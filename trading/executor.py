@@ -54,7 +54,7 @@ class TradeExecutor:
         self.risk_config = risk_config or RiskConfig()
         self.trade_count_today = 0
         self.client = None
-        self.proxy_address = os.getenv("PROXY_WALLET_ADDRESS")
+        self.proxy_address = os.getenv("POLY_ADDRESS")
         self.paper_trade_mode = str(os.getenv("PAPER_TRADE_MODE", "False")).strip().lower() in (
             "1",
             "true",
@@ -69,7 +69,7 @@ class TradeExecutor:
         ) or self.paper_trade_mode
 
         proxy_address = self.proxy_address
-        private_key = os.getenv("POLYMARKET_PRIVATE_KEY")
+        private_key = os.getenv("POLYGON_PRIVATE_KEY")
 
         if not CLOB_IMPORT_OK:
             logging.warning(
@@ -103,7 +103,7 @@ class TradeExecutor:
         else:
             logging.warning(
                 "TradeExecutor running in Paper Trading mode: "
-                "missing PROXY_WALLET_ADDRESS and/or POLYMARKET_PRIVATE_KEY"
+                "missing POLY_ADDRESS and/or POLYGON_PRIVATE_KEY"
             )
 
     def get_balance(self) -> float:

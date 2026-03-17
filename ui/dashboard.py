@@ -33,7 +33,7 @@ def _as_bool(raw_value: str, default: bool) -> bool:
 
 
 def _validate_runtime_env() -> dict:
-    required = ["POLYMARKET_PRIVATE_KEY", "PROXY_WALLET_ADDRESS"]
+    required = ["POLYGON_PRIVATE_KEY", "POLY_ADDRESS"]
     missing = [name for name in required if not os.getenv(name)]
     if missing:
         raise ValueError(
