@@ -115,12 +115,13 @@ class TradeExecutor:
                 proxy_addr = os.getenv("POLY_ADDRESS")
                 
             clean_addr = proxy_addr.replace("0x", "").lower().zfill(64)
-            # 2. Query the official USDC.e contract on Polygon
+            
+            # 2. Query the Native USDC contract on Polygon (This holds the $14.98)
             data = "0x70a08231" + clean_addr
             payload = json.dumps({
                 "jsonrpc": "2.0",
                 "method": "eth_call",
-                "params": [{"to": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "data": data}, "latest"],
+                "params": [{"to": "0x3c499c542cEF5E3811e1192ce70d8bC21B59FEe5", "data": data}, "latest"],
                 "id": 1
             }).encode('utf-8')
             
@@ -139,7 +140,7 @@ class TradeExecutor:
             hex_val = res.get("result", "0x0")
             if hex_val == "0x": hex_val = "0x0"
             
-            # 4. Divide by 1,000,000 to convert from blockchain format to $14.98
+            # 4. Divide by 1,000,000 to convert from blockchain format to dollars
             return int(hex_val, 16) / 1000000.0
             
         except Exception as exc:
