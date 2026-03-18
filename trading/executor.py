@@ -104,18 +104,17 @@ class TradeExecutor:
 
     def get_balance(self) -> float:
         """Get available USDC balance from the proxy wallet."""
+        import os, logging
         paper_balance = float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
 
         if self.dry_run or self.client is None:
             return paper_balance
 
         try:
-            resp = self.client.get_balance()
-            if isinstance(resp, dict):
-                for key in ("available", "balance", "amount", "usdc", "USDC"):
-                    if key in resp:
-                        return float(resp[key])
-            return float(resp)
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            resp = self.client.get_balance_allowance(params=params)
+            return float(resp.get("balance", 0.0))
         except Exception as exc:
             logging.warning(f"Could not fetch live balance: {exc}")
             return 0.0
