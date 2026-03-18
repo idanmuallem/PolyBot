@@ -124,11 +124,14 @@ class TradeExecutor:
                 "id": 1
             }).encode('utf-8')
             
-            # 3. Use dRPC to bypass the AWS block
+            # 3. Use dRPC with a Chrome User-Agent to bypass Cloudflare
             req = urllib.request.Request(
                 "https://polygon.drpc.org", 
                 data=payload, 
-                headers={'Content-Type': 'application/json'}
+                headers={
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                }
             )
             with urllib.request.urlopen(req, timeout=10) as response:
                 res = json.loads(response.read())
