@@ -117,23 +117,11 @@ class TradeExecutor:
             return paper_balance
 
         try:
-            if hasattr(self.client, "get_balance_allowance"):
-                kwargs = {}
-                if self.proxy_address:
-                    kwargs["params"] = {"signature_type": 1, "funder": self.proxy_address}
-                resp = self.client.get_balance_allowance(**kwargs)
-                if isinstance(resp, dict):
-                    balance_section = resp.get("balance") if isinstance(resp.get("balance"), dict) else resp
-                    for key in ("usdc", "USDC", "available", "amount", "balance"):
-                        if key in balance_section:
-                            return float(balance_section[key])
-
-            if hasattr(self.client, "get_balance"):
-                resp = self.client.get_balance()
-                if isinstance(resp, dict):
-                    for key in ("usdc", "USDC", "available_balance", "available", "amount", "balance"):
-                        if key in resp:
-                            return float(resp[key])
+            resp = self.client.get_balance()
+            if isinstance(resp, dict):
+                for key in ("usdc", "USDC", "available_balance", "available", "amount", "balance"):
+                    if key in resp:
+                        return float(resp[key])
         except Exception as exc:
             logging.warning(f"Could not fetch live balance from CLOB client: {exc}")
 
