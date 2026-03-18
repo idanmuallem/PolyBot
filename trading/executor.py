@@ -79,17 +79,11 @@ class TradeExecutor:
             return
 
         if proxy_address and private_key:
-            temp_client = ClobClient(
-                host="https://clob.polymarket.com",
-                chain_id=137,
-                key=private_key,
-                funder=proxy_address,
-                signature_type=1,
-            )
-            if hasattr(temp_client, "create_or_derive_api_key"):
-                creds = temp_client.create_or_derive_api_key()
-            else:
-                creds = temp_client.create_or_derive_api_creds()
+            creds = {
+                "key": os.getenv("POLY_API_KEY"),
+                "secret": os.getenv("POLY_SECRET"),
+                "passphrase": os.getenv("POLY_PASSPHRASE"),
+            }
             self.client = ClobClient(
                 host="https://clob.polymarket.com",
                 chain_id=137,
