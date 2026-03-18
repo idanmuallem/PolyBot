@@ -153,11 +153,26 @@ class TradeExecutor:
             return []
 
         positions: List[Position] = []
+        wallet_address = str(self.proxy_address)
+        url = f"https://gamma-api.polymarket.com/positions?user={wallet_address}"
+
         try:
-            wallet_address = str(self.proxy_address)
-            url = f"https://gamma-api.polymarket.com/positions?user={wallet_address}"
             response = requests.get(url, timeout=10)
             response.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 404:
+                logging.info("No open positions found (new wallet)")
+            else:
+                logging.info("No open positions found (new wallet)")
+                logging.debug(f"Gamma positions HTTP error: {exc}")
+            return []
+        except requests.exceptions.RequestException as exc:
+            logging.info("No open positions found (new wallet)")
+            logging.debug(f"Gamma positions request error: {exc}")
+            return []
+
+        try:
             raw_positions = response.json()
 
             if isinstance(raw_positions, dict):
@@ -208,7 +223,7 @@ class TradeExecutor:
                     )
                 )
         except Exception as exc:
-            logging.warning(f"Could not fetch open positions: {exc}")
+            logging.warning(f"Could not parse open positions: {exc}")
 
         return positions
 
