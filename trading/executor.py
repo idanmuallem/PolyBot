@@ -116,7 +116,7 @@ class TradeExecutor:
                 return 0.0
 
             # The Ultimate Bypass: Read the blockchain directly instead of using the broken library
-            rpc_url = "https://polygon-rpc.com"
+            rpc_url = "https://polygon.llamarpc.com"
             usdc_contract = "0x3c499c542cEF5E3811e1192ce70d8bC21B59FEe5"
             
             # Format the address for the ERC20 balanceOf function
