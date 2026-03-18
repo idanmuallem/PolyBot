@@ -103,46 +103,23 @@ class TradeExecutor:
             )
 
     def get_balance(self) -> float:
-        """Get available USDC balance directly from the Polygon blockchain."""
+        """Get available USDC balance from the proxy wallet."""
         paper_balance = float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
 
-        if self.dry_run:
+        if self.dry_run or self.client is None:
             return paper_balance
 
         try:
-            proxy_address = os.getenv("POLY_ADDRESS")
-            if not proxy_address:
-                logging.warning("No POLY_ADDRESS found in .env")
-                return 0.0
-
-            # The Ultimate Bypass: Read the blockchain directly instead of using the broken library
-            rpc_url = "https://polygon.llamarpc.com"
-            usdc_contract = "0x3c499c542cEF5E3811e1192ce70d8bC21B59FEe5"
-            
-            # Format the address for the ERC20 balanceOf function
-            clean_address = proxy_address.lower().replace("0x", "")
-            padded_address = clean_address.zfill(64)
-            data = "0x70a08231" + padded_address
-            
-            payload = {
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{"to": usdc_contract, "data": data}, "latest"],
-                "id": 1
-            }
-            
-            resp = requests.post(rpc_url, json=payload).json()
-            balance_hex = resp.get("result", "0x0")
-            
-            # USDC on Polygon has 6 decimal places
-            real_balance = int(balance_hex, 16) / 1_000_000.0
-            return real_balance
-            
+            resp = self.client.get_balance()
+            if isinstance(resp, dict):
+                for key in ("available", "balance", "amount", "usdc", "USDC"):
+                    if key in resp:
+                        return float(resp[key])
+            return float(resp)
         except Exception as exc:
-            logging.error(f"BLOCKCHAIN_FETCH_FAILURE: {exc}")
+            logging.warning(f"Could not fetch live balance: {exc}")
             return 0.0
         
-        return paper_balance if self.dry_run else 0.0
     def get_open_positions(self) -> List[Position]:
         """Fetch current open positions and calculate mark-to-mid PnL.
 
