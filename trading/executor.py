@@ -14,22 +14,18 @@ from core.trading_config import DEFAULT_MIN_EV
 from core.models import MarketData, Position
 
 try:
-    from py_clob_client.client import ClobClient  # type: ignore
-    from py_clob_client.clob_types import OrderArgs, ApiCreds, BalanceAllowanceParams  # Added BalanceAllowanceParams
-    from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore
-    from py_clob_client.constants import COLLATERAL  # Added COLLATERAL
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, ApiCreds
+    from py_clob_client.order_builder.constants import BUY, SELL
     CLOB_IMPORT_OK = True
 except Exception as e:
     logging.error(f"Import Error: {e}")
-    ClobClient = Any  # type: ignore
-    OrderArgs = Any  # type: ignore
-    ApiCreds = Any  # type: ignore
-    BalanceAllowanceParams = Any # type: ignore
-    COLLATERAL = None # type: ignore
+    ClobClient = Any 
+    OrderArgs = Any 
+    ApiCreds = Any 
     BUY = "BUY"
     SELL = "SELL"
     CLOB_IMPORT_OK = False
-
 
 @dataclass
 class RiskConfig:
@@ -107,31 +103,43 @@ class TradeExecutor:
             )
 
     def get_balance(self) -> float:
-        """Get available USDC balance from the proxy wallet."""
+        """Get available USDC balance directly from the Polygon blockchain."""
         paper_balance = float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
 
-        if self.dry_run or self.client is None:
+        if self.dry_run:
             return paper_balance
 
         try:
-            # We use the official 'BalanceAllowanceParams' object
-            # to prevent the 'dict has no attribute' error.
-            params = BalanceAllowanceParams(
-                asset_type=COLLATERAL, 
-                signature_type=1
-            )
-            resp = self.client.get_balance_allowance(params)
+            proxy_address = os.getenv("POLY_ADDRESS")
+            if not proxy_address:
+                logging.warning("No POLY_ADDRESS found in .env")
+                return 0.0
+
+            # The Ultimate Bypass: Read the blockchain directly instead of using the broken library
+            rpc_url = "https://polygon-rpc.com"
+            usdc_contract = "0x3c499c542cEF5E3811e1192ce70d8bC21B59FEe5"
             
-            # Polymarket returns a dict like {'balance': '20.00', ...}
-            if isinstance(resp, dict):
-                for key in ("balance", "available", "amount", "usdc"):
-                    if key in resp and resp[key] is not None:
-                        return float(resp[key])
+            # Format the address for the ERC20 balanceOf function
+            clean_address = proxy_address.lower().replace("0x", "")
+            padded_address = clean_address.zfill(64)
+            data = "0x70a08231" + padded_address
             
-            return float(resp) if resp else 0.0
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{"to": usdc_contract, "data": data}, "latest"],
+                "id": 1
+            }
+            
+            resp = requests.post(rpc_url, json=payload).json()
+            balance_hex = resp.get("result", "0x0")
+            
+            # USDC on Polygon has 6 decimal places
+            real_balance = int(balance_hex, 16) / 1_000_000.0
+            return real_balance
             
         except Exception as exc:
-            logging.error(f"BALANCE_FETCH_FAILURE: {exc}")
+            logging.error(f"BLOCKCHAIN_FETCH_FAILURE: {exc}")
             return 0.0
         
         return paper_balance if self.dry_run else 0.0
