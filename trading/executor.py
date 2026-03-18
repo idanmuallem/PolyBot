@@ -15,12 +15,13 @@ from core.models import MarketData, Position
 
 try:
     from py_clob_client.client import ClobClient  # type: ignore[reportMissingImports]
-    from py_clob_client.clob_types import OrderArgs  # type: ignore[reportMissingImports]
+    from py_clob_client.clob_types import OrderArgs, ApiCreds  # type: ignore[reportMissingImports]
     from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore[reportMissingImports]
     CLOB_IMPORT_OK = True
 except Exception:
     ClobClient = Any  # type: ignore
     OrderArgs = Any  # type: ignore
+    ApiCreds = Any  # type: ignore
     BUY = "BUY"
     SELL = "SELL"
     CLOB_IMPORT_OK = False
@@ -79,11 +80,12 @@ class TradeExecutor:
             return
 
         if proxy_address and private_key:
-            creds = {
-                "key": os.getenv("POLY_API_KEY"),
-                "secret": os.getenv("POLY_SECRET"),
-                "passphrase": os.getenv("POLY_PASSPHRASE"),
-            }
+            # Create the official credentials object the library expects.
+            creds = ApiCreds(
+                api_key=os.getenv("POLY_API_KEY"),
+                api_secret=os.getenv("POLY_SECRET"),
+                api_passphrase=os.getenv("POLY_PASSPHRASE"),
+            )
             self.client = ClobClient(
                 host="https://clob.polymarket.com",
                 chain_id=137,
