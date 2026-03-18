@@ -103,27 +103,32 @@ class TradeExecutor:
             )
 
     def get_balance(self) -> float:
-        """Get available USDC balance using the official Polymarket API."""
-        import os, logging
+        """Fetch total USDC across both Native and Legacy contracts."""
+        import os, logging, json, urllib.request
         if self.dry_run or self.client is None:
             return float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
-
-        try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
             
-            # The official way to check your Polymarket Collateral Vault
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            resp = self.client.get_balance_allowance(params=params)
-            
-            # The API returns a dictionary like {'balance': '14985288'}
-            raw_balance = float(resp.get("balance", "0"))
-            
-            # Convert from the 6-decimal blockchain format to standard dollars
-            return raw_balance / 1000000.0
-            
-        except Exception as exc:
-            logging.warning(f"Live balance fetch failed: {exc}")
-            return 0.0
+        total_balance = 0.0
+        # This checks both Native USDC and the older USDC.e
+        contracts = [
+            "0x3c499c542cEF5E3811e1192ce70d8bC21B59FEe5", 
+            "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        ]
+        
+        proxy_addr = getattr(self.client, "proxy_address", os.getenv("POLY_ADDRESS"))
+        clean_addr = proxy_addr.replace("0x", "").lower().zfill(64)
+        
+        for contract in contracts:
+            try:
+                data = "0x70a08231" + clean_addr
+                payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": contract, "data": data}, "latest"], "id": 1}).encode('utf-8')
+                req = urllib.request.Request("https://polygon.drpc.org", data=payload, headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as res:
+                    val = json.loads(res.read()).get("result", "0x0")
+                    total_balance += int(val, 16) / 1000000.0
+            except:
+                continue
+        return total_balance
         
     def get_open_positions(self) -> List[Position]:
         """Fetch current open positions and calculate mark-to-mid PnL.
