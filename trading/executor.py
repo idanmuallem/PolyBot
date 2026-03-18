@@ -103,50 +103,27 @@ class TradeExecutor:
             )
 
     def get_balance(self) -> float:
-        """Get available USDC balance from the proxy wallet."""
-        import os, logging, json, urllib.request
+        """Get available USDC balance using the official Polymarket API."""
+        import os, logging
         if self.dry_run or self.client is None:
             return float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
-            
+
         try:
-            # 1. Automatically get your Polymarket Proxy Wallet address
-            proxy_addr = getattr(self.client, "proxy_address", None)
-            if not proxy_addr:
-                proxy_addr = os.getenv("POLY_ADDRESS")
-                
-            clean_addr = proxy_addr.replace("0x", "").lower().zfill(64)
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
             
-            # 2. Query the Native USDC contract on Polygon (This holds the $14.98)
-            data = "0x70a08231" + clean_addr
-            payload = json.dumps({
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{"to": "0x3c499c542cEF5E3811e1192ce70d8bC21B59FEe5", "data": data}, "latest"],
-                "id": 1
-            }).encode('utf-8')
+            # The official way to check your Polymarket Collateral Vault
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            resp = self.client.get_balance_allowance(params=params)
             
-            # 3. Use dRPC with a Chrome User-Agent to bypass Cloudflare
-            req = urllib.request.Request(
-                "https://polygon.drpc.org", 
-                data=payload, 
-                headers={
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-                }
-            )
-            with urllib.request.urlopen(req, timeout=10) as response:
-                res = json.loads(response.read())
-                
-            hex_val = res.get("result", "0x0")
-            if hex_val == "0x": hex_val = "0x0"
+            # The API returns a dictionary like {'balance': '14985288'}
+            raw_balance = float(resp.get("balance", "0"))
             
-            # 4. Divide by 1,000,000 to convert from blockchain format to dollars
-            return int(hex_val, 16) / 1000000.0
+            # Convert from the 6-decimal blockchain format to standard dollars
+            return raw_balance / 1000000.0
             
         except Exception as exc:
             logging.warning(f"Live balance fetch failed: {exc}")
             return 0.0
-        
         
     def get_open_positions(self) -> List[Position]:
         """Fetch current open positions and calculate mark-to-mid PnL.
