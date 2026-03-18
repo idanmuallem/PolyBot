@@ -6,7 +6,7 @@ on:
       - main
 
 permissions:
-  id-token: write   # Required for OIDC
+  id-token: write   # Required for AWS OIDC authentication
   contents: read    # Required to checkout code
 
 env:
@@ -24,7 +24,6 @@ jobs:
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        # Using the Role-to-Assume method we configured in IAM
         role-to-assume: arn:aws:iam::979667333506:role/GitHub-Action-Role
         aws-region: ${{ env.AWS_REGION }}
 
@@ -52,9 +51,10 @@ jobs:
           --comment "Deploying PolyBot to Stockholm" \
           --parameters 'commands=[
             "aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}",
-            "docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest",
             "docker stop polybot || true",
             "docker rm polybot || true",
+            "docker system prune -a -f",
+            "docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest",
             "touch /home/ec2-user/trades.db",
             "chmod 666 /home/ec2-user/trades.db",
             "docker run -d --name polybot --restart always -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
