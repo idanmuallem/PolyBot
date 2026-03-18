@@ -103,30 +103,29 @@ class TradeExecutor:
             )
 
     def get_balance(self) -> float:
-        """Get available USDC balance from the proxy wallet.
-
-        Returns:
-            Balance value used by engine balance guard.
-        """
+        """Get available USDC balance from the proxy wallet."""
         paper_balance = float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
 
-        if self.dry_run:
-            return paper_balance
-
-        if self.client is None:
+        if self.dry_run or self.client is None:
             return paper_balance
 
         try:
+            # The library returns a simple dict. We just need to find the number.
             resp = self.client.get_balance()
+            
             if isinstance(resp, dict):
-                for key in ("usdc", "USDC", "available_balance", "available", "amount", "balance"):
+                # We look for any key that represents the balance
+                for key in ("available", "balance", "amount", "usdc", "USDC"):
                     if key in resp:
                         return float(resp[key])
+            
+            # If the response is just a number string
+            return float(resp)
+            
         except Exception as exc:
             logging.warning(f"Could not fetch live balance from CLOB client: {exc}")
 
         return paper_balance if self.dry_run else 0.0
-
     def get_open_positions(self) -> List[Position]:
         """Fetch current open positions and calculate mark-to-mid PnL.
 
