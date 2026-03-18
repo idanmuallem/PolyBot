@@ -14,14 +14,18 @@ from core.trading_config import DEFAULT_MIN_EV
 from core.models import MarketData, Position
 
 try:
-    from py_clob_client.client import ClobClient  # type: ignore[reportMissingImports]
-    from py_clob_client.clob_types import OrderArgs, ApiCreds  # type: ignore[reportMissingImports]
-    from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore[reportMissingImports]
+    from py_clob_client.client import ClobClient  # type: ignore
+    from py_clob_client.clob_types import OrderArgs, ApiCreds, BalanceAllowanceParams  # Added BalanceAllowanceParams
+    from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore
+    from py_clob_client.constants import COLLATERAL  # Added COLLATERAL
     CLOB_IMPORT_OK = True
-except Exception:
+except Exception as e:
+    logging.error(f"Import Error: {e}")
     ClobClient = Any  # type: ignore
     OrderArgs = Any  # type: ignore
     ApiCreds = Any  # type: ignore
+    BalanceAllowanceParams = Any # type: ignore
+    COLLATERAL = None # type: ignore
     BUY = "BUY"
     SELL = "SELL"
     CLOB_IMPORT_OK = False
@@ -110,21 +114,26 @@ class TradeExecutor:
             return paper_balance
 
         try:
-            # The library returns a simple dict. We just need to find the number.
-            resp = self.client.get_balance()
+            # We use the official 'BalanceAllowanceParams' object
+            # to prevent the 'dict has no attribute' error.
+            params = BalanceAllowanceParams(
+                asset_type=COLLATERAL, 
+                signature_type=1
+            )
+            resp = self.client.get_balance_allowance(params)
             
+            # Polymarket returns a dict like {'balance': '20.00', ...}
             if isinstance(resp, dict):
-                # We look for any key that represents the balance
-                for key in ("available", "balance", "amount", "usdc", "USDC"):
-                    if key in resp:
+                for key in ("balance", "available", "amount", "usdc"):
+                    if key in resp and resp[key] is not None:
                         return float(resp[key])
             
-            # If the response is just a number string
-            return float(resp)
+            return float(resp) if resp else 0.0
             
         except Exception as exc:
-            logging.warning(f"Could not fetch live balance from CLOB client: {exc}")
-
+            logging.error(f"BALANCE_FETCH_FAILURE: {exc}")
+            return 0.0
+        
         return paper_balance if self.dry_run else 0.0
     def get_open_positions(self) -> List[Position]:
         """Fetch current open positions and calculate mark-to-mid PnL.
