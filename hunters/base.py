@@ -50,7 +50,7 @@ class BasePolymarketHunter(BaseHunter):
 
     # selection constants moved out of the generic base so they can be tuned
     # independently of non-Polymarket hunters.
-    PRICE_FLOOR = 0.10
+    PRICE_FLOOR = 0.30
     PRICE_CEILING = 0.85
     MIN_VOLUME = 50000
     STRIKE_RATIO_MIN = 0.2

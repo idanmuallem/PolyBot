@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 from brains import get_brain_for_asset_type
 from brains.base import calculate_tte
 from core.models import MarketData
+from .base import BasePolymarketHunter
 from .crypto import CryptoHunter
 
 
@@ -101,6 +102,22 @@ class PolymarketScannerHunter:
         order_book = self.fetch_order_book(market)
         poly_price = float(order_book.get("mid_price", market.initial_price))
         self.bridge.market_poly = poly_price
+
+        if poly_price < BasePolymarketHunter.PRICE_FLOOR or poly_price > BasePolymarketHunter.PRICE_CEILING:
+            log_func(
+                "FILTERED",
+                asset_type,
+                token_id,
+                {
+                    "market_name": question,
+                    "reason": "price out of hunter bounds",
+                    "poly_price": round(poly_price, 4),
+                    "price_floor": BasePolymarketHunter.PRICE_FLOOR,
+                    "price_ceiling": BasePolymarketHunter.PRICE_CEILING,
+                },
+            )
+            self.add_to_cooldown(token_id)
+            return None
 
         live_truth = hunter.get_live_truth(market)
         if live_truth is None:
