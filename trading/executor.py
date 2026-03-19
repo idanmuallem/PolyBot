@@ -59,6 +59,7 @@ class TradeExecutor:
         self.trade_count_today = 0
         self.client = None
         self.proxy_address = os.getenv("POLY_ADDRESS")
+        self.signature_type = self._resolve_signature_type()
         self.paper_trade_mode = str(os.getenv("PAPER_TRADE_MODE", "False")).strip().lower() in (
             "1",
             "true",
@@ -95,7 +96,7 @@ class TradeExecutor:
                 key=private_key,
                 creds=creds,
                 funder=proxy_address,
-                signature_type=1,
+                signature_type=self.signature_type,
             )
             if self.dry_run:
                 logging.warning("TradeExecutor initialized in DRY_RUN mode.")
@@ -104,6 +105,78 @@ class TradeExecutor:
                 "TradeExecutor running in Paper Trading mode: "
                 "missing POLY_ADDRESS and/or POLYGON_PRIVATE_KEY"
             )
+
+    @staticmethod
+    def _resolve_signature_type() -> int:
+        raw_value = str(os.getenv("POLY_SIGNATURE_TYPE", "2")).strip()
+        try:
+            return int(raw_value)
+        except Exception:
+            return 2
+
+    def _submit_order(self, order: OrderArgs):
+        if self.client is None:
+            raise RuntimeError("CLOB client is not configured")
+
+        if order is None:
+            raise ValueError("OrderArgs is required")
+
+        if not all(hasattr(order, field) for field in ("price", "size", "side", "token_id")):
+            raise TypeError("order must be a valid OrderArgs object with price, size, side, token_id")
+
+        create_fn = getattr(self.client, "create_order", None)
+        post_fn = getattr(self.client, "post_order", None)
+
+        if callable(create_fn) and callable(post_fn):
+            try:
+                signed_order = create_fn(order, signature_type=self.signature_type)
+            except TypeError:
+                try:
+                    signed_order = create_fn(order, self.signature_type)
+                except TypeError:
+                    signed_order = create_fn(order)
+
+            post_resp = post_fn(signed_order)
+            if isinstance(post_resp, dict):
+                if post_resp.get("error"):
+                    raise RuntimeError(f"Polymarket post_order error: {post_resp.get('error')}")
+                if post_resp.get("errors"):
+                    raise RuntimeError(f"Polymarket post_order errors: {post_resp.get('errors')}")
+                if post_resp.get("success") is False:
+                    raise RuntimeError(f"Polymarket post_order rejected: {post_resp}")
+            return post_resp
+
+        if hasattr(self.client, "create_and_post_order"):
+            combined_resp = self.client.create_and_post_order(order)
+            if isinstance(combined_resp, dict):
+                if combined_resp.get("error"):
+                    raise RuntimeError(f"Polymarket create_and_post_order error: {combined_resp.get('error')}")
+                if combined_resp.get("errors"):
+                    raise RuntimeError(f"Polymarket create_and_post_order errors: {combined_resp.get('errors')}")
+                if combined_resp.get("success") is False:
+                    raise RuntimeError(f"Polymarket create_and_post_order rejected: {combined_resp}")
+            return combined_resp
+
+        raise RuntimeError("No supported order submission method found on CLOB client")
+
+    @staticmethod
+    def _format_order_exception(exc: Exception) -> Dict[str, Any]:
+        error_payload: Dict[str, Any] = {
+            "error": str(exc),
+            "exception_type": type(exc).__name__,
+            "exception_repr": repr(exc),
+        }
+
+        response = getattr(exc, "response", None)
+        if response is not None:
+            status_code = getattr(response, "status_code", None)
+            response_text = getattr(response, "text", None)
+            if status_code is not None:
+                error_payload["status_code"] = status_code
+            if response_text:
+                error_payload["response_text"] = response_text
+
+        return error_payload
 
     def get_balance(self) -> float:
         """Fetch total USDC across both Native and Legacy contracts."""
@@ -278,7 +351,7 @@ class TradeExecutor:
             token_id=execution_token_id,
         )
         try:
-            resp = self.client.create_and_post_order(order)
+            resp = self._submit_order(order)
             live_success = True
             if isinstance(resp, dict):
                 live_success = not resp.get("error") and not resp.get("errors")
@@ -291,11 +364,13 @@ class TradeExecutor:
             )
             return live_success
         except Exception as exc:
+            error_payload = self._format_order_exception(exc)
+            logging.error(f"LIVE order rejected: {error_payload}")
             log_func(
                 "LIVE-TRADE-ERROR",
                 asset_type,
                 execution_token_id,
-                f"Order failed: {exc}",
+                error_payload,
             )
             return False
 
@@ -342,7 +417,7 @@ class TradeExecutor:
             token_id=token_id,
         )
         try:
-            resp = self.client.create_and_post_order(order)
+            resp = self._submit_order(order)
             success = True
             if isinstance(resp, dict):
                 success = not resp.get("error") and not resp.get("errors")
@@ -355,11 +430,13 @@ class TradeExecutor:
             )
             return success
         except Exception as exc:
+            error_payload = self._format_order_exception(exc)
+            logging.error(f"SELL order rejected: {error_payload}")
             log_func(
                 "SELL-ERROR",
                 "Portfolio",
                 token_id,
-                f"Sell failed: {exc}",
+                error_payload,
             )
             return False
 
