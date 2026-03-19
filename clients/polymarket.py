@@ -5,9 +5,12 @@ from curl_cffi import requests as crequests
 
 try:
     from py_clob_client.client import ClobClient  # type: ignore[reportMissingImports]
+    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # type: ignore[reportMissingImports]
     CLOB_IMPORT_OK = True
 except Exception:
     ClobClient = Any  # type: ignore
+    AssetType = Any  # type: ignore
+    BalanceAllowanceParams = Any  # type: ignore
     CLOB_IMPORT_OK = False
 
 class PolymarketClient:
@@ -84,12 +87,15 @@ class PolymarketClient:
         )
 
         if hasattr(client, "get_balance_allowance"):
-            resp = client.get_balance_allowance(params={"signature_type": 1, "funder": proxy_address})
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            resp = client.get_balance_allowance(params=params)
             if isinstance(resp, dict):
                 balance_section = resp.get("balance") if isinstance(resp.get("balance"), dict) else resp
                 for key in ("usdc", "USDC", "available", "amount", "balance"):
                     if key in balance_section:
-                        return float(balance_section[key])
+                        raw_balance = float(balance_section[key])
+                        # Polymarket balance responses are commonly 6-decimal fixed-point integers.
+                        return raw_balance / 1_000_000.0 if raw_balance > 1_000_000 else raw_balance
 
         if hasattr(client, "get_balance"):
             resp = client.get_balance()
