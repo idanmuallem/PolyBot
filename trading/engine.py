@@ -19,6 +19,9 @@ from hunters import PolymarketScannerHunter
 from trading.risk_manager import PortfolioManager
 from core.trading_config import TradingConfig
 
+ENTRY_PRICE_FLOOR = 0.30
+ENTRY_PRICE_CEILING = 0.85
+
 
 async def run_market_monitor(bridge, log_func, delay: float | None = None):
     """Run lightweight monitor loop with modular delegation."""
@@ -140,6 +143,26 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
                     "side": best_side,
                     "ev": round(float(final_ev), 4),
                     "threshold": min_ev_threshold,
+                },
+            )
+            my_hunter.mark_seen(token_id)
+            continue
+
+        selected_entry_price = float(price_yes if best_side == "YES" else price_no)
+        if selected_entry_price < ENTRY_PRICE_FLOOR or selected_entry_price > ENTRY_PRICE_CEILING:
+            log_func(
+                "FILTERED",
+                asset_type,
+                token_id,
+                {
+                    "market_name": question,
+                    "reason": "entry price out of bounds for selected side",
+                    "side": best_side,
+                    "entry_price": round(float(selected_entry_price), 4),
+                    "price_floor": ENTRY_PRICE_FLOOR,
+                    "price_ceiling": ENTRY_PRICE_CEILING,
+                    "price_yes": round(float(price_yes), 4),
+                    "price_no": round(float(price_no), 4),
                 },
             )
             my_hunter.mark_seen(token_id)

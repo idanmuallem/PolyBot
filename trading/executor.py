@@ -13,6 +13,9 @@ import requests
 from core.trading_config import DEFAULT_MIN_EV
 from core.models import MarketData, Position
 
+ENTRY_PRICE_FLOOR = 0.30
+ENTRY_PRICE_CEILING = 0.85
+
 try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import OrderArgs, ApiCreds
@@ -427,6 +430,21 @@ class TradeExecutor:
         # ========================================
         # 5. Execute trade
         # ========================================
+        if execution_price < ENTRY_PRICE_FLOOR or execution_price > ENTRY_PRICE_CEILING:
+            log_func(
+                "EXECUTION",
+                asset_type,
+                execution_token_id,
+                {
+                    "reason": "entry price out of bounds",
+                    "side": execution_side,
+                    "execution_price": round(float(execution_price), 4),
+                    "price_floor": ENTRY_PRICE_FLOOR,
+                    "price_ceiling": ENTRY_PRICE_CEILING,
+                },
+            )
+            return False
+
         if execution_price <= 0:
             log_func(
                 "EXECUTION",

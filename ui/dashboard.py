@@ -5,24 +5,14 @@ import os
 import sqlite3
 import threading
 import time
-
+import pandas as pd
 import streamlit as st
 
 from trading.engine import run_market_monitor
 import ui.data_manager as data_manager
 from clients.polymarket import PolymarketClient
 from core.bridge import get_bridge
-from ui.components import (
-    render_equity_curve,
-    render_ev_chart,
-    render_history_table,
-    render_kpis,
-    render_positions,
-    render_risk_gauge,
-    render_system_throughput,
-    render_terminal_feed,
-    render_trade_stats,
-)
+from ui.components import render_equity_curve, render_ev_chart, render_positions
 
 st.set_page_config(page_title="PolyBot Quant Pro", page_icon="🛰️", layout="wide")
 bridge = get_bridge()
@@ -146,27 +136,115 @@ def _fetch_live_balance() -> tuple[float, bool]:
         return 0.0, False
 
 
-runtime_env = _validate_runtime_env()
-data_manager.init_db(runtime_env["trades_db_path"])
-restored_state = _restore_runtime_state(
-    db_path=runtime_env["trades_db_path"],
-    fallback_starting_balance=0.0,
-)
+def _render_global_kpis() -> None:
+    c1, c2 = st.columns([1, 1])
+    current_balance_label = (
+        "$0.00 (Connection Error)"
+        if bool(getattr(bridge, "balance_connection_error", False))
+        else f"${float(getattr(bridge, 'current_balance', 0.0)):,.2f}"
+    )
+    c1.metric("Current Balance", current_balance_label)
+    c2.metric("Total PnL", f"${float(getattr(bridge, 'total_pnl', 0.0)):,.2f}")
 
-live_balance, live_balance_ok = _fetch_live_balance()
 
-bridge.starting_balance = float(restored_state["starting_balance"])
-bridge.current_balance = float(live_balance)
-bridge.balance_connection_error = not bool(live_balance_ok)
-bridge.start_of_day_equity = float(restored_state["start_of_day_equity"])
-bridge.spent_today = float(restored_state["spent_today"])
-bridge.daily_spend = float(restored_state["spent_today"])
-bridge.state_bootstrap_source = str(restored_state["source"])
-bridge.live_trading = not (bool(runtime_env["dry_run"]) or bool(runtime_env["paper_trade_mode"]))
-bridge.last_balance_sync_at = time.time()
+def _render_hunter_history_table() -> None:
+    history_df = data_manager.fetch_latest_history(limit=80)
+    if history_df.empty:
+        st.info("No hunt history yet. Engine is scanning markets...")
+        return
 
-if bridge.starting_balance <= 0.0:
-    bridge.starting_balance = float(live_balance)
+    keep_cols = ["Time", "Asset", "Side", "EV", "Action"]
+    compact_df = history_df[[col for col in keep_cols if col in history_df.columns]].copy()
+    if compact_df.empty:
+        st.info("No display-ready events yet.")
+        return
+
+    if "EV" in compact_df.columns:
+        compact_df["EV"] = pd.to_numeric(compact_df["EV"], errors="coerce")
+
+    def _ev_color(value):
+        if pd.isna(value):
+            return ""
+        numeric = float(value)
+        if numeric > 0.5:
+            return "color: #22c55e; font-weight: 700;"
+        if numeric < 0.0:
+            return "color: #ef4444; font-weight: 700;"
+        return ""
+
+    styled = compact_df.style
+    if "EV" in compact_df.columns:
+        styled = styled.format({"EV": "{:.3f}"}).map(_ev_color, subset=["EV"])
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+
+def _render_compact_terminal_feed() -> None:
+    logs = list(getattr(bridge, "terminal_logs", []))[:20]
+    if not logs:
+        st.info("No terminal logs yet.")
+        return
+    st.code("\n".join(logs), language="text")
+
+
+def _render_hunter_view() -> None:
+    st.markdown("### Hunter")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        _render_hunter_history_table()
+    with col2:
+        _render_compact_terminal_feed()
+
+
+def _render_portfolio_view() -> None:
+    st.markdown("### Portfolio")
+    render_positions(bridge)
+    st.markdown("#### EV by Market")
+    render_ev_chart(bridge)
+
+
+def _render_balance_stats_row() -> None:
+    stats = data_manager.get_trade_stats()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Win Rate", f"{float(stats.get('win_rate', 0.0)):.2f}%")
+    c2.metric("Total Trades", f"{int(stats.get('total_trades', 0))}")
+    c3.metric("Avg Win", f"${float(stats.get('avg_win', 0.0)):,.2f}")
+    c4.metric("Avg Loss", f"${float(stats.get('avg_loss', 0.0)):,.2f}")
+
+
+def _render_balance_view() -> None:
+    st.markdown("### Balance")
+    _render_balance_stats_row()
+    render_equity_curve(data_manager)
+
+
+def _render_active_view(view_name: str) -> None:
+    if view_name == "Hunter":
+        _render_hunter_view()
+        return
+    if view_name == "Portfolio":
+        _render_portfolio_view()
+        return
+    _render_balance_view()
+
+
+def _ensure_engine_started_once() -> None:
+    # The loop/thread references are stored in session_state so Streamlit reruns
+    # (including navigation changes) do not spawn duplicate monitor workers.
+    if st.session_state.get("engine_started"):
+        return
+
+    loop = asyncio.new_event_loop()
+
+    def _runner() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_market_monitor(bridge, dashboard_log_event))
+
+    thread = threading.Thread(target=_runner, daemon=True, name="polybot-engine")
+    thread.start()
+
+    st.session_state.engine_loop = loop
+    st.session_state.engine_thread = thread
+    st.session_state.engine_started = True
 
 
 def dashboard_log_event(level, asset_type, token_id, payload):
@@ -196,22 +274,48 @@ def dashboard_log_event(level, asset_type, token_id, payload):
     )
 
 
-if "engine_started" not in st.session_state:
-    loop = asyncio.new_event_loop()
-    threading.Thread(
-        target=lambda: loop.run_until_complete(run_market_monitor(bridge, dashboard_log_event)),
-        daemon=True,
-    ).start()
-    st.session_state.engine_started = True
+runtime_env = _validate_runtime_env()
+data_manager.init_db(runtime_env["trades_db_path"])
+restored_state = _restore_runtime_state(
+    db_path=runtime_env["trades_db_path"],
+    fallback_starting_balance=0.0,
+)
+
+live_balance, live_balance_ok = _fetch_live_balance()
+
+bridge.starting_balance = float(restored_state["starting_balance"])
+bridge.current_balance = float(live_balance)
+bridge.balance_connection_error = not bool(live_balance_ok)
+bridge.start_of_day_equity = float(restored_state["start_of_day_equity"])
+bridge.spent_today = float(restored_state["spent_today"])
+bridge.daily_spend = float(restored_state["spent_today"])
+bridge.state_bootstrap_source = str(restored_state["source"])
+bridge.live_trading = not (bool(runtime_env["dry_run"]) or bool(runtime_env["paper_trade_mode"]))
+bridge.last_balance_sync_at = time.time()
+
+if bridge.starting_balance <= 0.0:
+    bridge.starting_balance = float(live_balance)
+_ensure_engine_started_once()
 
 st.title("🛰️ PolyBot: Quantitative Arbitrage Terminal")
-st.caption("Real-time probability discovery and execution monitoring")
+st.caption("Minimal live terminal for scan, exposure, and balance decisions")
 
 with st.sidebar:
-    st.header("⚙️ Trading Mode")
+    st.header("Navigation")
+    if hasattr(st, "segmented_control"):
+        active_view = st.segmented_control(
+            "View",
+            options=["Hunter", "Portfolio", "Balance"],
+            default="Hunter",
+        )
+    else:
+        active_view = st.radio("View", ["Hunter", "Portfolio", "Balance"], index=0)
+
+    st.divider()
+    st.header("Trading Mode")
     mode = st.toggle("Live Trading", value=bridge.live_trading)
     bridge.live_trading = bool(mode)
-    st.write("Mode:", "Live Trading" if bridge.live_trading else "Dry Run")
+    st.caption("Live Trading" if bridge.live_trading else "Dry Run")
 
     dry_run_enabled = not bridge.live_trading
     dot_color = "#16a34a" if dry_run_enabled else "#dc2626"
@@ -226,15 +330,8 @@ with st.sidebar:
     if bridge.watch_only:
         st.warning("Watch-Only mode enabled by Balance Guard")
 
-# PERFORMANCE: placeholders for partial redraws
-row0_placeholder = st.empty()
-row1_placeholder = st.empty()
-row2_placeholder = st.empty()
-row3_placeholder = st.empty()
-row4_placeholder = st.empty()
 
-
-def _render_dashboard_snapshot():
+def _render_dashboard_snapshot(view_name: str):
     now_ts = time.time()
     last_sync = float(getattr(bridge, "last_balance_sync_at", 0.0) or 0.0)
     if (now_ts - last_sync) >= 15.0:
@@ -247,44 +344,16 @@ def _render_dashboard_snapshot():
     if current_token:
         bridge.market_name_by_token[current_token] = bridge.market_question
 
-    with row0_placeholder.container():
-        render_kpis(bridge)
-
-    with row1_placeholder.container():
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            render_system_throughput(data_manager, bridge)
-        with c2:
-            render_trade_stats(data_manager)
-
-    with row2_placeholder.container():
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            render_equity_curve(data_manager)
-        with col2:
-            render_risk_gauge(bridge)
-
-    with row3_placeholder.container():
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            render_ev_chart(bridge)
-        with col2:
-            render_positions(bridge)
-
-    with row4_placeholder.container():
-        st.divider()
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            render_terminal_feed(bridge)
-        with col2:
-            render_history_table(data_manager)
+    _render_global_kpis()
+    st.divider()
+    _render_active_view(view_name)
 
 
 if hasattr(st, "fragment"):
     @st.fragment(run_every="2s")
     def live_fragment():
-        _render_dashboard_snapshot()
+        _render_dashboard_snapshot(active_view)
 
     live_fragment()
 else:
-    _render_dashboard_snapshot()
+    _render_dashboard_snapshot(active_view)
