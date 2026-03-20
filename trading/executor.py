@@ -131,17 +131,13 @@ class TradeExecutor:
             try:
                 signed_order = create_fn(order, signature_type=self.signature_type)
             except TypeError:
-                try:
-                    signed_order = create_fn(order, self.signature_type)
-                except TypeError:
-                    signed_order = create_fn(order)
+                signed_order = create_fn(order)
 
             post_resp = post_fn(signed_order)
             if isinstance(post_resp, dict):
-                if post_resp.get("error"):
-                    raise RuntimeError(f"Polymarket post_order error: {post_resp.get('error')}")
-                if post_resp.get("errors"):
-                    raise RuntimeError(f"Polymarket post_order errors: {post_resp.get('errors')}")
+                if post_resp.get("error") or post_resp.get("errors"):
+                    logging.error(f"Polymarket post_order rejected payload: {post_resp}")
+                    raise RuntimeError(f"Polymarket post_order rejected: {post_resp}")
                 if post_resp.get("success") is False:
                     raise RuntimeError(f"Polymarket post_order rejected: {post_resp}")
             return post_resp
@@ -149,10 +145,9 @@ class TradeExecutor:
         if hasattr(self.client, "create_and_post_order"):
             combined_resp = self.client.create_and_post_order(order)
             if isinstance(combined_resp, dict):
-                if combined_resp.get("error"):
-                    raise RuntimeError(f"Polymarket create_and_post_order error: {combined_resp.get('error')}")
-                if combined_resp.get("errors"):
-                    raise RuntimeError(f"Polymarket create_and_post_order errors: {combined_resp.get('errors')}")
+                if combined_resp.get("error") or combined_resp.get("errors"):
+                    logging.error(f"Polymarket create_and_post_order rejected payload: {combined_resp}")
+                    raise RuntimeError(f"Polymarket create_and_post_order rejected: {combined_resp}")
                 if combined_resp.get("success") is False:
                     raise RuntimeError(f"Polymarket create_and_post_order rejected: {combined_resp}")
             return combined_resp
