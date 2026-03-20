@@ -23,6 +23,28 @@ ENTRY_PRICE_FLOOR = 0.30
 ENTRY_PRICE_CEILING = 0.85
 
 
+def _sync_live_account_state(bridge, executor, log_func=None):
+    """Refresh live cash/positions from Polymarket APIs and update bridge state."""
+    try:
+        positions = executor.get_open_positions()
+        bridge.current_portfolio = positions
+        bridge.open_position_value = sum(float(getattr(p, "value", 0.0) or 0.0) for p in positions)
+        bridge.total_pnl = sum(
+            (float(getattr(p, "current_price", 0.0) or 0.0) - float(getattr(p, "initial_price", 0.0) or 0.0))
+            * float(getattr(p, "shares", 0.0) or 0.0)
+            for p in positions
+        )
+    except Exception as exc:
+        if log_func is not None:
+            log_func("SYNC-WARN", "Engine", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
+
+    try:
+        bridge.current_balance = float(executor.get_balance())
+    except Exception as exc:
+        if log_func is not None:
+            log_func("SYNC-WARN", "Engine", "balance", {"reason": "balance_fetch_failed", "error": str(exc)})
+
+
 async def run_market_monitor(bridge, log_func, delay: float | None = None):
     """Run lightweight monitor loop with modular delegation."""
     config = TradingConfig.from_env()
@@ -30,14 +52,10 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
     min_ev_threshold = float(config.min_ev)
     allocation_fraction = 0.10
     max_bet_size_usd = float(config.max_bet_size_usd)
-    safe_minimum = min(1.0, float(config.max_bet_size_usd))
+    safe_minimum = 1.0
 
     executor = TradeExecutor(risk_config=RiskConfig(ev_threshold=config.min_ev))
-    restored_balance = float(getattr(bridge, "current_balance", 0.0) or 0.0)
-    if restored_balance > 0.0:
-        bridge.current_balance = restored_balance
-    else:
-        bridge.current_balance = float(executor.get_balance())
+    _sync_live_account_state(bridge, executor, log_func)
 
     if float(getattr(bridge, "starting_balance", 0.0) or 0.0) <= 0.0:
         bridge.starting_balance = float(bridge.current_balance)
@@ -72,7 +90,9 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
         requested_live = bool(getattr(bridge, "live_trading", False))
         executor.dry_run = not requested_live
 
+        _sync_live_account_state(bridge, executor, log_func)
         portfolio_manager.manage_portfolio(log_func)
+        _sync_live_account_state(bridge, executor, log_func)
 
         cash_balance = float(bridge.current_balance)
         open_positions_value = float(bridge.open_position_value)
@@ -169,13 +189,13 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
             continue
 
         target_bet = float(total_equity) * float(allocation_fraction)
-        bet_amount = min(float(target_bet), float(max_bet_size_usd))
+        desired_bet = min(float(target_bet), float(max_bet_size_usd))
         available_cash = float(cash_balance)
         freed_cash = 0.0
 
-        if float(available_cash) < float(bet_amount):
+        if float(available_cash) < float(desired_bet):
             print(
-                f"[ENGINE] Insufficient cash (${available_cash:.2f}) for target bet (${bet_amount:.2f}). "
+                f"[ENGINE] Insufficient cash (${available_cash:.2f}) for target bet (${desired_bet:.2f}). "
                 "Triggering portfolio optimization..."
             )
             try:
@@ -192,7 +212,7 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
             available_cash = float(available_cash) + float(freed_cash)
             bridge.current_balance = float(available_cash)
 
-        planned_bet = min(float(bet_amount), float(allowed_remaining))
+        effective_budget = min(float(available_cash), float(allowed_remaining))
 
         if float(allowed_remaining) < float(safe_minimum):
             reason_msg = f"REJECTED: daily_limit_reached (Spent: ${float(spent_today):.2f} / Cap: ${float(daily_cap):.2f})"
@@ -215,10 +235,8 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
             my_hunter.mark_seen(token_id)
             continue
 
-        bet_amount = min(float(planned_bet), float(available_cash))
-
-        if float(bet_amount) < float(safe_minimum):
-            needed = max(float(safe_minimum), float(planned_bet))
+        if float(effective_budget) < float(safe_minimum):
+            needed = float(safe_minimum)
             reason_msg = f"REJECTED: insufficient_cash (Available: ${float(available_cash):.2f} / Needed: ${float(needed):.2f})"
             print(f"[REJECTED] {reason_msg}")
             log_func(
@@ -232,7 +250,7 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
                     "target_bet": round(float(target_bet), 4),
                     "target_bet_unclamped": round(float(target_bet), 4),
                     "max_bet_size_usd": round(float(max_bet_size_usd), 4),
-                    "bet_amount": round(float(bet_amount), 4),
+                    "bet_amount": round(float(effective_budget), 4),
                     "needed": round(float(needed), 4),
                     "available_cash": round(float(available_cash), 4),
                     "allowed_remaining": round(float(allowed_remaining), 4),
@@ -244,6 +262,22 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
             )
             my_hunter.mark_seen(token_id)
             continue
+
+        bet_amount = min(float(desired_bet), float(effective_budget))
+        if float(bet_amount) < float(desired_bet):
+            log_func(
+                "BET-DOWNSIZE",
+                asset_type,
+                token_id,
+                {
+                    "market_name": question,
+                    "reason": "using available cash instead of standard bet size",
+                    "desired_bet": round(float(desired_bet), 4),
+                    "actual_bet": round(float(bet_amount), 4),
+                    "available_cash": round(float(available_cash), 4),
+                    "allowed_remaining": round(float(allowed_remaining), 4),
+                },
+            )
 
         executed = executor.evaluate_and_execute(
             market=prepared["market"],
