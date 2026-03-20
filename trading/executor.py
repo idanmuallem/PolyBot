@@ -18,14 +18,13 @@ ENTRY_PRICE_CEILING = 0.85
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, ApiCreds
+    from py_clob_client.clob_types import OrderArgs
     from py_clob_client.order_builder.constants import BUY, SELL
     CLOB_IMPORT_OK = True
 except Exception as e:
     logging.error(f"Import Error: {e}")
     ClobClient = Any 
     OrderArgs = Any 
-    ApiCreds = Any 
     BUY = "BUY"
     SELL = "SELL"
     CLOB_IMPORT_OK = False
@@ -58,7 +57,8 @@ class TradeExecutor:
         self.risk_config = risk_config or RiskConfig()
         self.trade_count_today = 0
         self.client = None
-        self.proxy_address = os.getenv("POLY_ADDRESS")
+        self.private_key = self._resolve_private_key()
+        self.proxy_address = self._resolve_proxy_address()
         self.signature_type = self._resolve_signature_type()
         self.paper_trade_mode = str(os.getenv("PAPER_TRADE_MODE", "False")).strip().lower() in (
             "1",
@@ -74,7 +74,7 @@ class TradeExecutor:
         ) or self.paper_trade_mode
 
         proxy_address = self.proxy_address
-        private_key = os.getenv("POLYGON_PRIVATE_KEY")
+        private_key = self.private_key
 
         if not CLOB_IMPORT_OK:
             logging.warning(
@@ -84,31 +84,63 @@ class TradeExecutor:
             return
 
         if proxy_address and private_key:
-            # Create the official credentials object the library expects.
-            creds = ApiCreds(
-                api_key=os.getenv("POLY_API_KEY"),
-                api_secret=os.getenv("POLY_SECRET"),
-                api_passphrase=os.getenv("POLY_PASSPHRASE"),
-            )
             self.client = ClobClient(
                 host="https://clob.polymarket.com",
                 chain_id=137,
                 key=private_key,
-                creds=creds,
                 funder=proxy_address,
                 signature_type=self.signature_type,
             )
+
+            # Official auth flow: derive L2 creds from L1 signer, then set creds on client.
+            if hasattr(self.client, "create_or_derive_api_creds"):
+                creds = self.client.create_or_derive_api_creds()
+            elif hasattr(self.client, "create_or_derive_api_key"):
+                creds = self.client.create_or_derive_api_key()
+            else:
+                raise RuntimeError("py-clob-client does not expose API creds derivation method")
+
+            if hasattr(self.client, "set_api_creds"):
+                self.client.set_api_creds(creds)
+            else:
+                # Backward-compatible fallback for SDK versions without set_api_creds.
+                self.client = ClobClient(
+                    host="https://clob.polymarket.com",
+                    chain_id=137,
+                    key=private_key,
+                    creds=creds,
+                    funder=proxy_address,
+                    signature_type=self.signature_type,
+                )
+
             if self.dry_run:
                 logging.warning("TradeExecutor initialized in DRY_RUN mode.")
         else:
             logging.warning(
                 "TradeExecutor running in Paper Trading mode: "
-                "missing POLY_ADDRESS and/or POLYGON_PRIVATE_KEY"
+                "missing POLYMARKET_PROXY_ADDRESS/POLY_ADDRESS and/or "
+                "POLYMARKET_PRIVATE_KEY/POLYGON_PRIVATE_KEY"
             )
 
     @staticmethod
+    def _resolve_private_key() -> Optional[str]:
+        return str(
+            os.getenv("POLYMARKET_PRIVATE_KEY")
+            or os.getenv("POLYGON_PRIVATE_KEY")
+            or ""
+        ).strip() or None
+
+    @staticmethod
+    def _resolve_proxy_address() -> Optional[str]:
+        return str(
+            os.getenv("POLYMARKET_PROXY_ADDRESS")
+            or os.getenv("POLY_ADDRESS")
+            or ""
+        ).strip() or None
+
+    @staticmethod
     def _resolve_signature_type() -> int:
-        raw_value = str(os.getenv("POLY_SIGNATURE_TYPE", "2")).strip()
+        raw_value = str(os.getenv("SIGNATURE_TYPE") or os.getenv("POLY_SIGNATURE_TYPE") or "2").strip()
         try:
             return int(raw_value)
         except Exception:
