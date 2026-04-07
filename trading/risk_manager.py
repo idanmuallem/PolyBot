@@ -15,7 +15,9 @@ class PortfolioManager:
     def _refresh_portfolio(self):
         positions = self.executor.get_open_positions()
         self.bridge.current_portfolio = positions
-        self.bridge.open_position_value = sum(p.value for p in positions)
+        total_open_value = sum(float(getattr(p, "value", 0.0) or 0.0) for p in positions)
+        self.bridge.open_position_value = float(total_open_value)
+        self.bridge.open_positions_value = float(total_open_value)
         self.bridge.total_pnl = sum((p.current_price - p.initial_price) * p.shares for p in positions)
 
     @staticmethod
@@ -138,7 +140,9 @@ class PortfolioManager:
         return float(live_ev)
 
     def _apply_sale_to_bridge(self, position_value: float):
-        self.bridge.current_balance = float(self.bridge.current_balance) + max(0.0, float(position_value))
+        updated_cash = float(self.bridge.current_balance) + max(0.0, float(position_value))
+        self.bridge.current_balance = float(updated_cash)
+        self.bridge.cash = float(updated_cash)
 
     def optimize_for_candidate(self, new_candidate_ev: float, min_improvement: float = 0.10, log_func=None) -> float:
         """Liquidate all materially weaker positions to pool capital for a stronger candidate."""

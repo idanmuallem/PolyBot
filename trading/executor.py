@@ -18,13 +18,15 @@ ENTRY_PRICE_CEILING = 0.85
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs
+    from py_clob_client.clob_types import OrderArgs, AssetType, BalanceAllowanceParams
     from py_clob_client.order_builder.constants import BUY, SELL
     CLOB_IMPORT_OK = True
 except Exception as e:
     logging.error(f"Import Error: {e}")
     ClobClient = Any 
     OrderArgs = Any 
+    AssetType = Any
+    BalanceAllowanceParams = Any
     BUY = "BUY"
     SELL = "SELL"
     CLOB_IMPORT_OK = False
@@ -59,7 +61,9 @@ class TradeExecutor:
         self.client = None
         self.private_key = self._resolve_private_key()
         self.proxy_address = self._resolve_proxy_address()
-        self.signature_type = self._resolve_signature_type()
+        # Use signature_type=2 for standard MetaMask/EOA proxy-wallet flows.
+        # Change this to 1 if your Polymarket account uses Email/Magic Link.
+        self.signature_type = 2
         self.paper_trade_mode = str(os.getenv("PAPER_TRADE_MODE", "False")).strip().lower() in (
             "1",
             "true",
@@ -88,6 +92,8 @@ class TradeExecutor:
                 host="https://clob.polymarket.com",
                 chain_id=137,
                 key=private_key,
+                # MUST be your Proxy Wallet address from your Polymarket profile,
+                # not your standard public wallet address.
                 funder=proxy_address,
                 signature_type=self.signature_type,
             )
@@ -124,29 +130,45 @@ class TradeExecutor:
 
     @staticmethod
     def _resolve_private_key() -> Optional[str]:
-        return str(
-            os.getenv("POLYMARKET_PRIVATE_KEY")
-            or os.getenv("POLYGON_PRIVATE_KEY")
-            or ""
-        ).strip() or None
+        return str(os.getenv("POLYMARKET_PRIVATE_KEY") or "").strip() or None
 
     @staticmethod
     def _resolve_proxy_address() -> Optional[str]:
-        return str(
-            os.getenv("POLYMARKET_PROXY_ADDRESS")
-            or os.getenv("POLY_ADDRESS")
-            or ""
-        ).strip() or None
+        return str(os.getenv("POLYMARKET_PROXY_ADDRESS") or "").strip() or None
+
+    def _resolve_positions_user_address(self) -> Optional[str]:
+        """Resolve the wallet address used for Data API position queries."""
+        explicit = str(self.proxy_address or "").strip()
+        if explicit:
+            return explicit
+
+        fallback = str(os.getenv("POLY_ADDRESS") or "").strip()
+        if fallback:
+            return fallback
+
+        try:
+            if self.client is not None and hasattr(self.client, "get_address"):
+                addr = str(self.client.get_address() or "").strip()
+                if addr:
+                    return addr
+        except Exception:
+            pass
+
+        return None
 
     @staticmethod
-    def _resolve_signature_type() -> int:
-        raw_value = str(os.getenv("SIGNATURE_TYPE") or os.getenv("POLY_SIGNATURE_TYPE") or "2").strip()
-        try:
-            return int(raw_value)
-        except Exception:
-            return 2
+    def _pick_float(payload: Dict[str, Any], *keys: str) -> float:
+        for key in keys:
+            raw = payload.get(key)
+            if raw is None:
+                continue
+            try:
+                return float(raw)
+            except Exception:
+                continue
+        return 0.0
 
-    def _submit_order(self, order: OrderArgs):
+    def _submit_order(self, order: Any):
         if self.client is None:
             raise RuntimeError("CLOB client is not configured")
 
@@ -156,35 +178,17 @@ class TradeExecutor:
         if not all(hasattr(order, field) for field in ("price", "size", "side", "token_id")):
             raise TypeError("order must be a valid OrderArgs object with price, size, side, token_id")
 
-        create_fn = getattr(self.client, "create_order", None)
-        post_fn = getattr(self.client, "post_order", None)
+        if not hasattr(self.client, "create_and_post_order"):
+            raise RuntimeError("CLOB client does not support create_and_post_order")
 
-        if callable(create_fn) and callable(post_fn):
-            try:
-                signed_order = create_fn(order, signature_type=self.signature_type)
-            except TypeError:
-                signed_order = create_fn(order)
-
-            post_resp = post_fn(signed_order)
-            if isinstance(post_resp, dict):
-                if post_resp.get("error") or post_resp.get("errors"):
-                    logging.error(f"Polymarket post_order rejected payload: {post_resp}")
-                    raise RuntimeError(f"Polymarket post_order rejected: {post_resp}")
-                if post_resp.get("success") is False:
-                    raise RuntimeError(f"Polymarket post_order rejected: {post_resp}")
-            return post_resp
-
-        if hasattr(self.client, "create_and_post_order"):
-            combined_resp = self.client.create_and_post_order(order)
-            if isinstance(combined_resp, dict):
-                if combined_resp.get("error") or combined_resp.get("errors"):
-                    logging.error(f"Polymarket create_and_post_order rejected payload: {combined_resp}")
-                    raise RuntimeError(f"Polymarket create_and_post_order rejected: {combined_resp}")
-                if combined_resp.get("success") is False:
-                    raise RuntimeError(f"Polymarket create_and_post_order rejected: {combined_resp}")
-            return combined_resp
-
-        raise RuntimeError("No supported order submission method found on CLOB client")
+        response = self.client.create_and_post_order(order)
+        if isinstance(response, dict):
+            if response.get("error") or response.get("errors"):
+                logging.error(f"Polymarket create_and_post_order rejected payload: {response}")
+                raise RuntimeError(f"Polymarket create_and_post_order rejected: {response}")
+            if response.get("success") is False:
+                raise RuntimeError(f"Polymarket create_and_post_order rejected: {response}")
+        return response
 
     @staticmethod
     def _format_order_exception(exc: Exception) -> Dict[str, Any]:
@@ -206,32 +210,31 @@ class TradeExecutor:
         return error_payload
 
     def get_balance(self) -> float:
-        """Fetch total USDC across both Native and Legacy contracts."""
-        import os, logging, json, urllib.request
+        """Fetch available CLOB collateral balance (true deployable cash)."""
         if self.dry_run or self.client is None:
             return float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
-            
-        total_balance = 0.0
-        # This checks both Native USDC and the older USDC.e
-        contracts = [
-            "0x3c499c542cEF5E3811e1192ce70d8bC21B59FEe5", 
-            "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-        ]
-        
-        proxy_addr = getattr(self.client, "proxy_address", os.getenv("POLY_ADDRESS"))
-        clean_addr = proxy_addr.replace("0x", "").lower().zfill(64)
-        
-        for contract in contracts:
-            try:
-                data = "0x70a08231" + clean_addr
-                payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": contract, "data": data}, "latest"], "id": 1}).encode('utf-8')
-                req = urllib.request.Request("https://polygon.drpc.org", data=payload, headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=5) as res:
-                    val = json.loads(res.read()).get("result", "0x0")
-                    total_balance += int(val, 16) / 1000000.0
-            except:
-                continue
-        return total_balance
+
+        try:
+            if hasattr(self.client, "get_collateral_balance"):
+                raw_balance = float(self.client.get_collateral_balance())
+                return raw_balance / 1_000_000.0 if raw_balance > 1_000_000 else raw_balance
+
+            if hasattr(self.client, "get_balance_allowance"):
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                resp = self.client.get_balance_allowance(params=params)
+                if isinstance(resp, dict):
+                    balance_raw = resp.get("balance", resp)
+                    if isinstance(balance_raw, dict):
+                        for key in ("balance", "amount", "available", "usdc", "USDC"):
+                            if balance_raw.get(key) is not None:
+                                raw_balance = float(balance_raw.get(key))
+                                return raw_balance / 1_000_000.0 if raw_balance > 1_000_000 else raw_balance
+                    raw_balance = float(balance_raw)
+                    return raw_balance / 1_000_000.0 if raw_balance > 1_000_000 else raw_balance
+        except Exception as exc:
+            logging.warning(f"Live collateral balance fetch failed: {exc}")
+
+        return 0.0
         
     def get_open_positions(self) -> List[Position]:
         """Fetch current open positions and calculate mark-to-mid PnL.
@@ -239,12 +242,12 @@ class TradeExecutor:
         Uses Polymarket Data API because py-clob-client does not expose
         a stable positions listing method across versions.
         """
-        if not self.proxy_address:
+        wallet_address = self._resolve_positions_user_address()
+        if not wallet_address:
             return []
 
         positions: List[Position] = []
-        wallet_address = str(self.proxy_address)
-        url = f"https://gamma-api.polymarket.com/positions?user={wallet_address}"
+        url = f"https://data-api.polymarket.com/positions?user={wallet_address}"
 
         try:
             response = requests.get(url, timeout=10)
@@ -279,19 +282,43 @@ class TradeExecutor:
                 if not token_id:
                     continue
 
-                shares = float(raw.get("size") or raw.get("shares") or raw.get("quantity") or 0.0)
-                if shares <= 0:
+                shares_raw = self._pick_float(raw, "size", "shares", "quantity", "balance", "positionSize", "numShares")
+                shares = abs(float(shares_raw))
+
+                initial_price = self._pick_float(raw, "avgPrice", "avg_price", "entry_price", "initial_price", "price")
+                current_price = self._pick_float(raw, "currentPrice", "current_price", "markPrice", "mark_price")
+                current_value = abs(
+                    self._pick_float(
+                        raw,
+                        "currentValue",
+                        "current_value",
+                        "positionValue",
+                        "position_value",
+                        "value",
+                        "usdValue",
+                    )
+                )
+
+                if current_value <= 0.0 and shares > 0.0 and current_price > 0.0:
+                    current_value = float(shares) * float(current_price)
+
+                if current_price <= 0.0 and shares > 0.0 and current_value > 0.0:
+                    current_price = float(current_value) / float(shares)
+
+                if shares <= 0.0 and current_value > 0.0 and initial_price > 0.0:
+                    shares = float(current_value) / float(initial_price)
+
+                if shares <= 0.0 and current_value <= 0.0:
                     continue
 
-                current_value = float(raw.get("currentValue") or raw.get("current_value") or 0.0)
-                initial_price = float(raw.get("avgPrice") or raw.get("entry_price") or raw.get("initial_price") or 0.0)
-
-                if current_value > 0.0 and shares > 0.0:
-                    current_price = current_value / shares
-                    value = current_value
+                if current_value > 0.0:
+                    value = float(current_value)
                 else:
-                    current_price = initial_price
-                    value = shares * current_price
+                    ref_price = float(current_price if current_price > 0.0 else initial_price)
+                    value = float(shares) * float(ref_price)
+
+                if current_price <= 0.0:
+                    current_price = float(initial_price)
 
                 pnl_percent = 0.0
                 if initial_price > 0:

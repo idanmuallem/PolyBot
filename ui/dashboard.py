@@ -8,7 +8,7 @@ import time
 import pandas as pd
 import streamlit as st
 
-from trading.engine import run_market_monitor
+from trading.decision_pipeline import run_market_monitor
 import ui.data_manager as data_manager
 from clients.polymarket import PolymarketClient
 from core.bridge import get_bridge

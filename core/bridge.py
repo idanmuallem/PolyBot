@@ -16,6 +16,7 @@ class DataBridge:
         self.market_asset_type = "N/A"
         self.starting_balance = 0.0
         self.current_balance = 0.0
+        self.cash = 0.0
         self.balance_connection_error = False
         self.daily_spend = 0.0
         self.spent_today = 0.0
@@ -27,6 +28,7 @@ class DataBridge:
         self.market_name_by_token = {}
         self.current_portfolio = []
         self.open_position_value = 0.0
+        self.open_positions_value = 0.0
         self.total_pnl = 0.0
         self.event_count = 0
         self.level_counts = defaultdict(int)
