@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 .vscode/
 *.db
+PolyBot_New_Key
+PolyBot_New_Key.pub
+*.pem
+*.key
