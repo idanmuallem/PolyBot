@@ -1,0 +1,12 @@
+{
+    "commands":  [
+                     "aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin 979667333506.dkr.ecr.eu-north-1.amazonaws.com",
+                     "docker stop polybot || true",
+                     "docker rm polybot || true",
+                     "docker system prune -a -f",
+                     "docker pull 979667333506.dkr.ecr.eu-north-1.amazonaws.com/polybot/main:latest",
+                     "touch /home/ec2-user/trades.db",
+                     "chmod 666 /home/ec2-user/trades.db",
+                     "docker run -d --name polybot --restart always -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db --env-file /home/ec2-user/.env 979667333506.dkr.ecr.eu-north-1.amazonaws.com/polybot/main:latest"
+                 ]
+}

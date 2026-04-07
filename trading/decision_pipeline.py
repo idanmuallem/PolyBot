@@ -236,6 +236,22 @@ class SequentialTradingPipeline:
         asset_type = str(getattr(market, "asset_type", "") or "")
         question = str(getattr(market, "market_name", "") or getattr(market, "question", ""))
 
+        # STRICT SANITY CHECK: Prevent BTC/ETH Cross-Contamination
+        asset_lower = asset_type.lower()
+        q_lower = question.lower()
+
+        if "btc" in asset_lower or "bitcoin" in asset_lower:
+            if "eth" in q_lower or "ethereum" in q_lower or "sol" in q_lower or "solana" in q_lower:
+                self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "asset_mismatch_btc_vs_altcoin"})
+                self.hunter.mark_seen(token_id)
+                return None
+
+        if "eth" in asset_lower or "ethereum" in asset_lower:
+            if "btc" in q_lower or "bitcoin" in q_lower or "sol" in q_lower or "solana" in q_lower:
+                self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "asset_mismatch_eth_vs_other"})
+                self.hunter.mark_seen(token_id)
+                return None
+
         self.bridge.status = f"Scanning {asset_type}: {question[:60]}..."
         self.bridge.market_question = question
         self.bridge.market_asset_type = asset_type
@@ -453,46 +469,45 @@ class SequentialTradingPipeline:
             log_func=self.log_func,
         )
 
-        if not executed:
-            self.hunter.mark_seen(candidate.token_id)
-            return
+        if executed:
+            self.budget_manager.record_trade(float(approved_bet))
+            self.spent_today = float(self.budget_manager.total_spent_today)
+            self.bridge.spent_today = float(self.spent_today)
+            self.bridge.daily_spend = float(self.spent_today)
 
-        self.budget_manager.record_trade(float(approved_bet))
-        self.spent_today = float(self.budget_manager.total_spent_today)
-        self.bridge.spent_today = float(self.spent_today)
-        self.bridge.daily_spend = float(self.spent_today)
+            self.bridge.current_balance = max(0.0, float(self.bridge.current_balance) - float(approved_bet))
+            self.bridge.cash = float(self.bridge.current_balance)
 
-        self.bridge.current_balance = max(0.0, float(self.bridge.current_balance) - float(approved_bet))
-        self.bridge.cash = float(self.bridge.current_balance)
+            cash_balance = float(self.bridge.current_balance)
+            open_positions_value = float(self.bridge.open_position_value)
+            total_equity = float(cash_balance) + float(open_positions_value)
 
-        cash_balance = float(self.bridge.current_balance)
-        open_positions_value = float(self.bridge.open_position_value)
-        total_equity = float(cash_balance) + float(open_positions_value)
+            self.log_func(
+                "TRACK",
+                candidate.asset_type,
+                candidate.token_id,
+                {
+                    "market_name": candidate.question,
+                    "model_used": candidate.model_used,
+                    "fair": round(float(candidate.fair_value), 4),
+                    "ev": round(float(candidate.final_ev), 4),
+                    "ev_yes": round(float(candidate.ev_yes), 4),
+                    "ev_no": round(float(candidate.ev_no), 4),
+                    "side": candidate.side,
+                    "kelly": round(float(candidate.kelly_size), 4),
+                    "bet_usd": round(float(approved_bet), 2),
+                    "executed": bool(executed),
+                    "total_equity": round(float(total_equity), 4),
+                    "allocation_fraction": self.allocation_fraction,
+                    "max_bet_size_usd": round(float(self.max_bet_size_usd), 2),
+                    "target_bet_unclamped": round(float(risk_context.get("target_bet", 0.0)), 2),
+                    "target_bet_usd": round(float(approved_bet), 2),
+                    "available_cash": round(float(risk_context.get("available_cash", 0.0)), 2),
+                    "spent_today": round(float(self.spent_today), 2),
+                },
+            )
 
-        self.log_func(
-            "TRACK",
-            candidate.asset_type,
-            candidate.token_id,
-            {
-                "market_name": candidate.question,
-                "model_used": candidate.model_used,
-                "fair": round(float(candidate.fair_value), 4),
-                "ev": round(float(candidate.final_ev), 4),
-                "ev_yes": round(float(candidate.ev_yes), 4),
-                "ev_no": round(float(candidate.ev_no), 4),
-                "side": candidate.side,
-                "kelly": round(float(candidate.kelly_size), 4),
-                "bet_usd": round(float(approved_bet), 2),
-                "executed": bool(executed),
-                "total_equity": round(float(total_equity), 4),
-                "allocation_fraction": self.allocation_fraction,
-                "max_bet_size_usd": round(float(self.max_bet_size_usd), 2),
-                "target_bet_unclamped": round(float(risk_context.get("target_bet", 0.0)), 2),
-                "target_bet_usd": round(float(approved_bet), 2),
-                "available_cash": round(float(risk_context.get("available_cash", 0.0)), 2),
-                "spent_today": round(float(self.spent_today), 2),
-            },
-        )
+        self.hunter.mark_seen(candidate.token_id)
 
     async def run_forever(self):
         while True:

@@ -3,7 +3,6 @@ HybridCryptoBrain: Time-aware fair value calculation for cryptocurrency markets.
 
 Uses a Black-Scholes style CDF approach with annualized volatility.
 """
-
 import math
 import numpy as np
 from scipy.stats import norm
@@ -71,11 +70,19 @@ class HybridCryptoBrain(BaseBrain):
         # Extract volatility for the asset type (BTC, ETH, etc.)
         vol = self.get_volatility_for_symbol(market.asset_type)
 
-        return self.evaluate_fair_value(
+        base_prob = self.evaluate_fair_value(
             market=market,
             live_truth=live_truth,
             volatility=vol,
         )
+
+        question = str(getattr(market, "market_name", "") or getattr(market, "question", "")).lower()
+        invert_keywords = ["↓", "below", "under", "less", "down", "lower"]
+
+        if any(kw in question for kw in invert_keywords):
+            return 1.0 - base_prob
+
+        return base_prob
 
     def evaluate_fair_value(self, market: MarketData, live_truth: float, volatility: float) -> float:
         """Select pricing model based on time-to-expiry (TTE) with safe fallback.

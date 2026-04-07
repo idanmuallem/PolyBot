@@ -20,7 +20,7 @@ ENTRY_PRICE_CEILING = 0.85
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OrderArgs, AssetType, BalanceAllowanceParams
+    from py_clob_client.clob_types import OrderArgs, AssetType, BalanceAllowanceParams
     from py_clob_client.order_builder.constants import BUY, SELL
     CLOB_IMPORT_OK = True
 except Exception as e:
@@ -105,20 +105,23 @@ class TradeExecutor:
         if self.config.proxy_address and self.config.private_key:
             try:
                 print(f"Signing for Proxy: {self.config.proxy_address}")
-                creds = ApiCreds(
-                    api_key=os.getenv("POLY_API_KEY"),
-                    api_secret=os.getenv("POLY_SECRET"),
-                    api_passphrase=os.getenv("POLY_PASSPHRASE"),
-                )
                 self.client = ClobClient(
                     host="https://clob.polymarket.com",
                     chain_id=137,
                     key=self.config.private_key,
                     funder=to_checksum_address(self.config.proxy_address),
                     signature_type=self.config.signature_type,
-                    creds=creds,
                 )
-                self.client.set_api_creds(creds)
+
+                try:
+                    creds = self.client.create_or_derive_api_creds()
+                    self.client.set_api_creds(creds)
+                    print("[AUTH] Credentials successfully derived and set!")
+                except Exception as e:
+                    print(f"[AUTH-ERROR] Failed to derive: {e}")
+                    self.client = None
+                    return
+
                 print("[SUCCESS] Live CLOB Client is fully armed and operational!")
             except Exception as e:
                 print(f"[FATAL ERROR] ClobClient failed to build: {e}")
@@ -129,24 +132,25 @@ class TradeExecutor:
     def _initialize_clob_client(self) -> None:
         """Initialize authenticated CLOB client with proxy wallet (funder)."""
         print(f"Signing for Proxy: {self.config.proxy_address}")
-        creds = ApiCreds(
-            api_key=os.getenv("POLY_API_KEY"),
-            api_secret=os.getenv("POLY_SECRET"),
-            api_passphrase=os.getenv("POLY_PASSPHRASE"),
-        )
         self.client = ClobClient(
             host="https://clob.polymarket.com",
             chain_id=137,
             key=self.config.private_key,
             funder=to_checksum_address(self.config.proxy_address),
             signature_type=self.config.signature_type,
-            creds=creds,
         )
 
         if not hasattr(self.client, "set_api_creds"):
             raise RuntimeError("py-clob-client does not expose set_api_creds()")
 
-        self.client.set_api_creds(creds)
+        try:
+            creds = self.client.create_or_derive_api_creds()
+            self.client.set_api_creds(creds)
+            print("[AUTH] Credentials successfully derived and set!")
+        except Exception as e:
+            print(f"[AUTH-ERROR] Failed to derive: {e}")
+            self.client = None
+            raise
 
     def _resolve_positions_user_address(self) -> Optional[str]:
         """Resolve the wallet address used for Data API position queries."""
@@ -186,6 +190,20 @@ class TradeExecutor:
             # This will catch 'invalid signature' or 'insufficient balance'
             print(f"[LIVE-TRADE-ERROR] {token_id} - {str(e)}")
             return None
+
+    @staticmethod
+    def _is_valid_order_response(response: Any) -> bool:
+        if not response:
+            return False
+
+        if isinstance(response, dict):
+            if response.get("error") or response.get("errors") or response.get("errorMsg"):
+                return False
+
+            order_id = response.get("orderID") or response.get("orderId") or response.get("order_id") or response.get("id")
+            return bool(order_id)
+
+        return True
         
     @staticmethod
     def _format_order_exception(exc: Exception) -> Dict[str, Any]:
@@ -396,23 +414,37 @@ class TradeExecutor:
             return True
 
         try:
-            resp = self._submit_order(
+            order_resp = self._submit_order(
                 token_id=execution_token_id,
                 price=execution_price,
                 side=BUY,
                 size=shares,
             )
-            live_success = True
-            if isinstance(resp, dict):
-                live_success = not resp.get("error") and not resp.get("errors")
+
+            if not self._is_valid_order_response(order_resp):
+                error_payload = {
+                    "error": "order_rejected_or_unconfirmed",
+                    "response": order_resp,
+                    "side": execution_side,
+                    "price": execution_price,
+                    "shares": shares,
+                }
+                logging.error(f"LIVE order rejected: {error_payload}")
+                log_func(
+                    "LIVE-TRADE-ERROR",
+                    asset_type,
+                    execution_token_id,
+                    error_payload,
+                )
+                return False
 
             log_func(
                 "LIVE-TRADE",
                 asset_type,
                 execution_token_id,
-                {"success": live_success, "response": resp, "side": execution_side, "price": execution_price},
+                {"success": True, "response": order_resp, "side": execution_side, "price": execution_price},
             )
-            return live_success
+            return True
         except Exception as exc:
             error_payload = self._format_order_exception(exc)
             logging.error(f"LIVE order rejected: {error_payload}")
@@ -461,23 +493,36 @@ class TradeExecutor:
             return True
 
         try:
-            resp = self._submit_order(
+            order_resp = self._submit_order(
                 token_id=token_id,
                 price=price,
                 side=SELL,
                 size=shares,
             )
-            success = True
-            if isinstance(resp, dict):
-                success = not resp.get("error") and not resp.get("errors")
+
+            if not self._is_valid_order_response(order_resp):
+                error_payload = {
+                    "error": "order_rejected_or_unconfirmed",
+                    "response": order_resp,
+                    "price": price,
+                    "shares": shares,
+                }
+                logging.error(f"SELL order rejected: {error_payload}")
+                log_func(
+                    "SELL-ERROR",
+                    "Portfolio",
+                    token_id,
+                    error_payload,
+                )
+                return False
 
             log_func(
                 "SELL",
                 "Portfolio",
                 token_id,
-                {"success": success, "response": resp, "price": price, "shares": shares},
+                {"success": True, "response": order_resp, "price": price, "shares": shares},
             )
-            return success
+            return True
         except Exception as exc:
             error_payload = self._format_order_exception(exc)
             logging.error(f"SELL order rejected: {error_payload}")
