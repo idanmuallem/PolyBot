@@ -170,10 +170,12 @@ class TradeExecutor:
         if not hasattr(self.client, "create_and_post_order"):
             raise RuntimeError("CLOB client does not support create_and_post_order")
 
-        # Re-derive L2 creds defensively if client instance was recreated externally.
-        if hasattr(self.client, "create_or_derive_api_creds") and hasattr(self.client, "set_api_creds"):
-            creds = self.client.create_or_derive_api_creds()
-            self.client.set_api_creds(creds)
+        print(
+            "Attempting trade with Funder: "
+            + str(self.client.funder)
+            + " and Signature Type: "
+            + str(self.client.signature_type)
+        )
 
         response = self.client.create_and_post_order(order)
         if isinstance(response, dict):
