@@ -40,6 +40,31 @@ class RiskConfig:
     stop_loss_pct: float = 0.05  # Stop loss percentage
 
 
+@dataclass
+class ExecutorAuthConfig:
+    """Auth/config values required for Polymarket CLOB signing."""
+
+    private_key: Optional[str]
+    proxy_address: Optional[str]
+    signature_type: int = 2
+
+    @classmethod
+    def from_env(cls) -> "ExecutorAuthConfig":
+        private_key = str(os.getenv("POLYMARKET_PRIVATE_KEY") or "").strip() or None
+        proxy_address = str(os.getenv("POLYMARKET_PROXY_ADDRESS") or "").strip() or None
+        signature_type_raw = str(os.getenv("SIGNATURE_TYPE", "2")).strip()
+        try:
+            signature_type = int(signature_type_raw)
+        except ValueError:
+            signature_type = 2
+
+        return cls(
+            private_key=private_key,
+            proxy_address=proxy_address,
+            signature_type=signature_type,
+        )
+
+
 class TradeExecutor:
     """Handles trade execution with risk management.
 
@@ -59,11 +84,10 @@ class TradeExecutor:
         self.risk_config = risk_config or RiskConfig()
         self.trade_count_today = 0
         self.client = None
-        self.private_key = self._resolve_private_key()
-        self.proxy_address = self._resolve_proxy_address()
-        # Use signature_type=2 for standard MetaMask/EOA proxy-wallet flows.
-        # Change this to 1 if your Polymarket account uses Email/Magic Link.
-        self.signature_type = 2
+        self.config = ExecutorAuthConfig.from_env()
+        self.private_key = self.config.private_key
+        self.proxy_address = self.config.proxy_address
+        self.signature_type = self.config.signature_type
         self.paper_trade_mode = str(os.getenv("PAPER_TRADE_MODE", "False")).strip().lower() in (
             "1",
             "true",
@@ -77,9 +101,6 @@ class TradeExecutor:
             "on",
         ) or self.paper_trade_mode
 
-        proxy_address = self.proxy_address
-        private_key = self.private_key
-
         if not CLOB_IMPORT_OK:
             logging.warning(
                 "py-clob-client import not available. "
@@ -87,72 +108,40 @@ class TradeExecutor:
             )
             return
 
-        if proxy_address and private_key:
-            self.client = ClobClient(
-                host="https://clob.polymarket.com",
-                chain_id=137,
-                key=private_key,
-                # MUST be your Proxy Wallet address from your Polymarket profile,
-                # not your standard public wallet address.
-                funder=proxy_address,
-                signature_type=self.signature_type,
-            )
-
-            # Official auth flow: derive L2 creds from L1 signer, then set creds on client.
-            if hasattr(self.client, "create_or_derive_api_creds"):
-                creds = self.client.create_or_derive_api_creds()
-            elif hasattr(self.client, "create_or_derive_api_key"):
-                creds = self.client.create_or_derive_api_key()
-            else:
-                raise RuntimeError("py-clob-client does not expose API creds derivation method")
-
-            if hasattr(self.client, "set_api_creds"):
-                self.client.set_api_creds(creds)
-            else:
-                # Backward-compatible fallback for SDK versions without set_api_creds.
-                self.client = ClobClient(
-                    host="https://clob.polymarket.com",
-                    chain_id=137,
-                    key=private_key,
-                    creds=creds,
-                    funder=proxy_address,
-                    signature_type=self.signature_type,
-                )
-
+        if self.private_key and self.proxy_address:
+            self._initialize_clob_client()
             if self.dry_run:
                 logging.warning("TradeExecutor initialized in DRY_RUN mode.")
         else:
             logging.warning(
                 "TradeExecutor running in Paper Trading mode: "
-                "missing POLYMARKET_PROXY_ADDRESS/POLY_ADDRESS and/or "
-                "POLYMARKET_PRIVATE_KEY/POLYGON_PRIVATE_KEY"
+                "missing POLYMARKET_PROXY_ADDRESS and/or POLYMARKET_PRIVATE_KEY"
             )
 
-    @staticmethod
-    def _resolve_private_key() -> Optional[str]:
-        return str(os.getenv("POLYMARKET_PRIVATE_KEY") or "").strip() or None
+    def _initialize_clob_client(self) -> None:
+        """Initialize authenticated CLOB client with proxy wallet (funder)."""
+        self.client = ClobClient(
+            host="https://clob.polymarket.com",
+            chain_id=137,
+            key=self.config.private_key,
+            funder=self.config.proxy_address,
+            signature_type=self.config.signature_type,
+        )
 
-    @staticmethod
-    def _resolve_proxy_address() -> Optional[str]:
-        return str(os.getenv("POLYMARKET_PROXY_ADDRESS") or "").strip() or None
+        if not hasattr(self.client, "create_or_derive_api_creds"):
+            raise RuntimeError("py-clob-client does not expose create_or_derive_api_creds()")
+        if not hasattr(self.client, "set_api_creds"):
+            raise RuntimeError("py-clob-client does not expose set_api_creds()")
+
+        # Required for authenticated order posting on Polymarket CLOB.
+        creds = self.client.create_or_derive_api_creds()
+        self.client.set_api_creds(creds)
 
     def _resolve_positions_user_address(self) -> Optional[str]:
         """Resolve the wallet address used for Data API position queries."""
         explicit = str(self.proxy_address or "").strip()
         if explicit:
             return explicit
-
-        fallback = str(os.getenv("POLY_ADDRESS") or "").strip()
-        if fallback:
-            return fallback
-
-        try:
-            if self.client is not None and hasattr(self.client, "get_address"):
-                addr = str(self.client.get_address() or "").strip()
-                if addr:
-                    return addr
-        except Exception:
-            pass
 
         return None
 
@@ -180,6 +169,11 @@ class TradeExecutor:
 
         if not hasattr(self.client, "create_and_post_order"):
             raise RuntimeError("CLOB client does not support create_and_post_order")
+
+        # Re-derive L2 creds defensively if client instance was recreated externally.
+        if hasattr(self.client, "create_or_derive_api_creds") and hasattr(self.client, "set_api_creds"):
+            creds = self.client.create_or_derive_api_creds()
+            self.client.set_api_creds(creds)
 
         response = self.client.create_and_post_order(order)
         if isinstance(response, dict):
