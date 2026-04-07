@@ -7,5 +7,6 @@ services:
     env_file:
       - .env
     volumes:
+      - ./:/app
       - ./trades.db:/app/trades.db
     restart: unless-stopped
