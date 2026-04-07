@@ -1,5 +1,11 @@
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+
+# Load local .env values when running outside Docker/AWS.
+load_dotenv()
 
 
 DEFAULT_MIN_EV = 0.30
@@ -9,6 +15,14 @@ DEFAULT_DAILY_LIMIT_USD = 15.0
 
 def _env_bool(name: str, default: str) -> bool:
     return str(os.getenv(name, default)).strip().lower() in ("true", "1", "t")
+
+
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = str(os.getenv(name, "")).strip()
+        if value:
+            return value
+    return default
 
 
 @dataclass
@@ -29,6 +43,9 @@ class TradingConfig:
     min_hold_ev: float = 0.05
 
     loop_delay_seconds: float = 2.0
+    private_key: str = ""
+    proxy_address: str = ""
+    signature_type: int = 2
 
 
     @classmethod
@@ -47,4 +64,7 @@ class TradingConfig:
             loop_delay_seconds=float(os.getenv("ENGINE_LOOP_DELAY", "2.0")),
             dry_run=_env_bool("DRY_RUN", "True"),
             paper_trade_mode=_env_bool("PAPER_TRADE_MODE", "False"),
+            private_key=_env_first("POLYMARKET_PRIVATE_KEY", "POLYGON_PRIVATE_KEY"),
+            proxy_address=_env_first("POLYMARKET_PROXY_ADDRESS", "POLY_ADDRESS"),
+            signature_type=int(os.getenv("SIGNATURE_TYPE", "2")),
         )

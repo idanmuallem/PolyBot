@@ -6,6 +6,8 @@ services:
       - "8501:8501"
     env_file:
       - .env
+    environment:
+      STREAMLIT_SERVER_FILE_WATCHER_TYPE: poll
     volumes:
       - ./:/app
       - ./trades.db:/app/trades.db

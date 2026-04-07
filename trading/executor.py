@@ -7,10 +7,12 @@ Handles position sizing, risk checks, and trade firing.
 
 import os
 import logging
+import math
 from typing import Optional, Dict, Any, Callable, List
 from dataclasses import dataclass
 import requests
-from core.trading_config import DEFAULT_MIN_EV
+from eth_utils import to_checksum_address
+from core.trading_config import DEFAULT_MIN_EV, TradingConfig
 from core.models import MarketData, Position
 
 ENTRY_PRICE_FLOOR = 0.30
@@ -18,7 +20,7 @@ ENTRY_PRICE_CEILING = 0.85
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, AssetType, BalanceAllowanceParams
+    from py_clob_client.clob_types import ApiCreds, OrderArgs, AssetType, BalanceAllowanceParams
     from py_clob_client.order_builder.constants import BUY, SELL
     CLOB_IMPORT_OK = True
 except Exception as e:
@@ -76,65 +78,74 @@ class TradeExecutor:
     """
 
     def __init__(self, risk_config: Optional[RiskConfig] = None):
-        """Initialize TradeExecutor.
-
-        Args:
-            risk_config: Risk configuration (uses defaults if not provided)
-        """
+        self.config = TradingConfig.from_env()
         self.risk_config = risk_config or RiskConfig()
         self.trade_count_today = 0
+        self.dry_run = self.config.dry_run
         self.client = None
-        self.config = ExecutorAuthConfig.from_env()
+
         self.private_key = self.config.private_key
         self.proxy_address = self.config.proxy_address
         self.signature_type = self.config.signature_type
-        self.paper_trade_mode = str(os.getenv("PAPER_TRADE_MODE", "False")).strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        self.dry_run = str(os.getenv("DRY_RUN", "True")).strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ) or self.paper_trade_mode
+        self.paper_trade_mode = self.config.paper_trade_mode
+
+        # --- DIAGNOSTIC BLOCK ---
+        print("\n" + "=" * 30)
+        print("=== EXECUTOR BOOT DIAGNOSTIC ===")
+        print(f"1. CLOB Import OK:    {CLOB_IMPORT_OK}")
+        print(f"2. Private Key Found: {bool(self.config.private_key)}")
+        print(f"3. Proxy Addr Found:  {bool(self.config.proxy_address)}")
+        print(f"4. Dry Run Mode:      {self.dry_run}")
+        print("=" * 30 + "\n")
 
         if not CLOB_IMPORT_OK:
-            logging.warning(
-                "py-clob-client import not available. "
-                "TradeExecutor will run in Paper Trading mode."
-            )
+            print("[FATAL] py-clob-client is not loaded correctly!")
             return
 
-        if self.private_key and self.proxy_address:
-            self._initialize_clob_client()
-            if self.dry_run:
-                logging.warning("TradeExecutor initialized in DRY_RUN mode.")
+        if self.config.proxy_address and self.config.private_key:
+            try:
+                print(f"Signing for Proxy: {self.config.proxy_address}")
+                creds = ApiCreds(
+                    api_key=os.getenv("POLY_API_KEY"),
+                    api_secret=os.getenv("POLY_SECRET"),
+                    api_passphrase=os.getenv("POLY_PASSPHRASE"),
+                )
+                self.client = ClobClient(
+                    host="https://clob.polymarket.com",
+                    chain_id=137,
+                    key=self.config.private_key,
+                    funder=to_checksum_address(self.config.proxy_address),
+                    signature_type=self.config.signature_type,
+                    creds=creds,
+                )
+                self.client.set_api_creds(creds)
+                print("[SUCCESS] Live CLOB Client is fully armed and operational!")
+            except Exception as e:
+                print(f"[FATAL ERROR] ClobClient failed to build: {e}")
+                self.client = None
         else:
-            logging.warning(
-                "TradeExecutor running in Paper Trading mode: "
-                "missing POLYMARKET_PROXY_ADDRESS and/or POLYMARKET_PRIVATE_KEY"
-            )
+            print("[FATAL] Missing keys in Config! Cannot build Client.")
 
     def _initialize_clob_client(self) -> None:
         """Initialize authenticated CLOB client with proxy wallet (funder)."""
+        print(f"Signing for Proxy: {self.config.proxy_address}")
+        creds = ApiCreds(
+            api_key=os.getenv("POLY_API_KEY"),
+            api_secret=os.getenv("POLY_SECRET"),
+            api_passphrase=os.getenv("POLY_PASSPHRASE"),
+        )
         self.client = ClobClient(
             host="https://clob.polymarket.com",
             chain_id=137,
             key=self.config.private_key,
-            funder=self.config.proxy_address,
+            funder=to_checksum_address(self.config.proxy_address),
             signature_type=self.config.signature_type,
+            creds=creds,
         )
 
-        if not hasattr(self.client, "create_or_derive_api_creds"):
-            raise RuntimeError("py-clob-client does not expose create_or_derive_api_creds()")
         if not hasattr(self.client, "set_api_creds"):
             raise RuntimeError("py-clob-client does not expose set_api_creds()")
 
-        # Required for authenticated order posting on Polymarket CLOB.
-        creds = self.client.create_or_derive_api_creds()
         self.client.set_api_creds(creds)
 
     def _resolve_positions_user_address(self) -> Optional[str]:
@@ -157,35 +168,25 @@ class TradeExecutor:
                 continue
         return 0.0
 
-    def _submit_order(self, order: Any):
-        if self.client is None:
-            raise RuntimeError("CLOB client is not configured")
+    def _submit_order(self, token_id: str, price: float, side: str, size: float):
+        """Execute a live order on the Polymarket CLOB."""
+        try:
+            print(f"[EXECUTION] Attempting {side} order: {size} shares at ${price}")
 
-        if order is None:
-            raise ValueError("OrderArgs is required")
-
-        if not all(hasattr(order, field) for field in ("price", "size", "side", "token_id")):
-            raise TypeError("order must be a valid OrderArgs object with price, size, side, token_id")
-
-        if not hasattr(self.client, "create_and_post_order"):
-            raise RuntimeError("CLOB client does not support create_and_post_order")
-
-        print(
-            "Attempting trade with Funder: "
-            + str(self.client.funder)
-            + " and Signature Type: "
-            + str(self.client.signature_type)
-        )
-
-        response = self.client.create_and_post_order(order)
-        if isinstance(response, dict):
-            if response.get("error") or response.get("errors"):
-                logging.error(f"Polymarket create_and_post_order rejected payload: {response}")
-                raise RuntimeError(f"Polymarket create_and_post_order rejected: {response}")
-            if response.get("success") is False:
-                raise RuntimeError(f"Polymarket create_and_post_order rejected: {response}")
-        return response
-
+            order = OrderArgs(
+                token_id=token_id,
+                price=price,
+                side=side,
+                size=size,
+            )
+            
+            resp = self.client.create_and_post_order(order)
+            return resp
+        except Exception as e:
+            # This will catch 'invalid signature' or 'insufficient balance'
+            print(f"[LIVE-TRADE-ERROR] {token_id} - {str(e)}")
+            return None
+        
     @staticmethod
     def _format_order_exception(exc: Exception) -> Dict[str, Any]:
         error_payload: Dict[str, Any] = {
@@ -394,14 +395,13 @@ class TradeExecutor:
             )
             return True
 
-        order = OrderArgs(
-            price=execution_price,
-            size=shares,
-            side=BUY,
-            token_id=execution_token_id,
-        )
         try:
-            resp = self._submit_order(order)
+            resp = self._submit_order(
+                token_id=execution_token_id,
+                price=execution_price,
+                side=BUY,
+                size=shares,
+            )
             live_success = True
             if isinstance(resp, dict):
                 live_success = not resp.get("error") and not resp.get("errors")
@@ -460,14 +460,13 @@ class TradeExecutor:
             )
             return True
 
-        order = OrderArgs(
-            price=price,
-            size=shares,
-            side=SELL,
-            token_id=token_id,
-        )
         try:
-            resp = self._submit_order(order)
+            resp = self._submit_order(
+                token_id=token_id,
+                price=price,
+                side=SELL,
+                size=shares,
+            )
             success = True
             if isinstance(resp, dict):
                 success = not resp.get("error") and not resp.get("errors")
@@ -581,7 +580,7 @@ class TradeExecutor:
             )
             return False
 
-        shares = round(bet_amount_usd / execution_price, 2)
+        shares = math.floor((bet_amount_usd / execution_price) * 100.0) / 100.0
 
         if shares <= 0:
             log_func(

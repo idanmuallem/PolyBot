@@ -24,13 +24,22 @@ def _as_bool(raw_value: str, default: bool) -> bool:
     return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _get_env_with_fallback(*names: str) -> str:
+    for name in names:
+        value = str(os.getenv(name, "")).strip()
+        if value:
+            return value
+    return ""
+
+
 def _validate_runtime_env() -> dict:
-    required = ["POLYGON_PRIVATE_KEY", "POLY_ADDRESS"]
-    missing = [name for name in required if not os.getenv(name)]
-    if missing:
+    private_key = _get_env_with_fallback("POLYMARKET_PRIVATE_KEY", "POLYGON_PRIVATE_KEY")
+    proxy_address = _get_env_with_fallback("POLYMARKET_PROXY_ADDRESS", "POLY_ADDRESS")
+    if not private_key or not proxy_address:
         raise ValueError(
             "Missing required environment variables: "
-            + ", ".join(missing)
+            + "POLYMARKET_PRIVATE_KEY/POLYGON_PRIVATE_KEY and "
+            + "POLYMARKET_PROXY_ADDRESS/POLY_ADDRESS"
             + ". Pass them at runtime with --env-file."
         )
 
@@ -121,8 +130,8 @@ def _restore_runtime_state(db_path: str, fallback_starting_balance: float) -> di
 
 
 def _fetch_live_balance() -> tuple[float, bool]:
-    proxy_address = str(os.getenv("POLY_ADDRESS", "")).strip()
-    private_key = str(os.getenv("POLYGON_PRIVATE_KEY", "")).strip()
+    proxy_address = _get_env_with_fallback("POLYMARKET_PROXY_ADDRESS", "POLY_ADDRESS")
+    private_key = _get_env_with_fallback("POLYMARKET_PRIVATE_KEY", "POLYGON_PRIVATE_KEY")
     try:
         balance = float(
             PolymarketClient().get_proxy_balance(
