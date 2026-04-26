@@ -175,6 +175,10 @@ class TradeExecutor:
     def _submit_order(self, token_id: str, price: float, side: str, size: float):
         """Execute a live order on the Polymarket CLOB."""
         try:
+            # EXCHANGE GUARDRAIL: Round floats to prevent CLOB precision rejections
+            price = round(float(price), 2)
+            size = round(float(size), 2)
+
             print(f"[EXECUTION] Attempting {side} order: {size} shares at ${price}")
 
             order = OrderArgs(

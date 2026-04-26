@@ -80,17 +80,23 @@ class HybridCryptoBrain(BaseBrain):
         invert_keywords = ["↓", "below", "under", "less", "down", "lower"]
 
         if any(kw in question for kw in invert_keywords):
-            return 1.0 - base_prob
+            base_prob = 1.0 - base_prob
 
         return base_prob
 
     def evaluate_fair_value(self, market: MarketData, live_truth: float, volatility: float) -> float:
         """Select pricing model based on time-to-expiry (TTE) with safe fallback.
 
-        If the selected primary model fails or returns an extreme probability,
-        we explicitly fall back to Black-Scholes. Returned values are clamped so
-        the engine never receives exact 0.0 or 1.0.
+        If the selected primary model fails, we explicitly fall back to
+        Black-Scholes.
         """
+        # DYNAMIC VOLATILITY SKEW (FAT TAIL ADJUSTMENT)
+        # Inflates volatility the further the strike is from the current price.
+        strike = float(getattr(market, "strike_price", 0.0) or 0.0)
+        if strike > 0 and live_truth > 0:
+            distance_penalty = abs(math.log(live_truth / strike))
+            volatility = volatility * (1.0 + distance_penalty)
+
         tte_days = calculate_tte(getattr(market, "expiry_date", None))
 
         try:
@@ -107,13 +113,7 @@ class HybridCryptoBrain(BaseBrain):
             self.last_model_used = "black_scholes_fallback"
             fair_value = self._price_black_scholes(market, live_truth)
 
-        # Treat extreme probabilities from numerical models as unstable and fallback.
-        if fair_value < 0.001 or fair_value > 0.999:
-            self.last_model_used = "black_scholes_fallback"
-            fair_value = self._price_black_scholes(market, live_truth)
-
-        fair_value = max(0.001, min(0.999, float(fair_value)))
-        return fair_value
+        return float(fair_value)
 
     def _price_black_scholes(self, market: MarketData, live_truth: float) -> float:
         """Safe Black-Scholes fallback used when primary model output is unstable."""

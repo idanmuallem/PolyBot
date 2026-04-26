@@ -236,6 +236,17 @@ class SequentialTradingPipeline:
         asset_type = str(getattr(market, "asset_type", "") or "")
         question = str(getattr(market, "market_name", "") or getattr(market, "question", ""))
 
+        # HARD GUARDRAIL: Prevent Spread Suicide (Never buy what we already own)
+        # Check the live portfolio to see if we already hold shares in this exact market
+        if hasattr(self.bridge, "current_portfolio") and self.bridge.current_portfolio:
+            for position in self.bridge.current_portfolio:
+                # The position object might use asset_id or token_id depending on the executor
+                pos_token = str(getattr(position, "asset_id", getattr(position, "token_id", "")))
+                if pos_token == token_id:
+                    self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_owned_in_portfolio"})
+                    self.hunter.mark_seen(token_id)
+                    return None
+
         # STRICT SANITY CHECK: Prevent BTC/ETH Cross-Contamination
         asset_lower = asset_type.lower()
         q_lower = question.lower()

@@ -39,8 +39,8 @@ class TradingConfig:
     paper_trade_mode: bool = False
 
     take_profit_pct: float = 0.20
-    stop_loss_pct: float = -0.15
-    min_hold_ev: float = 0.05
+    stop_loss_pct: float = -0.50
+    min_hold_ev: float = -0.10
 
     loop_delay_seconds: float = 2.0
     private_key: str = ""
@@ -59,8 +59,8 @@ class TradingConfig:
             bankroll_usd=float(os.getenv("BANKROLL_USD", "1000.0")),
             min_trading_balance=float(os.getenv("MIN_TRADING_BALANCE", "5.0")),
             take_profit_pct=float(os.getenv("TAKE_PROFIT_PCT", "0.20")),
-            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "-0.15")),
-            min_hold_ev=float(os.getenv("MIN_HOLD_EV", "0.05")),
+            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "-0.50")),
+            min_hold_ev=float(os.getenv("MIN_HOLD_EV", "-0.10")),
             loop_delay_seconds=float(os.getenv("ENGINE_LOOP_DELAY", "2.0")),
             dry_run=_env_bool("DRY_RUN", "True"),
             paper_trade_mode=_env_bool("PAPER_TRADE_MODE", "False"),
