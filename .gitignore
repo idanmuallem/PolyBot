@@ -1,4 +1,4 @@
-.env
+﻿.env
 trades.db
 __pycache__/
 .venv/
@@ -9,3 +9,4 @@ PolyBot_New_Key
 PolyBot_New_Key.pub
 *.pem
 *.key
+.pytest_cache/
