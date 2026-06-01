@@ -41,6 +41,22 @@ jobs:
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
+    - name: Ensure EC2 instance is running
+      run: |
+        STATE=$(aws ec2 describe-instances \
+          --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
+          --query 'Reservations[0].Instances[0].State.Name' \
+          --output text)
+        if [ "$STATE" != "running" ]; then
+          echo "Instance is $STATE — starting it"
+          aws ec2 start-instances --instance-ids "${{ env.EC2_INSTANCE_ID }}"
+          aws ec2 wait instance-running --instance-ids "${{ env.EC2_INSTANCE_ID }}"
+          echo "Waiting 30s for SSM agent to come online..."
+          sleep 30
+        else
+          echo "Instance already running"
+        fi
+
     - name: Deploy to EC2 via AWS SSM
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
