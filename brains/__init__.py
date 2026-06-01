@@ -1,11 +1,4 @@
-"""
-Brains Package: Fair value calculation across multiple asset domains.
-
-This package contains specialized brains for different asset types:
-- CryptoBrain: Uses Black-Scholes style CDF pricing (log-normal distribution)
-- WeatherBrain: Uses normal distribution for temperature forecasts
-- EconomyBrain: Uses normal distribution with historical volatility for indicators
-"""
+"""Domain-specific fair value brains: Crypto (Black-Scholes/Heston), Weather (normal), Economy (normal)."""
 
 from .base import BaseBrain
 from .crypto import CryptoBrain, HybridCryptoBrain

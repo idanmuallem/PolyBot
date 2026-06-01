@@ -1,22 +1,20 @@
 """
-Executor: Trade execution and risk management.
+Trade execution engine: order submission, position tracking, and balance fetching.
 
-Separates execution logic from the orchestration layer.
-Handles position sizing, risk checks, and trade firing.
+Wraps the Polymarket CLOB client. Execution is gated by EV threshold, daily
+trade count, and price bounds. Supports dry-run, paper-trade, and live modes.
 """
 
 import os
 import logging
 import math
 from typing import Optional, Dict, Any, Callable, List
-from dataclasses import dataclass
+
 import requests
 from eth_utils import to_checksum_address
-from core.trading_config import DEFAULT_MIN_EV, TradingConfig
-from core.models import MarketData, Position
 
-ENTRY_PRICE_FLOOR = 0.30
-ENTRY_PRICE_CEILING = 0.85
+from core.models import MarketData, Position, PRICE_FLOOR, PRICE_CEILING
+from core.trading_config import TradingConfig
 
 try:
     from py_clob_client.client import ClobClient
@@ -25,71 +23,29 @@ try:
     CLOB_IMPORT_OK = True
 except Exception as e:
     logging.error(f"Import Error: {e}")
-    ClobClient = Any 
-    OrderArgs = Any 
+    ClobClient = Any
+    OrderArgs = Any
     AssetType = Any
     BalanceAllowanceParams = Any
     BUY = "BUY"
     SELL = "SELL"
     CLOB_IMPORT_OK = False
 
-@dataclass
-class RiskConfig:
-    """Risk management configuration."""
-    ev_threshold: float = DEFAULT_MIN_EV  # Minimum EV to execute trade
-    max_position_size: float = 1.0  # Max position as fraction of capital
-    max_daily_trades: int = 10  # Max trades per day
-    stop_loss_pct: float = 0.05  # Stop loss percentage
-
-
-@dataclass
-class ExecutorAuthConfig:
-    """Auth/config values required for Polymarket CLOB signing."""
-
-    private_key: Optional[str]
-    proxy_address: Optional[str]
-    signature_type: int = 2
-
-    @classmethod
-    def from_env(cls) -> "ExecutorAuthConfig":
-        private_key = str(os.getenv("POLYMARKET_PRIVATE_KEY") or "").strip() or None
-        proxy_address = str(os.getenv("POLYMARKET_PROXY_ADDRESS") or "").strip() or None
-        signature_type_raw = str(os.getenv("SIGNATURE_TYPE", "2")).strip()
-        try:
-            signature_type = int(signature_type_raw)
-        except ValueError:
-            signature_type = 2
-
-        return cls(
-            private_key=private_key,
-            proxy_address=proxy_address,
-            signature_type=signature_type,
-        )
-
 
 class TradeExecutor:
     """Handles trade execution with risk management.
 
-    Responsibilities:
-    - Evaluate expected value (EV) against thresholds
-    - Check risk constraints
-    - Fire execution callbacks
-    - Position sizing (future enhancement)
+    Modes: dry_run (simulate only), paper_trade (log only), live (real orders).
     """
 
-    def __init__(self, risk_config: Optional[RiskConfig] = None):
+    def __init__(self):
         self.config = TradingConfig.from_env()
-        self.risk_config = risk_config or RiskConfig()
         self.trade_count_today = 0
         self.dry_run = self.config.dry_run
+        self.paper_trade_mode = self.config.paper_trade_mode
+        self.proxy_address = self.config.proxy_address
         self.client = None
 
-        self.private_key = self.config.private_key
-        self.proxy_address = self.config.proxy_address
-        self.signature_type = self.config.signature_type
-        self.paper_trade_mode = self.config.paper_trade_mode
-
-        # --- DIAGNOSTIC BLOCK ---
         print("\n" + "=" * 30)
         print("=== EXECUTOR BOOT DIAGNOSTIC ===")
         print(f"1. CLOB Import OK:    {CLOB_IMPORT_OK}")
@@ -112,7 +68,6 @@ class TradeExecutor:
                     funder=to_checksum_address(self.config.proxy_address),
                     signature_type=self.config.signature_type,
                 )
-
                 try:
                     creds = self.client.create_or_derive_api_creds()
                     self.client.set_api_creds(creds)
@@ -121,7 +76,6 @@ class TradeExecutor:
                     print(f"[AUTH-ERROR] Failed to derive: {e}")
                     self.client = None
                     return
-
                 print("[SUCCESS] Live CLOB Client is fully armed and operational!")
             except Exception as e:
                 print(f"[FATAL ERROR] ClobClient failed to build: {e}")
@@ -129,36 +83,9 @@ class TradeExecutor:
         else:
             print("[FATAL] Missing keys in Config! Cannot build Client.")
 
-    def _initialize_clob_client(self) -> None:
-        """Initialize authenticated CLOB client with proxy wallet (funder)."""
-        print(f"Signing for Proxy: {self.config.proxy_address}")
-        self.client = ClobClient(
-            host="https://clob.polymarket.com",
-            chain_id=137,
-            key=self.config.private_key,
-            funder=to_checksum_address(self.config.proxy_address),
-            signature_type=self.config.signature_type,
-        )
-
-        if not hasattr(self.client, "set_api_creds"):
-            raise RuntimeError("py-clob-client does not expose set_api_creds()")
-
-        try:
-            creds = self.client.create_or_derive_api_creds()
-            self.client.set_api_creds(creds)
-            print("[AUTH] Credentials successfully derived and set!")
-        except Exception as e:
-            print(f"[AUTH-ERROR] Failed to derive: {e}")
-            self.client = None
-            raise
-
     def _resolve_positions_user_address(self) -> Optional[str]:
-        """Resolve the wallet address used for Data API position queries."""
         explicit = str(self.proxy_address or "").strip()
-        if explicit:
-            return explicit
-
-        return None
+        return explicit if explicit else None
 
     @staticmethod
     def _pick_float(payload: Dict[str, Any], *keys: str) -> float:
@@ -173,25 +100,14 @@ class TradeExecutor:
         return 0.0
 
     def _submit_order(self, token_id: str, price: float, side: str, size: float):
-        """Execute a live order on the Polymarket CLOB."""
+        """Submit a live order to the Polymarket CLOB."""
         try:
-            # EXCHANGE GUARDRAIL: Round floats to prevent CLOB precision rejections
             price = round(float(price), 2)
             size = round(float(size), 2)
-
             print(f"[EXECUTION] Attempting {side} order: {size} shares at ${price}")
-
-            order = OrderArgs(
-                token_id=token_id,
-                price=price,
-                side=side,
-                size=size,
-            )
-            
-            resp = self.client.create_and_post_order(order)
-            return resp
+            order = OrderArgs(token_id=token_id, price=price, side=side, size=size)
+            return self.client.create_and_post_order(order)
         except Exception as e:
-            # This will catch 'invalid signature' or 'insufficient balance'
             print(f"[LIVE-TRADE-ERROR] {token_id} - {str(e)}")
             return None
 
@@ -199,44 +115,42 @@ class TradeExecutor:
     def _is_valid_order_response(response: Any) -> bool:
         if not response:
             return False
-
         if isinstance(response, dict):
             if response.get("error") or response.get("errors") or response.get("errorMsg"):
                 return False
-
-            order_id = response.get("orderID") or response.get("orderId") or response.get("order_id") or response.get("id")
+            order_id = (
+                response.get("orderID")
+                or response.get("orderId")
+                or response.get("order_id")
+                or response.get("id")
+            )
             return bool(order_id)
-
         return True
-        
+
     @staticmethod
     def _format_order_exception(exc: Exception) -> Dict[str, Any]:
-        error_payload: Dict[str, Any] = {
+        payload: Dict[str, Any] = {
             "error": str(exc),
             "exception_type": type(exc).__name__,
             "exception_repr": repr(exc),
         }
-
         response = getattr(exc, "response", None)
         if response is not None:
-            status_code = getattr(response, "status_code", None)
-            response_text = getattr(response, "text", None)
-            if status_code is not None:
-                error_payload["status_code"] = status_code
-            if response_text:
-                error_payload["response_text"] = response_text
-
-        return error_payload
+            if getattr(response, "status_code", None) is not None:
+                payload["status_code"] = response.status_code
+            if getattr(response, "text", None):
+                payload["response_text"] = response.text
+        return payload
 
     def get_balance(self) -> float:
-        """Fetch available CLOB collateral balance (true deployable cash)."""
+        """Fetch available CLOB collateral balance (deployable cash)."""
         if self.dry_run or self.client is None:
             return float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
 
         try:
             if hasattr(self.client, "get_collateral_balance"):
-                raw_balance = float(self.client.get_collateral_balance())
-                return raw_balance / 1_000_000.0 if raw_balance > 1_000_000 else raw_balance
+                raw = float(self.client.get_collateral_balance())
+                return raw / 1_000_000.0 if raw > 1_000_000 else raw
 
             if hasattr(self.client, "get_balance_allowance"):
                 params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -246,20 +160,20 @@ class TradeExecutor:
                     if isinstance(balance_raw, dict):
                         for key in ("balance", "amount", "available", "usdc", "USDC"):
                             if balance_raw.get(key) is not None:
-                                raw_balance = float(balance_raw.get(key))
-                                return raw_balance / 1_000_000.0 if raw_balance > 1_000_000 else raw_balance
-                    raw_balance = float(balance_raw)
-                    return raw_balance / 1_000_000.0 if raw_balance > 1_000_000 else raw_balance
+                                raw = float(balance_raw[key])
+                                return raw / 1_000_000.0 if raw > 1_000_000 else raw
+                    raw = float(balance_raw)
+                    return raw / 1_000_000.0 if raw > 1_000_000 else raw
         except Exception as exc:
             logging.warning(f"Live collateral balance fetch failed: {exc}")
 
         return 0.0
-        
-    def get_open_positions(self) -> List[Position]:
-        """Fetch current open positions and calculate mark-to-mid PnL.
 
-        Uses Polymarket Data API because py-clob-client does not expose
-        a stable positions listing method across versions.
+    def get_open_positions(self) -> List[Position]:
+        """Fetch open positions from Polymarket Data API with mark-to-mid PnL.
+
+        Uses Data API because py-clob-client does not expose a stable positions
+        listing method across versions.
         """
         wallet_address = self._resolve_positions_user_address()
         if not wallet_address:
@@ -273,23 +187,17 @@ class TradeExecutor:
             response.raise_for_status()
         except requests.exceptions.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
-            if status_code == 404:
-                logging.info("No open positions found (new wallet)")
-            else:
-                logging.info("No open positions found (new wallet)")
+            if status_code != 404:
                 logging.debug(f"Gamma positions HTTP error: {exc}")
             return []
         except requests.exceptions.RequestException as exc:
-            logging.info("No open positions found (new wallet)")
             logging.debug(f"Gamma positions request error: {exc}")
             return []
 
         try:
             raw_positions = response.json()
-
             if isinstance(raw_positions, dict):
                 raw_positions = raw_positions.get("positions", [])
-
             if not isinstance(raw_positions, list):
                 return []
 
@@ -297,67 +205,61 @@ class TradeExecutor:
                 if not isinstance(raw, dict):
                     continue
 
-                token_id = str(raw.get("asset") or raw.get("token_id") or raw.get("tokenId") or "")
+                token_id = str(
+                    raw.get("asset") or raw.get("token_id") or raw.get("tokenId") or ""
+                )
                 if not token_id:
                     continue
 
-                shares_raw = self._pick_float(raw, "size", "shares", "quantity", "balance", "positionSize", "numShares")
-                shares = abs(float(shares_raw))
-
-                initial_price = self._pick_float(raw, "avgPrice", "avg_price", "entry_price", "initial_price", "price")
-                current_price = self._pick_float(raw, "currentPrice", "current_price", "markPrice", "mark_price")
-                current_value = abs(
-                    self._pick_float(
-                        raw,
-                        "currentValue",
-                        "current_value",
-                        "positionValue",
-                        "position_value",
-                        "value",
-                        "usdValue",
-                    )
+                shares = abs(float(self._pick_float(
+                    raw, "size", "shares", "quantity", "balance", "positionSize", "numShares"
+                )))
+                initial_price = self._pick_float(
+                    raw, "avgPrice", "avg_price", "entry_price", "initial_price", "price"
                 )
+                current_price = self._pick_float(
+                    raw, "currentPrice", "current_price", "markPrice", "mark_price"
+                )
+                current_value = abs(self._pick_float(
+                    raw, "currentValue", "current_value", "positionValue",
+                    "position_value", "value", "usdValue",
+                ))
 
                 if current_value <= 0.0 and shares > 0.0 and current_price > 0.0:
-                    current_value = float(shares) * float(current_price)
-
+                    current_value = shares * current_price
                 if current_price <= 0.0 and shares > 0.0 and current_value > 0.0:
-                    current_price = float(current_value) / float(shares)
-
+                    current_price = current_value / shares
                 if shares <= 0.0 and current_value > 0.0 and initial_price > 0.0:
-                    shares = float(current_value) / float(initial_price)
-
+                    shares = current_value / initial_price
                 if shares <= 0.0 and current_value <= 0.0:
                     continue
 
-                if current_value > 0.0:
-                    value = float(current_value)
-                else:
-                    ref_price = float(current_price if current_price > 0.0 else initial_price)
-                    value = float(shares) * float(ref_price)
-
+                value = current_value if current_value > 0.0 else (
+                    shares * (current_price if current_price > 0.0 else initial_price)
+                )
                 if current_price <= 0.0:
-                    current_price = float(initial_price)
+                    current_price = initial_price
 
-                pnl_percent = 0.0
-                if initial_price > 0:
-                    pnl_percent = ((current_price - initial_price) / initial_price) * 100
-
+                pnl_percent = (
+                    ((current_price - initial_price) / initial_price) * 100
+                    if initial_price > 0 else 0.0
+                )
                 live_ev = pnl_percent / 100.0 if abs(pnl_percent) > 1.0 else pnl_percent
 
-                positions.append(
-                    Position(
-                        market_id=str(raw.get("conditionId") or raw.get("condition_id") or raw.get("market_id") or token_id),
-                        token_id=token_id,
-                        initial_price=initial_price,
-                        current_price=current_price,
-                        shares=shares,
-                        value=value,
-                        pnl_percent=pnl_percent,
-                        side=str(raw.get("outcome") or raw.get("side") or "UNKNOWN"),
-                        live_ev=float(live_ev),
-                    )
-                )
+                positions.append(Position(
+                    market_id=str(
+                        raw.get("conditionId") or raw.get("condition_id")
+                        or raw.get("market_id") or token_id
+                    ),
+                    token_id=token_id,
+                    initial_price=initial_price,
+                    current_price=current_price,
+                    shares=shares,
+                    value=value,
+                    pnl_percent=pnl_percent,
+                    side=str(raw.get("outcome") or raw.get("side") or "UNKNOWN"),
+                    live_ev=float(live_ev),
+                ))
         except Exception as exc:
             logging.warning(f"Could not parse open positions: {exc}")
 
@@ -386,35 +288,21 @@ class TradeExecutor:
 
         if self.dry_run:
             print(
-                f"[DRY-RUN] Simulation: Would have purchased {shares} of {execution_token_id} "
+                f"[DRY-RUN] Would buy {shares} of {execution_token_id} "
                 f"({execution_side}) for ${bet_amount}."
             )
-            log_func(
-                "DRY-RUN",
-                asset_type,
-                execution_token_id,
-                {
-                    "price": execution_price,
-                    "shares": shares,
-                    "bet_amount_usd": bet_amount,
-                    "side": execution_side,
-                },
-            )
+            log_func("DRY-RUN", asset_type, execution_token_id, {
+                "price": execution_price, "shares": shares,
+                "bet_amount_usd": bet_amount, "side": execution_side,
+            })
             return True
 
         if self.client is None:
-            log_func(
-                "PAPER-TRADE",
-                asset_type,
-                execution_token_id,
-                {
-                    "price": execution_price,
-                    "shares": shares,
-                    "bet_amount_usd": bet_amount,
-                    "reason": "No live CLOB client configured",
-                    "side": execution_side,
-                },
-            )
+            log_func("PAPER-TRADE", asset_type, execution_token_id, {
+                "price": execution_price, "shares": shares,
+                "bet_amount_usd": bet_amount, "side": execution_side,
+                "reason": "No live CLOB client configured",
+            })
             return True
 
         try:
@@ -424,118 +312,63 @@ class TradeExecutor:
                 side=BUY,
                 size=shares,
             )
-
             if not self._is_valid_order_response(order_resp):
                 error_payload = {
                     "error": "order_rejected_or_unconfirmed",
-                    "response": order_resp,
-                    "side": execution_side,
-                    "price": execution_price,
-                    "shares": shares,
+                    "response": order_resp, "side": execution_side,
+                    "price": execution_price, "shares": shares,
                 }
                 logging.error(f"LIVE order rejected: {error_payload}")
-                log_func(
-                    "LIVE-TRADE-ERROR",
-                    asset_type,
-                    execution_token_id,
-                    error_payload,
-                )
+                log_func("LIVE-TRADE-ERROR", asset_type, execution_token_id, error_payload)
                 return False
 
-            log_func(
-                "LIVE-TRADE",
-                asset_type,
-                execution_token_id,
-                {"success": True, "response": order_resp, "side": execution_side, "price": execution_price},
-            )
+            log_func("LIVE-TRADE", asset_type, execution_token_id, {
+                "success": True, "response": order_resp,
+                "side": execution_side, "price": execution_price,
+            })
             return True
         except Exception as exc:
             error_payload = self._format_order_exception(exc)
             logging.error(f"LIVE order rejected: {error_payload}")
-            log_func(
-                "LIVE-TRADE-ERROR",
-                asset_type,
-                execution_token_id,
-                error_payload,
-            )
+            log_func("LIVE-TRADE-ERROR", asset_type, execution_token_id, error_payload)
             return False
 
-    def sell_position(
-        self,
-        token_id: str,
-        shares: float,
-        price: float,
-        log_func: Callable,
-    ) -> bool:
-        """Sell an existing position using dry-run or live execution."""
+    def sell_position(self, token_id: str, shares: float, price: float, log_func: Callable) -> bool:
+        """Sell an existing position (dry-run, paper, or live)."""
         if self.dry_run:
-            msg = f"[DRY-RUN] Would have SOLD {shares} of {token_id} at ${price}"
+            msg = f"[DRY-RUN] Would SELL {shares} of {token_id} at ${price}"
             print(msg)
-            log_func(
-                "DRY-RUN-SELL",
-                "Portfolio",
-                token_id,
-                {
-                    "message": msg,
-                    "price": price,
-                    "shares": shares,
-                },
-            )
+            log_func("DRY-RUN-SELL", "Portfolio", token_id, {
+                "message": msg, "price": price, "shares": shares,
+            })
             return True
 
         if self.client is None:
-            log_func(
-                "PAPER-SELL",
-                "Portfolio",
-                token_id,
-                {
-                    "price": price,
-                    "shares": shares,
-                    "reason": "No live CLOB client configured",
-                },
-            )
+            log_func("PAPER-SELL", "Portfolio", token_id, {
+                "price": price, "shares": shares,
+                "reason": "No live CLOB client configured",
+            })
             return True
 
         try:
-            order_resp = self._submit_order(
-                token_id=token_id,
-                price=price,
-                side=SELL,
-                size=shares,
-            )
-
+            order_resp = self._submit_order(token_id=token_id, price=price, side=SELL, size=shares)
             if not self._is_valid_order_response(order_resp):
                 error_payload = {
                     "error": "order_rejected_or_unconfirmed",
-                    "response": order_resp,
-                    "price": price,
-                    "shares": shares,
+                    "response": order_resp, "price": price, "shares": shares,
                 }
                 logging.error(f"SELL order rejected: {error_payload}")
-                log_func(
-                    "SELL-ERROR",
-                    "Portfolio",
-                    token_id,
-                    error_payload,
-                )
+                log_func("SELL-ERROR", "Portfolio", token_id, error_payload)
                 return False
 
-            log_func(
-                "SELL",
-                "Portfolio",
-                token_id,
-                {"success": True, "response": order_resp, "price": price, "shares": shares},
-            )
+            log_func("SELL", "Portfolio", token_id, {
+                "success": True, "response": order_resp, "price": price, "shares": shares,
+            })
             return True
         except Exception as exc:
             error_payload = self._format_order_exception(exc)
             logging.error(f"SELL order rejected: {error_payload}")
-            log_func(
-                "SELL-ERROR",
-                "Portfolio",
-                token_id,
-                error_payload,
-            )
+            log_func("SELL-ERROR", "Portfolio", token_id, error_payload)
             return False
 
     def evaluate_and_execute(
@@ -548,19 +381,7 @@ class TradeExecutor:
         side: str,
         log_func: Callable,
     ) -> bool:
-        """Evaluate market conditions and execute trade if criteria are met.
-
-        Args:
-            market: MarketData object with market_id, asset_type, question, etc.
-            fair_value: Fair value probability (our calculated price)
-            ev: Expected value (fair_value - market_price) / market_price
-            current_poly_price: Current Polymarket mid price
-            bet_amount_usd: USD amount to allocate to this trade
-            log_func: Logging callback function
-
-        Returns:
-            True if trade was executed, False otherwise
-        """
+        """Gate on EV + daily limit + price bounds, then fire the order."""
         asset_type = market.asset_type
         token_id = market.market_id
         execution_side = str(side or "YES").upper()
@@ -573,87 +394,49 @@ class TradeExecutor:
             execution_price = max(1e-6, 1.0 - float(current_poly_price))
             execution_fair_value = 1.0 - float(fair_value)
 
-        # ========================================
-        # 1. Check EV threshold
-        # ========================================
-        if ev <= self.risk_config.ev_threshold:
+        if ev <= self.config.min_ev:
             return False
 
-        # ========================================
-        # 2. Check daily trade limit
-        # ========================================
-        if self.trade_count_today >= self.risk_config.max_daily_trades:
-            log_func(
-                "RISK",
-                asset_type,
-                token_id,
-                f"Daily trade limit ({self.risk_config.max_daily_trades}) reached",
-            )
+        if self.trade_count_today >= self.config.max_daily_trades:
+            log_func("RISK", asset_type, token_id,
+                     f"Daily trade limit ({self.config.max_daily_trades}) reached")
             return False
 
-        # ========================================
-        # 3. Check market validity
-        # ========================================
         if not self._validate_market(market, log_func):
             return False
 
-        # ========================================
-        # 4. Calculate position size (future enhancement)
-        # ========================================
-        position_size = self._calculate_position_size(ev, fair_value)
+        position_size = min(ev * 2.0, 1.0)
 
-        # ========================================
-        # 5. Execute trade
-        # ========================================
-        if execution_price < ENTRY_PRICE_FLOOR or execution_price > ENTRY_PRICE_CEILING:
-            log_func(
-                "EXECUTION",
-                asset_type,
-                execution_token_id,
-                {
-                    "reason": "entry price out of bounds",
-                    "side": execution_side,
-                    "execution_price": round(float(execution_price), 4),
-                    "price_floor": ENTRY_PRICE_FLOOR,
-                    "price_ceiling": ENTRY_PRICE_CEILING,
-                },
-            )
+        if execution_price < PRICE_FLOOR or execution_price > PRICE_CEILING:
+            log_func("EXECUTION", asset_type, execution_token_id, {
+                "reason": "entry price out of bounds",
+                "side": execution_side,
+                "execution_price": round(execution_price, 4),
+                "price_floor": PRICE_FLOOR,
+                "price_ceiling": PRICE_CEILING,
+            })
             return False
 
         if execution_price <= 0:
-            log_func(
-                "EXECUTION",
-                asset_type,
-                execution_token_id,
-                f"Invalid market price for execution: {execution_price}",
-            )
+            log_func("EXECUTION", asset_type, execution_token_id,
+                     f"Invalid market price for execution: {execution_price}")
             return False
 
         shares = math.floor((bet_amount_usd / execution_price) * 100.0) / 100.0
-
         if shares <= 0:
-            log_func(
-                "EXECUTION",
-                asset_type,
-                execution_token_id,
-                f"Calculated zero shares for bet_amount_usd={bet_amount_usd}",
-            )
+            log_func("EXECUTION", asset_type, execution_token_id,
+                     f"Calculated zero shares for bet_amount_usd={bet_amount_usd}")
             return False
 
-        log_func(
-            "AUTO-TRADE",
-            asset_type,
-            execution_token_id,
-            {
-                "market_price": execution_price,
-                "fair_value": execution_fair_value,
-                "ev": round(ev, 4),
-                "position_size": position_size,
-                "bet_amount_usd": bet_amount_usd,
-                "shares": shares,
-                "side": execution_side,
-            },
-        )
+        log_func("AUTO-TRADE", asset_type, execution_token_id, {
+            "market_price": execution_price,
+            "fair_value": execution_fair_value,
+            "ev": round(ev, 4),
+            "position_size": position_size,
+            "bet_amount_usd": bet_amount_usd,
+            "shares": shares,
+            "side": execution_side,
+        })
 
         executed = self.execute_trade(
             token_id=token_id,
@@ -665,65 +448,28 @@ class TradeExecutor:
             no_token_id=getattr(market, "no_market_id", None),
             log_func=log_func,
         )
-
         if executed:
             self.trade_count_today += 1
-            return True
-        return False
+        return bool(executed)
 
     def _validate_market(self, market: MarketData, log_func: Callable) -> bool:
-        """Validate market conditions before execution.
-
-        Args:
-            market: MarketData object
-            log_func: Logging callback
-
-        Returns:
-            True if market is valid for trading
-        """
-        # Check required fields
-        required_fields = [
+        for field_name, field_value in [
             ("market_id", market.market_id),
             ("asset_type", market.asset_type),
             ("strike_price", market.strike_price),
             ("question", market.question),
-        ]
-        for field_name, field_value in required_fields:
+        ]:
             if field_value is None:
                 log_func("VALIDATE", "Market", "Unknown", f"Missing {field_name}")
                 return False
-
         return True
 
-    def _calculate_position_size(self, ev: float, fair_value: float) -> float:
-        """Calculate position size based on EV and fair value.
-
-        Simple Kelly-like approach (future enhancement).
-
-        Args:
-            ev: Expected value
-            fair_value: Fair value probability
-
-        Returns:
-            Position size as fraction of max (0.0 to 1.0)
-        """
-        # Simple: size proportional to EV, capped at max
-        # Higher EV = larger position
-        position = min(ev * 2.0, self.risk_config.max_position_size)
-        return max(0.01, position)  # Minimum 1% if trading
-
     def reset_daily_count(self):
-        """Reset daily trade counter (call at start of each trading day)."""
         self.trade_count_today = 0
 
     def get_execution_stats(self) -> Dict[str, Any]:
-        """Get current execution statistics.
-
-        Returns:
-            Dict with execution stats (trades today, etc.)
-        """
         return {
             "trades_today": self.trade_count_today,
-            "daily_limit": self.risk_config.max_daily_trades,
-            "av_ev_threshold": self.risk_config.ev_threshold,
+            "daily_limit": self.config.max_daily_trades,
+            "ev_threshold": self.config.min_ev,
         }

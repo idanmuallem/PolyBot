@@ -1,3 +1,10 @@
+"""
+PolymarketScannerHunter: Coordinator that runs discovery and pricing passes.
+
+Manages the cooldown cache shared across all hunters and wires the brain
+evaluation layer into the scan loop.
+"""
+
 import time
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
@@ -10,7 +17,9 @@ from .crypto import CryptoHunter
 
 
 class PolymarketScannerHunter:
-    """Coordinator hunter that runs one complete discovery+pricing pass."""
+    """Coordinator hunter that runs one complete discovery + pricing pass."""
+
+    _COOLDOWN_SECONDS = 600
 
     def __init__(self, bridge, executor, config, hunters: Optional[list] = None):
         self.bridge = bridge
@@ -18,27 +27,34 @@ class PolymarketScannerHunter:
         self.config = config
         self.hunters = hunters or [CryptoHunter()]
         self.min_ev = float(config.min_ev)
+        self.seen_markets: dict = {}
 
-        self.seen_markets = {}
+    # ------------------------------------------------------------------
+    # Cooldown cache
+    # ------------------------------------------------------------------
 
     def _get_active_seen_ids(self) -> List[str]:
-        current_time = time.time()
-        expired_ids = [mid for mid, ts in self.seen_markets.items() if current_time - ts >= 600]
-        for mid in expired_ids:
+        now = time.time()
+        expired = [mid for mid, ts in self.seen_markets.items() if now - ts >= self._COOLDOWN_SECONDS]
+        for mid in expired:
             del self.seen_markets[mid]
-        print(f"[CACHE] Active cooldowns: {len(self.seen_markets)} | Expired & Removed: {len(expired_ids)}")
+        print(f"[CACHE] Active cooldowns: {len(self.seen_markets)} | Expired: {len(expired)}")
         return list(self.seen_markets.keys())
 
     def add_to_cooldown(self, market_id: str):
         if market_id:
             self.seen_markets[str(market_id)] = time.time()
-            print(f"[CACHE] Added {market_id} to cooldown bin.")
+            print(f"[CACHE] Added {market_id} to cooldown.")
 
     def mark_seen(self, market_id: str):
         self.add_to_cooldown(market_id)
 
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
+
     def get_active_markets(self, log_func) -> Tuple[Optional[MarketData], Optional[object]]:
-        """Discovery pass across all hunters with TTE safety filters."""
+        """Run one discovery pass across all hunters with TTE safety filters."""
         skip_ids = self._get_active_seen_ids()
         min_tte_days = float(self.config.min_tte_minutes) / (24.0 * 60.0)
 
@@ -80,8 +96,12 @@ class PolymarketScannerHunter:
 
         return None, None
 
+    # ------------------------------------------------------------------
+    # Pricing
+    # ------------------------------------------------------------------
+
     def fetch_order_book(self, market: MarketData) -> dict:
-        """Fetch market orderbook snapshot (midpoint proxy for now)."""
+        """Fetch a market orderbook snapshot (midpoint proxy)."""
         return {
             "token_id": market.market_id,
             "mid_price": float(market.initial_price),
@@ -89,7 +109,7 @@ class PolymarketScannerHunter:
         }
 
     def prepare_market_signal(self, market: MarketData, hunter, log_func):
-        """Price and evaluate one market, returning execution context."""
+        """Price and evaluate one market; return the execution context or None."""
         token_id = market.market_id
         asset_type = market.asset_type
         question = market.market_name

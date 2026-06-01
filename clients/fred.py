@@ -2,7 +2,7 @@ import os
 import requests
 from typing import Optional
 
-from .base import BaseApiClient
+from . import BaseApiClient
 
 
 class FredClient(BaseApiClient):

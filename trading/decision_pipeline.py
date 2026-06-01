@@ -1,10 +1,10 @@
-"""Central sequential trading pipeline and decision handlers.
+"""Central sequential trading pipeline.
 
 Pipeline order per loop:
-1) Hunters gather opportunities.
-2) Brains/Parsers evaluate EV from market + live truth.
-3) RiskManager and BudgetManager run safety checks.
-4) Executor submits approved orders.
+1. Hunt   — find active markets via PolymarketScannerHunter
+2. Evaluate — compute fair value, EV, side (YES/NO)
+3. Risk & Budget — position sizing, portfolio optimization, cash guards
+4. Execute — submit order via TradeExecutor
 """
 
 import asyncio
@@ -13,127 +13,12 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from brains import get_brain_for_asset_type
+from core.models import PRICE_FLOOR, PRICE_CEILING
 from core.trading_config import TradingConfig
 from hunters import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
-from trading.executor import RiskConfig, TradeExecutor
+from trading.executor import TradeExecutor
 from trading.risk_manager import PortfolioManager
-
-ENTRY_PRICE_FLOOR = 0.30
-ENTRY_PRICE_CEILING = 0.85
-
-
-@dataclass
-class DecisionContext:
-    market: object
-    asset_type: str
-    token_id: str
-    question: str
-    signal: object
-    model_used: str
-    poly_price: float
-    actual_bet_usd: float = 0.0
-    executed: bool = False
-    status: str = "pending"
-
-
-class DecisionHandler:
-    def __init__(self):
-        self._next = None
-
-    def set_next(self, handler: "DecisionHandler") -> "DecisionHandler":
-        self._next = handler
-        return handler
-
-    def handle(self, context: DecisionContext, log_func):
-        result = self._process(context, log_func)
-        if self._next and result is not None:
-            return self._next.handle(result, log_func)
-        return result
-
-    def _process(self, context: DecisionContext, log_func):
-        raise NotImplementedError
-
-
-class TradabilityHandler(DecisionHandler):
-    def _process(self, context: DecisionContext, log_func):
-        if not context.signal.is_tradable:
-            context.status = "not_tradable"
-            return context
-        return context
-
-
-class BudgetHandler(DecisionHandler):
-    def __init__(self, budget_manager):
-        super().__init__()
-        self.budget_manager = budget_manager
-
-    def _process(self, context: DecisionContext, log_func):
-        actual_bet_usd, should_execute = self.budget_manager.check_and_cap_bet(context.signal.kelly_size)
-        if not should_execute:
-            context.status = "daily_limit"
-            return context
-        context.actual_bet_usd = actual_bet_usd
-        return context
-
-
-class WatchOnlyHandler(DecisionHandler):
-    def __init__(self, budget_manager):
-        super().__init__()
-        self.budget_manager = budget_manager
-
-    def _process(self, context: DecisionContext, log_func):
-        if self.budget_manager.watch_only:
-            context.status = "watch_only"
-            return context
-        return context
-
-
-class ExecuteHandler(DecisionHandler):
-    def __init__(self, executor, budget_manager):
-        super().__init__()
-        self.executor = executor
-        self.budget_manager = budget_manager
-
-    def _process(self, context: DecisionContext, log_func):
-        executed = self.executor.evaluate_and_execute(
-            market=context.market,
-            fair_value=context.signal.fair_value,
-            ev=context.signal.expected_value,
-            current_poly_price=context.poly_price,
-            bet_amount_usd=context.actual_bet_usd,
-            side="YES",
-            log_func=log_func,
-        )
-        context.executed = executed
-        context.status = "executed" if executed else "execution_failed"
-        if executed:
-            self.budget_manager.record_trade(context.actual_bet_usd)
-        return context
-
-
-class GuardByStatusHandler(DecisionHandler):
-    def __init__(self, terminal_statuses):
-        super().__init__()
-        self.terminal_statuses = set(terminal_statuses)
-
-    def _process(self, context: DecisionContext, log_func):
-        if context.status in self.terminal_statuses:
-            return None
-        return context
-
-
-def build_entry_pipeline(executor, budget_manager):
-    tradability = TradabilityHandler()
-    stop_after_not_tradable = GuardByStatusHandler({"not_tradable"})
-    budget = BudgetHandler(budget_manager)
-    stop_after_budget = GuardByStatusHandler({"daily_limit"})
-    watch_only = WatchOnlyHandler(budget_manager)
-    stop_after_watch = GuardByStatusHandler({"watch_only"})
-    execute = ExecuteHandler(executor, budget_manager)
-
-    tradability.set_next(stop_after_not_tradable).set_next(budget).set_next(stop_after_budget).set_next(watch_only).set_next(stop_after_watch).set_next(execute)
-    return tradability
 
 
 @dataclass
@@ -164,7 +49,7 @@ class SequentialTradingPipeline:
         self.max_bet_size_usd = float(self.config.max_bet_size_usd)
         self.safe_minimum = 1.0
 
-        self.executor = TradeExecutor(risk_config=RiskConfig(ev_threshold=self.config.min_ev))
+        self.executor = TradeExecutor()
         self.portfolio_manager = PortfolioManager(
             bridge=self.bridge,
             executor=self.executor,
@@ -236,27 +121,23 @@ class SequentialTradingPipeline:
         asset_type = str(getattr(market, "asset_type", "") or "")
         question = str(getattr(market, "market_name", "") or getattr(market, "question", ""))
 
-        # HARD GUARDRAIL: Prevent Spread Suicide (Never buy what we already own)
-        # Check the live portfolio to see if we already hold shares in this exact market
+        # Prevent buying a market already in the portfolio.
         if hasattr(self.bridge, "current_portfolio") and self.bridge.current_portfolio:
             for position in self.bridge.current_portfolio:
-                # The position object might use asset_id or token_id depending on the executor
                 pos_token = str(getattr(position, "asset_id", getattr(position, "token_id", "")))
                 if pos_token == token_id:
                     self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_owned_in_portfolio"})
                     self.hunter.mark_seen(token_id)
                     return None
 
-        # STRICT SANITY CHECK: Prevent BTC/ETH Cross-Contamination
+        # Prevent BTC/ETH cross-contamination.
         asset_lower = asset_type.lower()
         q_lower = question.lower()
-
         if "btc" in asset_lower or "bitcoin" in asset_lower:
             if "eth" in q_lower or "ethereum" in q_lower or "sol" in q_lower or "solana" in q_lower:
                 self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "asset_mismatch_btc_vs_altcoin"})
                 self.hunter.mark_seen(token_id)
                 return None
-
         if "eth" in asset_lower or "ethereum" in asset_lower:
             if "btc" in q_lower or "bitcoin" in q_lower or "sol" in q_lower or "solana" in q_lower:
                 self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "asset_mismatch_eth_vs_other"})
@@ -268,23 +149,17 @@ class SequentialTradingPipeline:
         self.bridge.market_asset_type = asset_type
         self.bridge.current_token_id = token_id
 
-        # Parser output is already embedded in market metadata from the hunter stage.
         poly_price = float(getattr(market, "initial_price", 0.0) or 0.0)
         self.bridge.market_poly = poly_price
 
-        if poly_price < ENTRY_PRICE_FLOOR or poly_price > ENTRY_PRICE_CEILING:
-            self.log_func(
-                "FILTERED",
-                asset_type,
-                token_id,
-                {
-                    "market_name": question,
-                    "reason": "entry price out of bounds",
-                    "poly_price": round(float(poly_price), 4),
-                    "price_floor": ENTRY_PRICE_FLOOR,
-                    "price_ceiling": ENTRY_PRICE_CEILING,
-                },
-            )
+        if poly_price < PRICE_FLOOR or poly_price > PRICE_CEILING:
+            self.log_func("FILTERED", asset_type, token_id, {
+                "market_name": question,
+                "reason": "entry price out of bounds",
+                "poly_price": round(float(poly_price), 4),
+                "price_floor": PRICE_FLOOR,
+                "price_ceiling": PRICE_CEILING,
+            })
             self.hunter.mark_seen(token_id)
             return None
 
@@ -341,53 +216,38 @@ class SequentialTradingPipeline:
 
         if float(cash_balance) < float(self.safe_minimum):
             self.bridge.status = "Portfolio Management Mode (cash below $1.00)"
-            self.log_func(
-                "PORTFOLIO-MODE",
-                "Pipeline",
-                "cash_guard",
-                {
-                    "reason": "insufficient_cash_for_new_entries",
-                    "cash": round(float(cash_balance), 4),
-                    "open_positions_value": round(float(open_positions_value), 4),
-                    "minimum_required_cash": round(float(self.safe_minimum), 4),
-                },
-            )
+            self.log_func("PORTFOLIO-MODE", "Pipeline", "cash_guard", {
+                "reason": "insufficient_cash_for_new_entries",
+                "cash": round(float(cash_balance), 4),
+                "open_positions_value": round(float(open_positions_value), 4),
+                "minimum_required_cash": round(float(self.safe_minimum), 4),
+            })
             return 0.0, None
 
         if float(candidate.final_ev) < float(self.min_ev_threshold):
-            self.log_func(
-                "REJECTED",
-                candidate.asset_type,
-                candidate.token_id,
-                {
-                    "market_name": candidate.question,
-                    "reason": "EV below dynamic threshold",
-                    "ev_yes": round(float(candidate.ev_yes), 4),
-                    "ev_no": round(float(candidate.ev_no), 4),
-                    "side": candidate.side,
-                    "ev": round(float(candidate.final_ev), 4),
-                    "threshold": self.min_ev_threshold,
-                },
-            )
+            self.log_func("REJECTED", candidate.asset_type, candidate.token_id, {
+                "market_name": candidate.question,
+                "reason": "EV below dynamic threshold",
+                "ev_yes": round(float(candidate.ev_yes), 4),
+                "ev_no": round(float(candidate.ev_no), 4),
+                "side": candidate.side,
+                "ev": round(float(candidate.final_ev), 4),
+                "threshold": self.min_ev_threshold,
+            })
             self.hunter.mark_seen(candidate.token_id)
             return 0.0, None
 
-        if candidate.entry_price < ENTRY_PRICE_FLOOR or candidate.entry_price > ENTRY_PRICE_CEILING:
-            self.log_func(
-                "FILTERED",
-                candidate.asset_type,
-                candidate.token_id,
-                {
-                    "market_name": candidate.question,
-                    "reason": "entry price out of bounds for selected side",
-                    "side": candidate.side,
-                    "entry_price": round(float(candidate.entry_price), 4),
-                    "price_floor": ENTRY_PRICE_FLOOR,
-                    "price_ceiling": ENTRY_PRICE_CEILING,
-                    "price_yes": round(float(candidate.price_yes), 4),
-                    "price_no": round(float(1.0 - candidate.price_yes), 4),
-                },
-            )
+        if candidate.entry_price < PRICE_FLOOR or candidate.entry_price > PRICE_CEILING:
+            self.log_func("FILTERED", candidate.asset_type, candidate.token_id, {
+                "market_name": candidate.question,
+                "reason": "entry price out of bounds for selected side",
+                "side": candidate.side,
+                "entry_price": round(float(candidate.entry_price), 4),
+                "price_floor": PRICE_FLOOR,
+                "price_ceiling": PRICE_CEILING,
+                "price_yes": round(float(candidate.price_yes), 4),
+                "price_no": round(float(1.0 - candidate.price_yes), 4),
+            })
             self.hunter.mark_seen(candidate.token_id)
             return 0.0, None
 
@@ -396,18 +256,13 @@ class SequentialTradingPipeline:
 
         budget_bet, budget_ok = self.budget_manager.check_and_cap_bet(float(candidate.kelly_size))
         if not budget_ok:
-            self.log_func(
-                "REJECTED",
-                candidate.asset_type,
-                candidate.token_id,
-                {
-                    "market_name": candidate.question,
-                    "reason": "daily_limit_reached",
-                    "kelly_size": round(float(candidate.kelly_size), 4),
-                    "daily_limit_usd": round(float(self.budget_manager.daily_limit_usd), 4),
-                    "spent_today": round(float(self.budget_manager.total_spent_today), 4),
-                },
-            )
+            self.log_func("REJECTED", candidate.asset_type, candidate.token_id, {
+                "market_name": candidate.question,
+                "reason": "daily_limit_reached",
+                "kelly_size": round(float(candidate.kelly_size), 4),
+                "daily_limit_usd": round(float(self.budget_manager.daily_limit_usd), 4),
+                "spent_today": round(float(self.budget_manager.total_spent_today), 4),
+            })
             self.hunter.mark_seen(candidate.token_id)
             return 0.0, None
 
@@ -415,53 +270,38 @@ class SequentialTradingPipeline:
         freed_cash = 0.0
         if float(available_cash) < float(desired_bet):
             try:
-                freed_cash = float(
-                    self.portfolio_manager.optimize_for_candidate(
-                        float(candidate.final_ev),
-                        min_improvement=0.10,
-                        log_func=self.log_func,
-                    )
-                )
+                freed_cash = float(self.portfolio_manager.optimize_for_candidate(
+                    float(candidate.final_ev), min_improvement=0.10, log_func=self.log_func,
+                ))
             except Exception as exc:
                 print(f"[PIPELINE] Portfolio optimization failed: {exc}")
                 freed_cash = 0.0
-
             available_cash = float(available_cash) + float(freed_cash)
             self.bridge.current_balance = float(available_cash)
             self.bridge.cash = float(available_cash)
 
         approved_bet = min(float(desired_bet), float(budget_bet), float(available_cash))
         if float(approved_bet) < float(self.safe_minimum):
-            self.log_func(
-                "REJECTED",
-                candidate.asset_type,
-                candidate.token_id,
-                {
-                    "market_name": candidate.question,
-                    "reason": "insufficient_cash",
-                    "approved_bet": round(float(approved_bet), 4),
-                    "available_cash": round(float(available_cash), 4),
-                    "freed_cash": round(float(freed_cash), 4),
-                    "desired_bet": round(float(desired_bet), 4),
-                },
-            )
+            self.log_func("REJECTED", candidate.asset_type, candidate.token_id, {
+                "market_name": candidate.question,
+                "reason": "insufficient_cash",
+                "approved_bet": round(float(approved_bet), 4),
+                "available_cash": round(float(available_cash), 4),
+                "freed_cash": round(float(freed_cash), 4),
+                "desired_bet": round(float(desired_bet), 4),
+            })
             self.hunter.mark_seen(candidate.token_id)
             return 0.0, None
 
         if float(approved_bet) < float(desired_bet):
-            self.log_func(
-                "BET-DOWNSIZE",
-                candidate.asset_type,
-                candidate.token_id,
-                {
-                    "market_name": candidate.question,
-                    "reason": "using available cash instead of standard bet size",
-                    "desired_bet": round(float(desired_bet), 4),
-                    "actual_bet": round(float(approved_bet), 4),
-                    "available_cash": round(float(available_cash), 4),
-                    "budget_bet": round(float(budget_bet), 4),
-                },
-            )
+            self.log_func("BET-DOWNSIZE", candidate.asset_type, candidate.token_id, {
+                "market_name": candidate.question,
+                "reason": "using available cash instead of standard bet size",
+                "desired_bet": round(float(desired_bet), 4),
+                "actual_bet": round(float(approved_bet), 4),
+                "available_cash": round(float(available_cash), 4),
+                "budget_bet": round(float(budget_bet), 4),
+            })
 
         return float(approved_bet), {
             "available_cash": float(available_cash),
@@ -485,7 +325,6 @@ class SequentialTradingPipeline:
             self.spent_today = float(self.budget_manager.total_spent_today)
             self.bridge.spent_today = float(self.spent_today)
             self.bridge.daily_spend = float(self.spent_today)
-
             self.bridge.current_balance = max(0.0, float(self.bridge.current_balance) - float(approved_bet))
             self.bridge.cash = float(self.bridge.current_balance)
 
@@ -493,30 +332,25 @@ class SequentialTradingPipeline:
             open_positions_value = float(self.bridge.open_position_value)
             total_equity = float(cash_balance) + float(open_positions_value)
 
-            self.log_func(
-                "TRACK",
-                candidate.asset_type,
-                candidate.token_id,
-                {
-                    "market_name": candidate.question,
-                    "model_used": candidate.model_used,
-                    "fair": round(float(candidate.fair_value), 4),
-                    "ev": round(float(candidate.final_ev), 4),
-                    "ev_yes": round(float(candidate.ev_yes), 4),
-                    "ev_no": round(float(candidate.ev_no), 4),
-                    "side": candidate.side,
-                    "kelly": round(float(candidate.kelly_size), 4),
-                    "bet_usd": round(float(approved_bet), 2),
-                    "executed": bool(executed),
-                    "total_equity": round(float(total_equity), 4),
-                    "allocation_fraction": self.allocation_fraction,
-                    "max_bet_size_usd": round(float(self.max_bet_size_usd), 2),
-                    "target_bet_unclamped": round(float(risk_context.get("target_bet", 0.0)), 2),
-                    "target_bet_usd": round(float(approved_bet), 2),
-                    "available_cash": round(float(risk_context.get("available_cash", 0.0)), 2),
-                    "spent_today": round(float(self.spent_today), 2),
-                },
-            )
+            self.log_func("TRACK", candidate.asset_type, candidate.token_id, {
+                "market_name": candidate.question,
+                "model_used": candidate.model_used,
+                "fair": round(float(candidate.fair_value), 4),
+                "ev": round(float(candidate.final_ev), 4),
+                "ev_yes": round(float(candidate.ev_yes), 4),
+                "ev_no": round(float(candidate.ev_no), 4),
+                "side": candidate.side,
+                "kelly": round(float(candidate.kelly_size), 4),
+                "bet_usd": round(float(approved_bet), 2),
+                "executed": bool(executed),
+                "total_equity": round(float(total_equity), 4),
+                "allocation_fraction": self.allocation_fraction,
+                "max_bet_size_usd": round(float(self.max_bet_size_usd), 2),
+                "target_bet_unclamped": round(float(risk_context.get("target_bet", 0.0)), 2),
+                "target_bet_usd": round(float(approved_bet), 2),
+                "available_cash": round(float(risk_context.get("available_cash", 0.0)), 2),
+                "spent_today": round(float(self.spent_today), 2),
+            })
 
         self.hunter.mark_seen(candidate.token_id)
 
@@ -552,18 +386,3 @@ async def run_market_monitor(bridge, log_func, delay: float | None = None):
     """Canonical entrypoint for the trading monitor loop."""
     pipeline = SequentialTradingPipeline(bridge=bridge, log_func=log_func, delay=delay)
     await pipeline.run_forever()
-
-
-__all__ = [
-    "DecisionContext",
-    "DecisionHandler",
-    "TradabilityHandler",
-    "BudgetHandler",
-    "WatchOnlyHandler",
-    "ExecuteHandler",
-    "GuardByStatusHandler",
-    "build_entry_pipeline",
-    "CandidateTrade",
-    "SequentialTradingPipeline",
-    "run_market_monitor",
-]

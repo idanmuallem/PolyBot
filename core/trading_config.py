@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 
 # Load local .env values when running outside Docker/AWS.
-load_dotenv()
+load_dotenv("config/.env")
 
 
 DEFAULT_MIN_EV = 0.30
@@ -43,10 +43,10 @@ class TradingConfig:
     min_hold_ev: float = -0.10
 
     loop_delay_seconds: float = 2.0
+    max_daily_trades: int = 10
     private_key: str = ""
     proxy_address: str = ""
     signature_type: int = 2
-
 
     @classmethod
     def from_env(cls) -> "TradingConfig":

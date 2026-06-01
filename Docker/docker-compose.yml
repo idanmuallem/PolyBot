@@ -5,7 +5,7 @@ services:
     ports:
       - "8501:8501"
     env_file:
-      - .env
+      - config/.env
     environment:
       STREAMLIT_SERVER_FILE_WATCHER_TYPE: poll
     volumes:

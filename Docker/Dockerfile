@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install requirements
-COPY requirements.txt ./
+COPY config/requirements.txt ./requirements.txt
 # Upgrading pip first prevents weird dependency resolution bugs
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt

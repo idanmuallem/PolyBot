@@ -1,6 +1,6 @@
 from curl_cffi import requests as crequests
 
-from .base import BaseApiClient
+from . import BaseApiClient
 
 
 class BinanceClient(BaseApiClient):

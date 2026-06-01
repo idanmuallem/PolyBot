@@ -1,6 +1,10 @@
 from dataclasses import dataclass
 from typing import Optional
 
+# Market entry price bounds — shared by hunters, executor, and pipeline.
+PRICE_FLOOR = 0.30
+PRICE_CEILING = 0.85
+
 @dataclass
 class MarketData:
     market_id: str
