@@ -5,8 +5,8 @@ EconomyHunter: Hunts Polymarket for economic indicator prediction markets.
 from typing import Optional
 
 from core.models import MarketData
-from parsers import extract_economy_strike
-from clients.fred import FredClient
+from .parsers import extract_economy_strike
+from .clients.fred import FredClient
 
 from .base import BasePolymarketHunter
 

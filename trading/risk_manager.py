@@ -1,7 +1,34 @@
-import ast
 import json
 import os
 import sqlite3
+
+
+_DB_CANDIDATES = ["/app/trades.db", "trades.db"]
+
+
+def _parse_payload(payload_value) -> dict:
+    if isinstance(payload_value, dict):
+        return payload_value
+    text = str(payload_value or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        try:
+            import ast
+            return ast.literal_eval(text)
+        except Exception:
+            return {}
+
+
+def _db_path() -> str:
+    for candidate in _DB_CANDIDATES:
+        if os.path.isdir(candidate):
+            candidate = os.path.join(candidate, "trades.db")
+        if os.path.exists(candidate):
+            return candidate
+    return _DB_CANDIDATES[0]
 
 
 class PortfolioManager:
@@ -26,87 +53,62 @@ class PortfolioManager:
             return position.get(field_name, default)
         return getattr(position, field_name, default)
 
-    @staticmethod
-    def _db_path() -> str:
-        candidate = "/app/trades.db"
-        if os.path.isdir(candidate):
-            candidate = os.path.join(candidate, "trades.db")
-        if os.path.exists(candidate):
-            return candidate
-        fallback = os.path.join("trading", "trades.db")
-        return fallback
-
-    @staticmethod
-    def _parse_payload(payload_value):
-        if isinstance(payload_value, dict):
-            return payload_value
-        if payload_value is None:
-            return {}
-        payload_text = str(payload_value).strip()
-        if not payload_text:
-            return {}
-        try:
-            return ast.literal_eval(payload_text)
-        except Exception:
-            try:
-                return json.loads(payload_text)
-            except Exception:
-                return {}
-
-    def _resolve_position_fair_value(self, position):
-        direct_value = self._position_field(position, "fair_value")
-        if direct_value is not None:
-            try:
-                return float(direct_value)
-            except Exception:
-                pass
-
-        token_id = str(self._position_field(position, "token_id", "") or "")
-        market_id = str(self._position_field(position, "market_id", "") or "")
-
-        for key in (token_id, market_id):
-            snapshot = getattr(self.bridge, "opportunity_map", {}).get(str(key), {}) if key else {}
-            if isinstance(snapshot, dict):
-                for payload_key in ("fair_value", "fair"):
-                    if snapshot.get(payload_key) is not None:
-                        try:
-                            return float(snapshot.get(payload_key))
-                        except Exception:
-                            pass
-
-        db_file = self._db_path()
+    def _fair_value_from_db(self, token_id: str, market_id: str):
+        """Look up latest fair value for a position from the trade history DB."""
+        db_file = _db_path()
         if not os.path.exists(db_file):
             return None
-
         try:
             with sqlite3.connect(db_file, timeout=5) as conn:
                 cursor = conn.cursor()
-                for lookup_token in (token_id, market_id):
-                    if not lookup_token:
+                for lookup_id in (token_id, market_id):
+                    if not lookup_id:
                         continue
                     cursor.execute(
                         """
-                        SELECT payload
-                        FROM hunt_history
+                        SELECT payload FROM hunt_history
                         WHERE token_id = ?
                           AND level IN ('AUTO-TRADE', 'LIVE-TRADE', 'DRY-RUN', 'PAPER-TRADE', 'TRACK')
-                        ORDER BY id DESC
-                        LIMIT 10
+                        ORDER BY id DESC LIMIT 10
                         """,
-                        (lookup_token,),
+                        (lookup_id,),
                     )
                     for (payload_raw,) in cursor.fetchall():
-                        payload = self._parse_payload(payload_raw)
-                        for payload_key in ("fair_value", "fair"):
-                            if payload.get(payload_key) is not None:
+                        payload = _parse_payload(payload_raw)
+                        for key in ("fair_value", "fair"):
+                            if payload.get(key) is not None:
                                 try:
-                                    return float(payload.get(payload_key))
+                                    return float(payload[key])
                                 except Exception:
                                     continue
         except Exception:
-            return None
-
+            pass
         return None
+
+    def _resolve_position_fair_value(self, position):
+        # 1. Direct attribute
+        direct = self._position_field(position, "fair_value")
+        if direct is not None:
+            try:
+                return float(direct)
+            except Exception:
+                pass
+
+        # 2. Bridge opportunity map
+        token_id = str(self._position_field(position, "token_id", "") or "")
+        market_id = str(self._position_field(position, "market_id", "") or "")
+        for key in (token_id, market_id):
+            snapshot = getattr(self.bridge, "opportunity_map", {}).get(key, {}) if key else {}
+            for payload_key in ("fair_value", "fair"):
+                val = snapshot.get(payload_key) if isinstance(snapshot, dict) else None
+                if val is not None:
+                    try:
+                        return float(val)
+                    except Exception:
+                        pass
+
+        # 3. DB fallback
+        return self._fair_value_from_db(token_id, market_id)
 
     def _liquidate_position_value(self, position, log_func) -> float:
         token_id = str(self._position_field(position, "token_id", "") or "")
@@ -123,10 +125,7 @@ class PortfolioManager:
             print(f"[PORTFOLIO-CULL] Liquidation failed for {token_id}: {exc}")
             return 0.0
 
-        if not sold:
-            return 0.0
-
-        return max(0.0, float(position_value))
+        return max(0.0, float(position_value)) if sold else 0.0
 
     @staticmethod
     def _normalized_pnl_ratio(position) -> float:
@@ -144,8 +143,27 @@ class PortfolioManager:
         self.bridge.current_balance = float(updated_cash)
         self.bridge.cash = float(updated_cash)
 
+    def _exit_position(self, position, level: str, threshold: float, extra: dict, log_func) -> bool:
+        """Sell a position and log the exit. Returns True if sold."""
+        token_id = position.token_id
+        shares = float(position.shares)
+        current_price = float(position.current_price)
+        position_value = float(getattr(position, "value", shares * current_price))
+
+        sold = self.executor.sell_position(token_id, shares, current_price, log_func)
+        if sold:
+            self._apply_sale_to_bridge(position_value)
+        log_func(level, "Portfolio", token_id, {
+            "threshold": threshold,
+            "shares": shares,
+            "price": current_price,
+            "sold": sold,
+            **extra,
+        })
+        return bool(sold)
+
     def optimize_for_candidate(self, new_candidate_ev: float, min_improvement: float = 0.10, log_func=None) -> float:
-        """Liquidate all materially weaker positions to pool capital for a stronger candidate."""
+        """Liquidate positions materially weaker than the new candidate to pool capital."""
         try:
             self._refresh_portfolio()
             open_positions = list(getattr(self.bridge, "current_portfolio", []) or [])
@@ -161,47 +179,53 @@ class PortfolioManager:
                     if fair_value is None:
                         continue
 
-                    size = float(self._position_field(position, "shares", 0.0) or self._position_field(position, "size", 0.0) or 0.0)
-                    current_value = float(self._position_field(position, "value", 0.0) or self._position_field(position, "currentValue", 0.0) or 0.0)
-
+                    size = float(
+                        self._position_field(position, "shares", 0.0)
+                        or self._position_field(position, "size", 0.0)
+                        or 0.0
+                    )
                     if size <= 0.0:
                         continue
 
-                    current_price = current_value / size if current_value > 0.0 else float(self._position_field(position, "current_price", 0.0) or 0.0)
+                    current_value = float(
+                        self._position_field(position, "value", 0.0)
+                        or self._position_field(position, "currentValue", 0.0)
+                        or 0.0
+                    )
+                    current_price = (
+                        current_value / size if current_value > 0.0
+                        else float(self._position_field(position, "current_price", 0.0) or 0.0)
+                    )
                     if current_price <= 0.001:
                         continue
 
-                    bounded_fair_value = max(0.001, min(0.999, float(fair_value)))
-                    live_ev = (bounded_fair_value / float(current_price)) - 1.0
+                    live_ev = (max(0.001, min(0.999, float(fair_value))) / float(current_price)) - 1.0
 
                     if float(new_candidate_ev) >= float(live_ev) + float(min_improvement):
                         asset = str(self._position_field(position, "token_id", "UNKNOWN") or "UNKNOWN")
-                        print(f"[PORTFOLIO-CULL] Found weak position: Asset {asset} (Live EV: {live_ev:.2f}).")
+                        print(f"[PORTFOLIO-CULL] Weak position: {asset} (live_ev={live_ev:.2f})")
 
-                        recovered_value = self._liquidate_position_value(position, log_func or (lambda *args, **kwargs: None))
-                        if recovered_value <= 0.0:
+                        recovered = self._liquidate_position_value(
+                            position, log_func or (lambda *a, **k: None)
+                        )
+                        if recovered <= 0.0:
                             continue
 
-                        freed_capital += float(recovered_value)
+                        freed_capital += float(recovered)
                         liquidated_count += 1
                 except Exception as exc:
-                    print(f"[PORTFOLIO-CULL] Failed to evaluate position for cull: {exc}")
+                    print(f"[PORTFOLIO-CULL] Failed to evaluate position: {exc}")
                     continue
 
-            print(f"[OPPORTUNITY-SWAP] Total Culled: {liquidated_count} positions. Recovered Capital: ${freed_capital:.2f}")
+            print(f"[OPPORTUNITY-SWAP] Culled {liquidated_count} positions, recovered ${freed_capital:.2f}")
 
             if log_func is not None and liquidated_count > 0:
-                log_func(
-                    "PORTFOLIO-CULL",
-                    "Portfolio",
-                    "MULTI",
-                    {
-                        "liquidated_count": liquidated_count,
-                        "freed_capital": round(float(freed_capital), 4),
-                        "new_candidate_ev": round(float(new_candidate_ev), 4),
-                        "min_improvement": round(float(min_improvement), 4),
-                    },
-                )
+                log_func("PORTFOLIO-CULL", "Portfolio", "MULTI", {
+                    "liquidated_count": liquidated_count,
+                    "freed_capital": round(float(freed_capital), 4),
+                    "new_candidate_ev": round(float(new_candidate_ev), 4),
+                    "min_improvement": round(float(min_improvement), 4),
+                })
 
             self._refresh_portfolio()
             return float(freed_capital)
@@ -210,6 +234,7 @@ class PortfolioManager:
             return 0.0
 
     def free_up_capital(self, required_amount: float, log_func) -> bool:
+        """Sell weakest positions (by PnL) until required_amount of cash is available."""
         self._refresh_portfolio()
 
         if float(self.bridge.current_balance) >= float(required_amount):
@@ -217,7 +242,7 @@ class PortfolioManager:
 
         weakest_first = sorted(
             list(self.bridge.current_portfolio),
-            key=lambda position: float(getattr(position, "pnl_percent", 0.0)),
+            key=lambda p: float(getattr(p, "pnl_percent", 0.0)),
         )
 
         for position in weakest_first:
@@ -231,17 +256,12 @@ class PortfolioManager:
                 continue
 
             self._apply_sale_to_bridge(position_value)
-            log_func(
-                "OPPORTUNITY-SWAP",
-                "Portfolio",
-                token_id,
-                {
-                    "message": f"Liquidated {token_id} to free up capital for high-EV trade.",
-                    "freed_value": round(position_value, 4),
-                    "required_amount": round(float(required_amount), 4),
-                    "current_balance": round(float(self.bridge.current_balance), 4),
-                },
-            )
+            log_func("OPPORTUNITY-SWAP", "Portfolio", token_id, {
+                "message": f"Liquidated {token_id} to free capital for high-EV trade.",
+                "freed_value": round(position_value, 4),
+                "required_amount": round(float(required_amount), 4),
+                "current_balance": round(float(self.bridge.current_balance), 4),
+            })
 
             if float(self.bridge.current_balance) >= float(required_amount):
                 self._refresh_portfolio()
@@ -254,67 +274,22 @@ class PortfolioManager:
         self._refresh_portfolio()
 
         for position in list(self.bridge.current_portfolio):
-            token_id = position.token_id
-            shares = float(position.shares)
-            current_price = float(position.current_price)
-            position_value = float(getattr(position, "value", shares * current_price))
-
-            pnl_raw = float(position.pnl_percent)
             pnl_ratio = self._normalized_pnl_ratio(position)
+            pnl_raw = float(position.pnl_percent)
 
             if pnl_ratio >= self.take_profit_pct:
-                sold = self.executor.sell_position(token_id, shares, current_price, log_func)
-                if sold:
-                    self._apply_sale_to_bridge(position_value)
-                log_func(
-                    "TAKE-PROFIT",
-                    "Portfolio",
-                    token_id,
-                    {
-                        "pnl_percent": pnl_raw,
-                        "threshold": self.take_profit_pct,
-                        "shares": shares,
-                        "price": current_price,
-                        "sold": sold,
-                    },
-                )
+                self._exit_position(position, "TAKE-PROFIT", self.take_profit_pct,
+                                    {"pnl_percent": pnl_raw}, log_func)
                 continue
 
             if pnl_ratio <= self.stop_loss_pct:
-                sold = self.executor.sell_position(token_id, shares, current_price, log_func)
-                if sold:
-                    self._apply_sale_to_bridge(position_value)
-                log_func(
-                    "STOP-LOSS",
-                    "Portfolio",
-                    token_id,
-                    {
-                        "pnl_percent": pnl_raw,
-                        "threshold": self.stop_loss_pct,
-                        "shares": shares,
-                        "price": current_price,
-                        "sold": sold,
-                    },
-                )
+                self._exit_position(position, "STOP-LOSS", self.stop_loss_pct,
+                                    {"pnl_percent": pnl_raw}, log_func)
                 continue
 
-            # Optional/Future EV convergence placeholder
             estimated_hold_ev = self._position_live_ev(position)
             if estimated_hold_ev < self.min_hold_ev:
-                sold = self.executor.sell_position(token_id, shares, current_price, log_func)
-                if sold:
-                    self._apply_sale_to_bridge(position_value)
-                log_func(
-                    "EV-CONVERGENCE",
-                    "Portfolio",
-                    token_id,
-                    {
-                        "estimated_ev": round(estimated_hold_ev, 4),
-                        "threshold": self.min_hold_ev,
-                        "shares": shares,
-                        "price": current_price,
-                        "sold": sold,
-                    },
-                )
+                self._exit_position(position, "EV-CONVERGENCE", self.min_hold_ev,
+                                    {"estimated_ev": round(estimated_hold_ev, 4)}, log_func)
 
         self._refresh_portfolio()

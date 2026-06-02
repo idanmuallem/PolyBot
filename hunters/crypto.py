@@ -5,8 +5,8 @@ CryptoHunter: Hunts Polymarket for cryptocurrency price prediction markets.
 from typing import Optional
 
 from core.models import MarketData
-from parsers import extract_crypto_strike
-from clients.binance import BinanceClient
+from .parsers import extract_crypto_strike
+from .clients.binance import BinanceClient
 
 from .base import BasePolymarketHunter
 
@@ -76,6 +76,21 @@ class CryptoHunter(BasePolymarketHunter):
                     best_market = found
 
         if best_market:
+            # Guard against cross-asset contamination (e.g. a BTC-tagged market whose
+            # question is actually about ETH/SOL, or vice versa).
+            asset_lower = best_market.asset_type.lower()
+            q_lower = (best_market.market_name or "").lower()
+            mismatch = (
+                ("btc" in asset_lower or "bitcoin" in asset_lower)
+                and any(kw in q_lower for kw in ("eth", "ethereum", "sol", "solana"))
+            ) or (
+                ("eth" in asset_lower or "ethereum" in asset_lower)
+                and any(kw in q_lower for kw in ("btc", "bitcoin", "sol", "solana"))
+            )
+            if mismatch:
+                print(f"[CryptoHunter] Skipping asset mismatch: {best_market.asset_type} / {best_market.market_name[:60]}")
+                return None
+
             print(f"[CryptoHunter] Best market: {best_market.market_name} | vol={best_market.volume:,.0f}")
         else:
             print("[CryptoHunter] No markets found")

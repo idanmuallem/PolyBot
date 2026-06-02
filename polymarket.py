@@ -1,20 +1,126 @@
 """
-PolymarketScannerHunter: Coordinator that runs discovery and pricing passes.
+Polymarket module: API client + market scanner/coordinator.
 
-Manages the cooldown cache shared across all hunters and wires the brain
-evaluation layer into the scan loop.
+- PolymarketClient   : thin HTTP wrapper for Gamma API event search and CLOB balance fetching.
+- PolymarketScannerHunter : coordinator that runs discovery and pricing passes across hunters.
 """
 
+import json
 import time
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from curl_cffi import requests as crequests
+
+try:
+    from py_clob_client.client import ClobClient          # type: ignore[reportMissingImports]
+    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # type: ignore
+    CLOB_IMPORT_OK = True
+except Exception:
+    ClobClient = Any           # type: ignore
+    AssetType = Any            # type: ignore
+    BalanceAllowanceParams = Any  # type: ignore
+    CLOB_IMPORT_OK = False
 
 from brains import get_brain_for_asset_type
 from brains.base import calculate_tte
 from core.models import MarketData
-from .base import BasePolymarketHunter
-from .crypto import CryptoHunter
+from hunters.base import BasePolymarketHunter
+from hunters.crypto import CryptoHunter
 
+
+# ---------------------------------------------------------------------------
+# PolymarketClient
+# ---------------------------------------------------------------------------
+
+class PolymarketClient:
+    """Wrapper around the Polymarket gamma-api for event searching."""
+
+    BASE_URL = "https://gamma-api.polymarket.com/events"
+
+    def search_events(
+        self,
+        query: str,
+        limit: int = 100,
+        offset: int = 0,
+        order: str = "volume",
+        ascending: str = "false",
+    ) -> List[Dict[str, Any]]:
+        """Fetch a page of events matching the query."""
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": limit,
+            "offset": offset,
+            "query": query,
+            "order": order,
+            "ascending": ascending,
+        }
+        resp = crequests.get(self.BASE_URL, params=params, impersonate="chrome120", timeout=15)
+        if resp.status_code != 200:
+            return []
+        events = resp.json()
+        return events if events else []
+
+    def get_proxy_balance(self, proxy_address: str, private_key: str) -> float:
+        """Fetch proxy wallet USDC balance from Polymarket CLOB API.
+
+        Raises an exception when credentials are missing or a balance cannot be resolved.
+        """
+        if not proxy_address or not private_key:
+            raise ValueError("Missing POLY_ADDRESS and/or POLYGON_PRIVATE_KEY")
+        if not CLOB_IMPORT_OK:
+            raise RuntimeError("py-clob-client is not available")
+
+        temp_client = ClobClient(
+            host="https://clob.polymarket.com",
+            chain_id=137,
+            key=private_key,
+            funder=proxy_address,
+            signature_type=1,
+        )
+        creds = (
+            temp_client.create_or_derive_api_key()
+            if hasattr(temp_client, "create_or_derive_api_key")
+            else temp_client.create_or_derive_api_creds()
+        )
+
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            chain_id=137,
+            key=private_key,
+            creds=creds,
+            funder=proxy_address,
+            signature_type=1,
+        )
+
+        if hasattr(client, "get_balance_allowance"):
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            resp = client.get_balance_allowance(params=params)
+            if isinstance(resp, dict):
+                balance_section = resp.get("balance") if isinstance(resp.get("balance"), dict) else resp
+                for key in ("usdc", "USDC", "available", "amount", "balance"):
+                    if key in balance_section:
+                        raw = float(balance_section[key])
+                        return raw / 1_000_000.0 if raw > 1_000_000 else raw
+
+        if hasattr(client, "get_balance"):
+            resp = client.get_balance()
+            if isinstance(resp, dict):
+                for key in ("usdc", "USDC", "available_balance", "available", "amount", "balance"):
+                    if key in resp:
+                        return float(resp[key])
+
+        raise RuntimeError("Unable to resolve balance from Polymarket API")
+
+    def get_balance(self, proxy_address: str, private_key: str) -> float:
+        """Compatibility alias for callers expecting get_balance()."""
+        return self.get_proxy_balance(proxy_address=proxy_address, private_key=private_key)
+
+
+# ---------------------------------------------------------------------------
+# PolymarketScannerHunter
+# ---------------------------------------------------------------------------
 
 class PolymarketScannerHunter:
     """Coordinator hunter that runs one complete discovery + pricing pass."""
@@ -125,9 +231,7 @@ class PolymarketScannerHunter:
 
         if poly_price < BasePolymarketHunter.PRICE_FLOOR or poly_price > BasePolymarketHunter.PRICE_CEILING:
             log_func(
-                "FILTERED",
-                asset_type,
-                token_id,
+                "FILTERED", asset_type, token_id,
                 {
                     "market_name": question,
                     "reason": "price out of hunter bounds",

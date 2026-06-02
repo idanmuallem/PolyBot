@@ -405,8 +405,6 @@ class TradeExecutor:
         if not self._validate_market(market, log_func):
             return False
 
-        position_size = min(ev * 2.0, 1.0)
-
         if execution_price < PRICE_FLOOR or execution_price > PRICE_CEILING:
             log_func("EXECUTION", asset_type, execution_token_id, {
                 "reason": "entry price out of bounds",

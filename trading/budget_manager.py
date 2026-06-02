@@ -1,6 +1,3 @@
-import time
-
-
 class BudgetManager:
     def __init__(self, bridge, config, initial_balance: float):
         self.bridge = bridge
@@ -12,7 +9,6 @@ class BudgetManager:
 
         self.base_balance = float(initial_balance)
         self.total_spent_today = 0.0
-        self.day_start_time = time.time()
 
         self.watch_only = self.base_balance < self.min_trading_balance
         self._sync_bridge()
@@ -22,14 +18,7 @@ class BudgetManager:
         self.bridge.current_balance = max(self.base_balance - self.total_spent_today, 0.0)
         self.bridge.watch_only = self.watch_only
 
-    def _reset_daily_if_needed(self):
-        if time.time() - self.day_start_time >= 86400:
-            self.total_spent_today = 0.0
-            self.day_start_time = time.time()
-            self._sync_bridge()
-
     def get_remaining_budget(self) -> float:
-        self._reset_daily_if_needed()
         return self.daily_limit_usd - self.total_spent_today
 
     def check_and_cap_bet(self, kelly_fraction: float):

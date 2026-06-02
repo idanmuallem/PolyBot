@@ -15,7 +15,7 @@ from typing import Optional
 from brains import get_brain_for_asset_type
 from core.models import PRICE_FLOOR, PRICE_CEILING
 from core.trading_config import TradingConfig
-from hunters import PolymarketScannerHunter
+from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
 from trading.risk_manager import PortfolioManager
@@ -129,20 +129,6 @@ class SequentialTradingPipeline:
                     self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_owned_in_portfolio"})
                     self.hunter.mark_seen(token_id)
                     return None
-
-        # Prevent BTC/ETH cross-contamination.
-        asset_lower = asset_type.lower()
-        q_lower = question.lower()
-        if "btc" in asset_lower or "bitcoin" in asset_lower:
-            if "eth" in q_lower or "ethereum" in q_lower or "sol" in q_lower or "solana" in q_lower:
-                self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "asset_mismatch_btc_vs_altcoin"})
-                self.hunter.mark_seen(token_id)
-                return None
-        if "eth" in asset_lower or "ethereum" in asset_lower:
-            if "btc" in q_lower or "bitcoin" in q_lower or "sol" in q_lower or "solana" in q_lower:
-                self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "asset_mismatch_eth_vs_other"})
-                self.hunter.mark_seen(token_id)
-                return None
 
         self.bridge.status = f"Scanning {asset_type}: {question[:60]}..."
         self.bridge.market_question = question
@@ -269,6 +255,7 @@ class SequentialTradingPipeline:
         available_cash = float(cash_balance)
         freed_cash = 0.0
         if float(available_cash) < float(desired_bet):
+            # First pass: swap out positions with materially worse EV
             try:
                 freed_cash = float(self.portfolio_manager.optimize_for_candidate(
                     float(candidate.final_ev), min_improvement=0.10, log_func=self.log_func,
@@ -277,6 +264,15 @@ class SequentialTradingPipeline:
                 print(f"[PIPELINE] Portfolio optimization failed: {exc}")
                 freed_cash = 0.0
             available_cash = float(available_cash) + float(freed_cash)
+
+            # Second pass: if still short, sell weakest positions regardless of EV
+            if float(available_cash) < float(desired_bet):
+                try:
+                    self.portfolio_manager.free_up_capital(float(desired_bet), self.log_func)
+                    available_cash = float(self.bridge.current_balance)
+                except Exception as exc:
+                    print(f"[PIPELINE] free_up_capital failed: {exc}")
+
             self.bridge.current_balance = float(available_cash)
             self.bridge.cash = float(available_cash)
 
