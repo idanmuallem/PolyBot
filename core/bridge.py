@@ -6,6 +6,7 @@ import streamlit as st
 
 class DataBridge:
     def __init__(self):
+        self._engine_thread = None  # persists across Streamlit reruns via cache_resource
         self.market_actual = 0.0
         self.market_poly = 0.0
         self.forecast = 0.0

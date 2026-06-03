@@ -1,3 +1,15 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Ensure stdout/stderr handle Unicode (e.g. market names with ↓ ↑ symbols).
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 import asyncio
 import os
 import threading
@@ -53,17 +65,43 @@ def _validate_runtime_env() -> dict:
     }
 
 
-def _fetch_live_balance() -> tuple[float, bool]:
-    proxy_address = _get_env("POLYMARKET_PROXY_ADDRESS", "POLY_ADDRESS")
-    private_key = _get_env("POLYMARKET_PRIVATE_KEY", "POLYGON_PRIVATE_KEY")
+_balance_lock = threading.Lock()
+_balance_value: float = 0.0
+_balance_ok: bool = False
+_balance_fetching: bool = False
+
+
+def _do_balance_fetch() -> None:
+    global _balance_value, _balance_ok, _balance_fetching
     try:
+        proxy_address = _get_env("POLYMARKET_PROXY_ADDRESS", "POLY_ADDRESS")
+        private_key = _get_env("POLYMARKET_PRIVATE_KEY", "POLYGON_PRIVATE_KEY")
         balance = float(
             PolymarketClient().get_proxy_balance(proxy_address=proxy_address, private_key=private_key)
         )
-        return max(0.0, balance), True
+        with _balance_lock:
+            _balance_value = max(0.0, balance)
+            _balance_ok = True
     except Exception as exc:
         bridge.terminal_logs.appendleft(f"[BALANCE-ERROR] {exc}")
-        return 0.0, False
+        with _balance_lock:
+            _balance_ok = False
+    finally:
+        with _balance_lock:
+            _balance_fetching = False
+
+
+def _fetch_live_balance() -> tuple[float, bool]:
+    """Return last-known balance immediately; refresh in background if idle."""
+    global _balance_fetching
+    with _balance_lock:
+        already = _balance_fetching
+        val, ok = _balance_value, _balance_ok
+    if not already:
+        with _balance_lock:
+            _balance_fetching = True
+        threading.Thread(target=_do_balance_fetch, daemon=True, name="balance-fetch").start()
+    return val, ok
 
 
 # ---------------------------------------------------------------------------
@@ -71,21 +109,25 @@ def _fetch_live_balance() -> tuple[float, bool]:
 # ---------------------------------------------------------------------------
 
 def _ensure_engine_started_once() -> None:
-    if st.session_state.get("engine_started"):
+    # Thread is stored on bridge (a @st.cache_resource singleton) so it
+    # survives Streamlit reruns that would otherwise reset a module-level var.
+    if bridge._engine_thread is not None and bridge._engine_thread.is_alive():
         return
 
     loop = asyncio.new_event_loop()
 
     def _runner() -> None:
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(run_market_monitor(bridge, _log_event))
+        try:
+            loop.run_until_complete(run_market_monitor(bridge, _log_event))
+        except Exception as exc:
+            import traceback
+            bridge.terminal_logs.appendleft(f"[ENGINE-CRASH] {exc}")
+            with open("C:/app/engine_crash.log", "a", encoding="utf-8") as f:
+                f.write(f"[ENGINE-CRASH] {exc}\n{traceback.format_exc()}\n")
 
-    thread = threading.Thread(target=_runner, daemon=True, name="polybot-engine")
-    thread.start()
-
-    st.session_state.engine_loop = loop
-    st.session_state.engine_thread = thread
-    st.session_state.engine_started = True
+    bridge._engine_thread = threading.Thread(target=_runner, daemon=True, name="polybot-engine")
+    bridge._engine_thread.start()
 
 
 def _log_event(level, asset_type, token_id, payload):
@@ -104,15 +146,17 @@ def _log_event(level, asset_type, token_id, payload):
             for key in keys[:100]:
                 bridge.seen_markets.pop(key, None)
 
-    data_manager.log_event(bridge, level, asset_type, token_id, payload, db_path=runtime_env["trades_db_path"])
+    db_path = runtime_env.get("trades_db_path", "/app/trades.db")
+    data_manager.log_event(bridge, level, asset_type, token_id, payload, db_path=db_path)
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap (runs once at module load)
+# Bootstrap (runs once per session; guarded against re-init)
 # ---------------------------------------------------------------------------
 
 def _bootstrap() -> None:
     global runtime_env
+    # runtime_env is reset to {} on each Streamlit script rerun — re-populate it.
     runtime_env = _validate_runtime_env()
     data_manager.init_db(runtime_env["trades_db_path"])
 
@@ -120,20 +164,22 @@ def _bootstrap() -> None:
         db_path=runtime_env["trades_db_path"],
         fallback_starting_balance=0.0,
     )
-    live_balance, live_balance_ok = _fetch_live_balance()
+
+    # Kick off balance fetch in background — don't block startup.
+    _fetch_live_balance()
 
     bridge.starting_balance = float(restored["starting_balance"])
-    bridge.current_balance = float(live_balance)
-    bridge.balance_connection_error = not live_balance_ok
+    bridge.current_balance = float(restored["current_balance"])
+    bridge.balance_connection_error = False
     bridge.start_of_day_equity = float(restored["start_of_day_equity"])
     bridge.spent_today = float(restored["spent_today"])
     bridge.daily_spend = float(restored["spent_today"])
     bridge.state_bootstrap_source = str(restored["source"])
     bridge.live_trading = not (bool(runtime_env["dry_run"]) or bool(runtime_env["paper_trade_mode"]))
-    bridge.last_balance_sync_at = time.time()
+    bridge.last_balance_sync_at = 0.0
 
     if bridge.starting_balance <= 0.0:
-        bridge.starting_balance = float(live_balance)
+        bridge.starting_balance = float(restored["current_balance"])
 
     _ensure_engine_started_once()
 
@@ -272,9 +318,11 @@ def _render_dashboard_snapshot(view_name: str):
     now_ts = time.time()
     last_sync = float(getattr(bridge, "last_balance_sync_at", 0.0) or 0.0)
     if (now_ts - last_sync) >= 15.0:
+        # Non-blocking: returns cached value and kicks off background refresh.
         live_balance, live_balance_ok = _fetch_live_balance()
-        bridge.current_balance = float(live_balance)
-        bridge.balance_connection_error = not live_balance_ok
+        if live_balance > 0.0:
+            bridge.current_balance = float(live_balance)
+            bridge.balance_connection_error = not live_balance_ok
         bridge.last_balance_sync_at = now_ts
 
     current_token = str(getattr(bridge, "current_token_id", ""))

@@ -244,7 +244,7 @@ class TradeExecutor:
                     ((current_price - initial_price) / initial_price) * 100
                     if initial_price > 0 else 0.0
                 )
-                live_ev = pnl_percent / 100.0 if abs(pnl_percent) > 1.0 else pnl_percent
+                live_ev = pnl_percent / 100.0 if abs(pnl_percent) >= 1.0 else pnl_percent
 
                 positions.append(Position(
                     market_id=str(
@@ -394,7 +394,7 @@ class TradeExecutor:
             execution_price = max(1e-6, 1.0 - float(current_poly_price))
             execution_fair_value = 1.0 - float(fair_value)
 
-        if ev <= self.config.min_ev:
+        if ev < self.config.min_ev:
             return False
 
         if self.trade_count_today >= self.config.max_daily_trades:
@@ -430,7 +430,7 @@ class TradeExecutor:
             "market_price": execution_price,
             "fair_value": execution_fair_value,
             "ev": round(ev, 4),
-            "position_size": position_size,
+            "position_size": shares,
             "bet_amount_usd": bet_amount_usd,
             "shares": shares,
             "side": execution_side,

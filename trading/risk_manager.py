@@ -130,7 +130,7 @@ class PortfolioManager:
     @staticmethod
     def _normalized_pnl_ratio(position) -> float:
         pnl_raw = float(getattr(position, "pnl_percent", 0.0) or 0.0)
-        return pnl_raw / 100.0 if abs(pnl_raw) > 1.0 else pnl_raw
+        return pnl_raw / 100.0 if abs(pnl_raw) >= 1.0 else pnl_raw
 
     def _position_live_ev(self, position) -> float:
         live_ev = getattr(position, "live_ev", None)

@@ -209,7 +209,7 @@ class BasePolymarketHunter(BaseHunter):
                             )
 
             except Exception as e:
-                print(f"[{tag}] Scan error on page {page}: {e}")
+                print(f"[{tag}] Scan error on page {page}: {str(e).encode('ascii', errors='replace').decode()}")
                 break
 
         return best_market

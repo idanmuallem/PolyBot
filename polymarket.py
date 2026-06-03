@@ -125,7 +125,7 @@ class PolymarketClient:
 class PolymarketScannerHunter:
     """Coordinator hunter that runs one complete discovery + pricing pass."""
 
-    _COOLDOWN_SECONDS = 600
+    _COOLDOWN_SECONDS = 120
 
     def __init__(self, bridge, executor, config, hunters: Optional[list] = None):
         self.bridge = bridge
