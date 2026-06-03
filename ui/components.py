@@ -66,17 +66,17 @@ def render_positions(bridge):
             rows.append(pos.__dict__ if hasattr(pos, "__dict__") else {})
 
     pos_df = pd.DataFrame(rows)
-    desired_cols = ["market_id", "token_id", "side", "shares", "initial_price", "current_price", "value", "pnl_percent"]
+    desired_cols = ["market_id", "token_id", "side", "shares", "initial_price", "current_price", "value", "pnl_ratio"]
     pos_df = pos_df[[c for c in desired_cols if c in pos_df.columns]]
 
     styled = pos_df.style.format({
         "initial_price": "{:.4f}",
         "current_price": "{:.4f}",
         "value": "${:,.2f}",
-        "pnl_percent": "{:.2f}%",
+        "pnl_ratio": "{:.2%}",
     }).map(
         lambda v: "color: #16a34a" if v > 0 else ("color: #dc2626" if v < 0 else ""),
-        subset=["pnl_percent"],
+        subset=["pnl_ratio"],
     )
 
     if "side" in pos_df.columns:

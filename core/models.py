@@ -35,6 +35,6 @@ class Position:
     current_price: float
     shares: float
     value: float
-    pnl_percent: float
+    pnl_ratio: float          # fraction: 0.25 = +25%, -0.50 = -50%
     side: str = "UNKNOWN"
     live_ev: float = 0.0

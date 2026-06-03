@@ -2,6 +2,9 @@ import json
 import os
 import sqlite3
 
+from brains import get_brain_for_asset_type
+from core.models import MarketData
+
 
 _DB_CANDIDATES = ["/app/trades.db", "trades.db"]
 
@@ -32,9 +35,10 @@ def _db_path() -> str:
 
 
 class PortfolioManager:
-    def __init__(self, bridge, executor, config):
+    def __init__(self, bridge, executor, config, hunter=None):
         self.bridge = bridge
         self.executor = executor
+        self.hunter = hunter
         self.take_profit_pct = float(config.take_profit_pct)
         self.stop_loss_pct = float(config.stop_loss_pct)
         self.min_hold_ev = float(config.min_hold_ev)
@@ -45,7 +49,11 @@ class PortfolioManager:
         total_open_value = sum(float(getattr(p, "value", 0.0) or 0.0) for p in positions)
         self.bridge.open_position_value = float(total_open_value)
         self.bridge.open_positions_value = float(total_open_value)
-        self.bridge.total_pnl = sum((p.current_price - p.initial_price) * p.shares for p in positions)
+        self.bridge.total_pnl = sum(
+            (float(getattr(p, "current_price", 0.0) or 0.0) - float(getattr(p, "initial_price", 0.0) or 0.0))
+            * float(getattr(p, "shares", 0.0) or 0.0)
+            for p in positions
+        )
 
     @staticmethod
     def _position_field(position, field_name, default=None):
@@ -81,6 +89,49 @@ class PortfolioManager:
                                     return float(payload[key])
                                 except Exception:
                                     continue
+        except Exception:
+            pass
+        return None
+
+    def _market_data_from_db(self, token_id: str, market_id: str, current_price: float) -> MarketData | None:
+        """Reconstruct MarketData for a held position from the trade log DB."""
+        db_file = _db_path()
+        if not os.path.exists(db_file):
+            return None
+        try:
+            with sqlite3.connect(db_file, timeout=5) as conn:
+                cursor = conn.cursor()
+                for lookup_id in (token_id, market_id):
+                    if not lookup_id:
+                        continue
+                    cursor.execute(
+                        """
+                        SELECT asset_type, payload FROM hunt_history
+                        WHERE token_id = ?
+                          AND level IN ('TRACK', 'AUTO-TRADE', 'LIVE-TRADE', 'DRY-RUN', 'PAPER-TRADE')
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (lookup_id,),
+                    )
+                    row = cursor.fetchone()
+                    if not row:
+                        continue
+                    asset_type, payload_raw = row
+                    payload = _parse_payload(payload_raw)
+                    strike_price = float(payload.get("strike_price") or 0.0)
+                    expiry_date = str(payload.get("expiry_date") or "")
+                    market_name = str(payload.get("market_name") or "")
+                    if asset_type:
+                        return MarketData(
+                            market_id=market_id or token_id,
+                            asset_type=asset_type,
+                            strike_price=strike_price,
+                            question=market_name,
+                            market_name=market_name,
+                            initial_price=current_price,
+                            volume=0.0,
+                            expiry_date=expiry_date or None,
+                        )
         except Exception:
             pass
         return None
@@ -127,16 +178,26 @@ class PortfolioManager:
 
         return max(0.0, float(position_value)) if sold else 0.0
 
-    @staticmethod
-    def _normalized_pnl_ratio(position) -> float:
-        pnl_raw = float(getattr(position, "pnl_percent", 0.0) or 0.0)
-        return pnl_raw / 100.0 if abs(pnl_raw) >= 1.0 else pnl_raw
-
     def _position_live_ev(self, position) -> float:
-        live_ev = getattr(position, "live_ev", None)
-        if live_ev is None:
-            return float(self._normalized_pnl_ratio(position))
-        return float(live_ev)
+        token_id = str(self._position_field(position, "token_id", "") or "")
+        market_id = str(self._position_field(position, "market_id", "") or "")
+        current_price = float(self._position_field(position, "current_price", 0.0) or 0.0)
+
+        # Reconstruct MarketData from trade log and run the brain with fresh live_truth.
+        if self.hunter is not None and current_price > 0.0:
+            market_data = self._market_data_from_db(token_id, market_id, current_price)
+            if market_data is not None:
+                try:
+                    sub_hunter = self.hunter.get_hunter_for_asset_type(market_data.asset_type)
+                    live_truth = sub_hunter.get_live_truth(market_data) if sub_hunter else None
+                    if live_truth is not None:
+                        brain = get_brain_for_asset_type(market_data.asset_type)
+                        signal = brain.evaluate(market_data, float(live_truth))
+                        return float(signal.expected_value)
+                except Exception:
+                    pass
+
+        return float(getattr(position, "pnl_ratio", 0.0) or 0.0)
 
     def _apply_sale_to_bridge(self, position_value: float):
         updated_cash = float(self.bridge.current_balance) + max(0.0, float(position_value))
@@ -242,7 +303,7 @@ class PortfolioManager:
 
         weakest_first = sorted(
             list(self.bridge.current_portfolio),
-            key=lambda p: float(getattr(p, "pnl_percent", 0.0)),
+            key=lambda p: float(getattr(p, "pnl_ratio", 0.0)),
         )
 
         for position in weakest_first:
@@ -274,17 +335,16 @@ class PortfolioManager:
         self._refresh_portfolio()
 
         for position in list(self.bridge.current_portfolio):
-            pnl_ratio = self._normalized_pnl_ratio(position)
-            pnl_raw = float(position.pnl_percent)
+            pnl_ratio = float(position.pnl_ratio)
 
             if pnl_ratio >= self.take_profit_pct:
                 self._exit_position(position, "TAKE-PROFIT", self.take_profit_pct,
-                                    {"pnl_percent": pnl_raw}, log_func)
+                                    {"pnl_ratio": pnl_ratio}, log_func)
                 continue
 
             if pnl_ratio <= self.stop_loss_pct:
                 self._exit_position(position, "STOP-LOSS", self.stop_loss_pct,
-                                    {"pnl_percent": pnl_raw}, log_func)
+                                    {"pnl_ratio": pnl_ratio}, log_func)
                 continue
 
             estimated_hold_ev = self._position_live_ev(position)

@@ -240,11 +240,10 @@ class TradeExecutor:
                 if current_price <= 0.0:
                     current_price = initial_price
 
-                pnl_percent = (
-                    ((current_price - initial_price) / initial_price) * 100
+                pnl_ratio = (
+                    (current_price - initial_price) / initial_price
                     if initial_price > 0 else 0.0
                 )
-                live_ev = pnl_percent / 100.0 if abs(pnl_percent) >= 1.0 else pnl_percent
 
                 positions.append(Position(
                     market_id=str(
@@ -256,9 +255,9 @@ class TradeExecutor:
                     current_price=current_price,
                     shares=shares,
                     value=value,
-                    pnl_percent=pnl_percent,
+                    pnl_ratio=pnl_ratio,
                     side=str(raw.get("outcome") or raw.get("side") or "UNKNOWN"),
-                    live_ev=float(live_ev),
+                    live_ev=float(pnl_ratio),
                 ))
         except Exception as exc:
             logging.warning(f"Could not parse open positions: {exc}")

@@ -135,6 +135,14 @@ class PolymarketScannerHunter:
         self.min_ev = float(config.min_ev)
         self.seen_markets: dict = {}
 
+    def get_hunter_for_asset_type(self, asset_type: str):
+        """Return the sub-hunter whose topic matches asset_type, or None."""
+        prefix = asset_type.split("::")[0].strip().lower()
+        for h in self.hunters:
+            if h.get_topic_type().lower() == prefix:
+                return h
+        return None
+
     # ------------------------------------------------------------------
     # Cooldown cache
     # ------------------------------------------------------------------
