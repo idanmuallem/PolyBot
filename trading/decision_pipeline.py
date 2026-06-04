@@ -45,7 +45,6 @@ class SequentialTradingPipeline:
         self.config = TradingConfig.from_env()
         self.loop_delay = float(delay) if delay is not None else float(self.config.loop_delay_seconds)
         self.min_ev_threshold = float(self.config.min_ev)
-        self.allocation_fraction = 0.10
         self.max_bet_size_usd = float(self.config.max_bet_size_usd)
         self.safe_minimum = 1.0
 
@@ -244,7 +243,7 @@ class SequentialTradingPipeline:
                 "price_no": round(1.0 - candidate.price_yes, 4),
             })
 
-        target_bet = total_equity * self.allocation_fraction
+        target_bet = total_equity * candidate.kelly_size
         desired_bet = min(target_bet, self.max_bet_size_usd)
 
         budget_bet, budget_ok = self.budget_manager.check_and_cap_bet(candidate.kelly_size)
@@ -337,7 +336,6 @@ class SequentialTradingPipeline:
                 "bet_usd": round(float(approved_bet), 2),
                 "executed": bool(executed),
                 "total_equity": round(float(total_equity), 4),
-                "allocation_fraction": self.allocation_fraction,
                 "max_bet_size_usd": round(float(self.max_bet_size_usd), 2),
                 "target_bet_unclamped": round(float(risk_context.get("target_bet", 0.0)), 2),
                 "target_bet_usd": round(float(approved_bet), 2),
