@@ -197,7 +197,7 @@ class PortfolioManager:
                 except Exception:
                     pass
 
-        return float(getattr(position, "pnl_ratio", 0.0) or 0.0)
+        return float(getattr(position, "live_ev", None) or getattr(position, "pnl_ratio", 0.0) or 0.0)
 
     def _apply_sale_to_bridge(self, position_value: float):
         updated_cash = float(self.bridge.current_balance) + max(0.0, float(position_value))
