@@ -24,7 +24,6 @@ class TradeSignal:
     expected_value: float  # (fair - price) / price
     kelly_size: float      # fraction of bankroll to risk
     is_tradable: bool      # meets EV threshold and positive kelly
-    realized_pnl: float = 0.0
 
 
 @dataclass

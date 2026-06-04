@@ -94,7 +94,7 @@ class SequentialTradingPipeline:
     def _reject(self, level: str, candidate: CandidateTrade, payload: dict):
         """Log a rejection, cool down the market, and signal the pipeline to skip."""
         self.log_func(level, candidate.asset_type, candidate.token_id, payload)
-        self.hunter.mark_seen(candidate.token_id)
+        self.hunter.add_to_cooldown(candidate.token_id)
         return 0.0, None
 
     # ------------------------------------------------------------------
@@ -139,7 +139,7 @@ class SequentialTradingPipeline:
                 pos_token = str(getattr(position, "asset_id", getattr(position, "token_id", "")))
                 if pos_token == token_id:
                     self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_owned_in_portfolio"})
-                    self.hunter.mark_seen(token_id)
+                    self.hunter.add_to_cooldown(token_id)
                     return None
 
         self.bridge.status = f"Scanning {asset_type}: {question[:60]}..."
@@ -158,7 +158,7 @@ class SequentialTradingPipeline:
                 "price_floor": PRICE_FLOOR,
                 "price_ceiling": PRICE_CEILING,
             })
-            self.hunter.mark_seen(token_id)
+            self.hunter.add_to_cooldown(token_id)
             return None
 
         live_truth = hunter.get_live_truth(market)
@@ -347,7 +347,7 @@ class SequentialTradingPipeline:
                 "expiry_date": str(getattr(candidate.market, "expiry_date", "") or ""),
             })
 
-        self.hunter.mark_seen(candidate.token_id)
+        self.hunter.add_to_cooldown(candidate.token_id)
 
     async def run_forever(self):
         while True:

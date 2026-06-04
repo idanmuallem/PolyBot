@@ -1,5 +1,4 @@
-from collections import defaultdict
-import collections
+from collections import defaultdict, deque
 
 import streamlit as st
 
@@ -35,7 +34,7 @@ class DataBridge:
         self.level_counts = defaultdict(int)
         self.ev_samples = []
         self.last_summary_at = 0
-        self.terminal_logs = collections.deque(maxlen=20)
+        self.terminal_logs = deque(maxlen=20)
         self.seen_markets = {}
 
 

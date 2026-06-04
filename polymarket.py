@@ -5,7 +5,6 @@ Polymarket module: API client + market scanner/coordinator.
 - PolymarketScannerHunter : coordinator that runs discovery and pricing passes across hunters.
 """
 
-import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -160,8 +159,6 @@ class PolymarketScannerHunter:
             self.seen_markets[str(market_id)] = time.time()
             print(f"[CACHE] Added {market_id} to cooldown.")
 
-    def mark_seen(self, market_id: str):
-        self.add_to_cooldown(market_id)
 
     # ------------------------------------------------------------------
     # Discovery

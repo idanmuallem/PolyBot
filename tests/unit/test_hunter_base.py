@@ -178,7 +178,7 @@ def test_cooldown_cache_expires_after_600_seconds():
     assert "tok_old" not in active
 
 
-def test_mark_seen_adds_to_cooldown():
+def test_add_to_cooldown():
     from polymarket import PolymarketScannerHunter
     from core.trading_config import TradingConfig
     from core.bridge import DataBridge
@@ -188,5 +188,5 @@ def test_mark_seen_adds_to_cooldown():
     executor = MagicMock()
 
     scanner = PolymarketScannerHunter(bridge=bridge, executor=executor, config=config)
-    scanner.mark_seen("new_tok")
+    scanner.add_to_cooldown("new_tok")
     assert "new_tok" in scanner.seen_markets
