@@ -320,7 +320,8 @@ class SequentialTradingPipeline:
             self.budget_manager.record_trade(float(approved_bet))
             self.spent_today = float(self.budget_manager.total_spent_today)
             self._set_spend(self.spent_today)
-            self._set_cash(max(0.0, float(self.bridge.current_balance) - float(approved_bet)))
+            if not self.executor.dry_run:
+                self._set_cash(max(0.0, float(self.bridge.current_balance) - float(approved_bet)))
 
             total_equity = self._total_equity()
 

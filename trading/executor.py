@@ -429,7 +429,6 @@ class TradeExecutor:
             "market_price": execution_price,
             "fair_value": execution_fair_value,
             "ev": round(ev, 4),
-            "position_size": shares,
             "bet_amount_usd": bet_amount_usd,
             "shares": shares,
             "side": execution_side,
