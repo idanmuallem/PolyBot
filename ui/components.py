@@ -1,8 +1,25 @@
+import json
 from dataclasses import asdict
 
 import pandas as pd
 import streamlit as st
-from streamlit_echarts import st_echarts
+import streamlit.components.v1 as components
+
+_ECHARTS_CDN = "https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"
+
+
+def _echarts(options: dict, height: int = 350) -> None:
+    opts_json = json.dumps(options, ensure_ascii=False)
+    html = f"""
+    <script src="{_ECHARTS_CDN}"></script>
+    <div id="c" style="width:100%;height:{height}px;"></div>
+    <script>
+      var chart = echarts.init(document.getElementById('c'), null, {{renderer:'canvas'}});
+      chart.setOption({opts_json});
+      window.addEventListener('resize', function(){{ chart.resize(); }});
+    </script>
+    """
+    components.html(html, height=height + 20)
 
 
 def render_ev_chart(bridge):
@@ -17,16 +34,15 @@ def render_ev_chart(bridge):
         for x in items
     ]
     evs = [round(x["ev"], 4) for x in items]
-
     bar_data = [
         {"value": ev, "itemStyle": {"color": "#22c55e" if ev > 0 else "#ef4444"}}
         for ev in evs
     ]
 
-    options = {
+    _echarts({
         "backgroundColor": "transparent",
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": "3%", "right": "6%", "bottom": "3%", "containLabel": True},
+        "grid": {"left": "2%", "right": "6%", "top": "4%", "bottom": "4%", "containLabel": True},
         "xAxis": {
             "type": "value",
             "axisLabel": {"color": "#94a3b8"},
@@ -43,12 +59,11 @@ def render_ev_chart(bridge):
             "markLine": {
                 "silent": True,
                 "data": [{"xAxis": 0}],
-                "lineStyle": {"color": "#64748b", "type": "dashed"},
+                "lineStyle": {"color": "#475569", "type": "dashed"},
                 "label": {"show": False},
             },
         }],
-    }
-    st_echarts(options=options, height="380px")
+    }, height=380)
 
 
 def render_equity_curve(data_manager):
@@ -61,14 +76,10 @@ def render_equity_curve(data_manager):
     times = df["timestamp"].dt.strftime("%m-%d %H:%M").tolist()
     values = df["total_equity"].round(2).tolist()
 
-    options = {
+    _echarts({
         "backgroundColor": "transparent",
-        "tooltip": {
-            "trigger": "axis",
-            "formatter": "{b}<br/>Equity: ${c}",
-            "axisPointer": {"type": "cross"},
-        },
-        "grid": {"left": "3%", "right": "4%", "bottom": "3%", "containLabel": True},
+        "tooltip": {"trigger": "axis", "formatter": "{b}<br/>Equity: ${c}", "axisPointer": {"type": "cross"}},
+        "grid": {"left": "2%", "right": "4%", "top": "4%", "bottom": "8%", "containLabel": True},
         "xAxis": {
             "type": "category",
             "data": times,
@@ -90,8 +101,7 @@ def render_equity_curve(data_manager):
             "itemStyle": {"color": "#22c55e"},
             "areaStyle": {
                 "color": {
-                    "type": "linear",
-                    "x": 0, "y": 0, "x2": 0, "y2": 1,
+                    "type": "linear", "x": 0, "y": 0, "x2": 0, "y2": 1,
                     "colorStops": [
                         {"offset": 0, "color": "rgba(34,197,94,0.30)"},
                         {"offset": 1, "color": "rgba(34,197,94,0.00)"},
@@ -99,8 +109,7 @@ def render_equity_curve(data_manager):
                 }
             },
         }],
-    }
-    st_echarts(options=options, height="300px")
+    }, height=300)
 
 
 def render_activity_chart(bridge):
@@ -128,10 +137,10 @@ def render_activity_chart(bridge):
         for lbl in labels
     ]
 
-    options = {
+    _echarts({
         "backgroundColor": "transparent",
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": "3%", "right": "4%", "bottom": "3%", "containLabel": True},
+        "grid": {"left": "2%", "right": "4%", "top": "4%", "bottom": "10%", "containLabel": True},
         "xAxis": {
             "type": "category",
             "data": labels,
@@ -144,8 +153,7 @@ def render_activity_chart(bridge):
             "splitLine": {"lineStyle": {"color": "#1e293b"}},
         },
         "series": [{"type": "bar", "data": bar_data, "barMaxWidth": 50}],
-    }
-    st_echarts(options=options, height="260px")
+    }, height=260)
 
 
 def render_positions(bridge):
