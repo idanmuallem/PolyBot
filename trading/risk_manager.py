@@ -1,25 +1,10 @@
-import json
 import os
 import sqlite3
 
+from core.utils import parse_payload as _parse_payload
 
-_DB_CANDIDATES = ["/app/trades.db", "trades.db"]
 
-
-def _parse_payload(payload_value) -> dict:
-    if isinstance(payload_value, dict):
-        return payload_value
-    text = str(payload_value or "").strip()
-    if not text:
-        return {}
-    try:
-        return json.loads(text)
-    except Exception:
-        try:
-            import ast
-            return ast.literal_eval(text)
-        except Exception:
-            return {}
+_DB_CANDIDATES = ["trades.db", "/app/trades.db"]
 
 
 def _db_path() -> str:
@@ -133,7 +118,10 @@ class PortfolioManager:
         return max(0.0, float(position_value)) if sold else 0.0
 
     def _position_live_ev(self, position) -> float:
-        return float(getattr(position, "live_ev", None) or getattr(position, "pnl_ratio", 0.0) or 0.0)
+        live_ev = getattr(position, "live_ev", None)
+        if live_ev is not None:
+            return float(live_ev)
+        return float(getattr(position, "pnl_ratio", 0.0) or 0.0)
 
     def _apply_sale_to_bridge(self, position_value: float):
         updated_cash = float(self.bridge.current_balance) + max(0.0, float(position_value))
@@ -142,10 +130,10 @@ class PortfolioManager:
 
     def _exit_position(self, position, level: str, threshold: float, extra: dict, log_func) -> bool:
         """Sell a position and log the exit. Returns True if sold."""
-        token_id = position.token_id
-        shares = float(position.shares)
-        current_price = float(position.current_price)
-        position_value = float(getattr(position, "value", shares * current_price))
+        token_id = str(self._position_field(position, "token_id", "") or "")
+        shares = float(self._position_field(position, "shares", 0.0) or 0.0)
+        current_price = float(self._position_field(position, "current_price", 0.0) or 0.0)
+        position_value = float(self._position_field(position, "value", shares * current_price) or 0.0)
 
         sold = self.executor.sell_position(token_id, shares, current_price, log_func)
         if sold:
@@ -271,7 +259,7 @@ class PortfolioManager:
         self._refresh_portfolio()
 
         for position in list(self.bridge.current_portfolio):
-            pnl_ratio = float(position.pnl_ratio)
+            pnl_ratio = float(self._position_field(position, "pnl_ratio", 0.0) or 0.0)
 
             if pnl_ratio >= self.take_profit_pct:
                 self._exit_position(position, "TAKE-PROFIT", self.take_profit_pct,

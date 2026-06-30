@@ -192,6 +192,12 @@ class BasePolymarketHunter(BaseHunter):
                                 f"{event.get('title', '')} - {market.get('groupItemTitle', '')}".strip(" -")
                                 or market.get("question", "unknown")
                             )
+                            expiry_date = (
+                                market.get("endDateIso")
+                                or market.get("endDate")
+                                or event.get("endDate")
+                                or None
+                            )
                             best_market = MarketData(
                                 market_id=market_id,
                                 asset_type=f"{self.get_topic_type()}::{keyword}",
@@ -200,6 +206,7 @@ class BasePolymarketHunter(BaseHunter):
                                 market_name=market_name,
                                 initial_price=current_price,
                                 volume=volume,
+                                expiry_date=expiry_date,
                                 no_market_id=no_market_id,
                             )
                             print(

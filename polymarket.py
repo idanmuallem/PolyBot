@@ -6,7 +6,6 @@ Polymarket module: API client + market scanner/coordinator.
 """
 
 import time
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from curl_cffi import requests as crequests
@@ -21,10 +20,8 @@ except Exception:
     BalanceAllowanceParams = Any  # type: ignore
     CLOB_IMPORT_OK = False
 
-from brains import get_brain_for_asset_type
 from brains.base import calculate_tte
 from core.models import MarketData
-from hunters.base import BasePolymarketHunter
 from hunters.crypto import CryptoHunter
 
 
@@ -207,66 +204,3 @@ class PolymarketScannerHunter:
 
         return None, None
 
-    # ------------------------------------------------------------------
-    # Pricing
-    # ------------------------------------------------------------------
-
-    def fetch_order_book(self, market: MarketData) -> dict:
-        """Fetch a market orderbook snapshot (midpoint proxy)."""
-        return {
-            "token_id": market.market_id,
-            "mid_price": float(market.initial_price),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    def prepare_market_signal(self, market: MarketData, hunter, log_func):
-        """Price and evaluate one market; return the execution context or None."""
-        token_id = market.market_id
-        asset_type = market.asset_type
-        question = market.market_name
-
-        self.bridge.status = f"🎯 {asset_type}: {question[:60]}..."
-        self.bridge.market_question = question
-        self.bridge.market_asset_type = asset_type
-        self.bridge.current_token_id = token_id
-
-        order_book = self.fetch_order_book(market)
-        poly_price = float(order_book.get("mid_price", market.initial_price))
-        self.bridge.market_poly = poly_price
-
-        if poly_price < BasePolymarketHunter.PRICE_FLOOR or poly_price > BasePolymarketHunter.PRICE_CEILING:
-            log_func(
-                "FILTERED", asset_type, token_id,
-                {
-                    "market_name": question,
-                    "reason": "price out of hunter bounds",
-                    "poly_price": round(poly_price, 4),
-                    "price_floor": BasePolymarketHunter.PRICE_FLOOR,
-                    "price_ceiling": BasePolymarketHunter.PRICE_CEILING,
-                },
-            )
-            self.add_to_cooldown(token_id)
-            return None
-
-        live_truth = hunter.get_live_truth(market)
-        if live_truth is None:
-            log_func("SCAN-SKIP", asset_type, token_id, {"reason": "live_truth unavailable"})
-            return None
-
-        self.bridge.market_actual = live_truth
-        brain = get_brain_for_asset_type(asset_type)
-        signal = brain.evaluate(market, live_truth, min_ev=self.min_ev)
-        model_used = getattr(brain, "last_model_used", "unknown")
-
-        self.bridge.forecast = signal.fair_value
-        self.bridge.ev = signal.expected_value
-
-        return {
-            "market": market,
-            "token_id": token_id,
-            "asset_type": asset_type,
-            "question": question,
-            "signal": signal,
-            "model_used": model_used,
-            "poly_price": poly_price,
-        }

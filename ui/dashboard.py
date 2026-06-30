@@ -122,8 +122,10 @@ def _ensure_engine_started_once() -> None:
             loop.run_until_complete(run_market_monitor(bridge, _log_event))
         except Exception as exc:
             import traceback
+            import tempfile
             bridge.terminal_logs.appendleft(f"[ENGINE-CRASH] {exc}")
-            with open("C:/app/engine_crash.log", "a", encoding="utf-8") as f:
+            log_path = Path(tempfile.gettempdir()) / "polybot_crash.log"
+            with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"[ENGINE-CRASH] {exc}\n{traceback.format_exc()}\n")
 
     bridge._engine_thread = threading.Thread(target=_runner, daemon=True, name="polybot-engine")

@@ -15,7 +15,6 @@ class BudgetManager:
 
     def _sync_bridge(self):
         self.bridge.daily_spend = self.total_spent_today
-        self.bridge.current_balance = max(self.base_balance - self.total_spent_today, 0.0)
         self.bridge.watch_only = self.watch_only
 
     def get_remaining_budget(self) -> float:
