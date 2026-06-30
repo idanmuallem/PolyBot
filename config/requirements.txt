@@ -1,6 +1,7 @@
 # Runtime dependencies for PolyBot
 py-clob-client==0.34.6
 streamlit==1.54.0
+streamlit-echarts==0.4.0
 pandas==2.3.3
 plotly==5.24.1
 scipy==1.17.0

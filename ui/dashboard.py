@@ -22,7 +22,7 @@ from trading.decision_pipeline import run_market_monitor
 import ui.data_manager as data_manager
 from polymarket import PolymarketClient
 from core.bridge import get_bridge
-from ui.components import render_equity_curve, render_ev_chart, render_positions
+from ui.components import render_activity_chart, render_equity_curve, render_ev_chart, render_positions
 
 st.set_page_config(page_title="PolyBot Quant Pro", page_icon="🛰️", layout="wide")
 bridge = get_bridge()
@@ -260,6 +260,8 @@ def _render_hunter_view() -> None:
         _render_hunter_history_table()
     with col2:
         _render_compact_terminal_feed()
+    st.markdown("#### Activity Breakdown")
+    render_activity_chart(bridge)
 
 
 # ---------------------------------------------------------------------------
