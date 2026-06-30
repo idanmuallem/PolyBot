@@ -17,7 +17,20 @@ _ACTIVE_DB_PATH: str | None = None
 # Payload parsing
 # ---------------------------------------------------------------------------
 
-from core.utils import parse_payload as _parse_payload_value
+def _parse_payload_value(payload_value) -> dict:
+    if isinstance(payload_value, dict):
+        return payload_value
+    text = str(payload_value or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        try:
+            import ast
+            return ast.literal_eval(text)
+        except Exception:
+            return {}
 
 
 # ---------------------------------------------------------------------------
