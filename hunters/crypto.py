@@ -53,7 +53,12 @@ class CryptoHunter(BasePolymarketHunter):
     def extract_strike(self, text: str, anchor: float) -> Optional[float]:
         return extract_crypto_strike(text, anchor)
 
-    def get_search_aliases(self) -> list:
+    @staticmethod
+    def get_search_aliases() -> list:
+        # Static (not tied to a live CCXTDataClient/instance) so callers that
+        # only need the keyword list — e.g. EventSumStrategy's crypto-first
+        # pass (see trading/strategies/event_sum.py) — can use it as the one
+        # source of truth without instantiating a full CryptoHunter.
         return ["bitcoin", "btc", "ethereum", "eth", "solana", "sol"]
 
     def _resolve_keyword(self, anchor, event, market, current_keyword, matched_alias):

@@ -388,5 +388,11 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `WANG_MIN_EDGE` | `0.05` | Minimum \|Wang edge\| (probability points) to consider a trade |
 | `KELLY_FRACTION` | `0.25` | Fraction of full Kelly used for position sizing |
 | `MAX_DRAWDOWN_PCT` | `0.20` | Equity drop from peak that pauses new entries (exits still run) |
+| `ARBITRAGE_DAILY_LIMIT_USD` | `50.0` | Daily USD budget reserved for the arbitrage strategy path — independent of `CRYPTO_DAILY_LIMIT_USD`, so one path can't starve the other's spend on the shared wallet balance |
+| `ARBITRAGE_MAX_DAILY_TRADES` | `50` | Daily trade-count cap for the arbitrage strategy path |
+| `CRYPTO_DAILY_LIMIT_USD` | `50.0` | Daily USD budget reserved for the crypto/model-driven strategy path |
+| `CRYPTO_MAX_DAILY_TRADES` | `50` | Daily trade-count cap for the crypto/model-driven strategy path |
+| `ARBITRAGE_ORDER_TIMEOUT_SECONDS` | `60` | Seconds to wait for each arbitrage leg's limit order to fill before cancelling the whole group |
+| `ARBITRAGE_CRYPTO_FIRST` | `True` | Scan crypto event groups before general ones, so crypto gets first claim on the arbitrage budget |
 | `OPENWEATHER_API_KEY` | — | Required for WeatherHunter |
 | `FRED_API_KEY` | — | Required for EconomyHunter |

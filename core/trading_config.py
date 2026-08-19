@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from dataclasses import dataclass, fields
 
@@ -30,6 +31,31 @@ class TradingConfig:
 
     daily_limit_usd: float = DEFAULT_DAILY_LIMIT_USD
     max_bet_size_usd: float = DEFAULT_MAX_BET_SIZE_USD
+
+    # Per-strategy budget isolation (see trading/budget_manager.py): the
+    # arbitrage and crypto-brain paths draw from the same wallet cash pool
+    # but track spend/trade-count independently, so one can't starve the
+    # other. daily_limit_usd/max_daily_trades above remain the global
+    # ceiling — the sum of these should not exceed them (from_env/from_file
+    # log a warning, not an error, if it does).
+    arbitrage_daily_limit_usd: float = 50.0
+    arbitrage_max_daily_trades: int = 50
+    crypto_daily_limit_usd: float = 50.0
+    crypto_max_daily_trades: int = 50
+
+    # How long to let each arbitrage leg's limit order sit before giving up
+    # (see TradeExecutor.execute_arbitrage_group). Zero fills on any leg
+    # after this many seconds cancels the whole group — no arbitrage exists
+    # without every leg.
+    arbitrage_order_timeout_seconds: float = 60.0
+
+    # Crypto event groups are higher-volume/more liquid than the general
+    # Polymarket catalog, so EventSumStrategy scans them first and spends
+    # whatever arbitrage budget remains on everything else (see
+    # trading/strategies/event_sum.py). False restores the original
+    # single-pass scan order, for A/B comparison during dry-run.
+    arbitrage_crypto_first: bool = True
+
     bankroll_usd: float = 1000.0
     min_trading_balance: float = 5.0
     dry_run: bool = True
@@ -62,6 +88,28 @@ class TradingConfig:
     kelly_fraction: float = 0.25  # quarter-Kelly — full Kelly is optimal in expectation but has extreme variance
     max_drawdown_pct: float = 0.20  # equity drop from peak that pauses new entries (position exits still allowed)
 
+    def _warn_if_strategy_budgets_exceed_ceiling(self) -> None:
+        """Per-strategy budgets are independent allocations, not a hard sum
+        constraint — but if they add up to more than the global ceiling,
+        that's very likely a misconfiguration, so warn (don't crash)."""
+        strategy_usd_total = self.arbitrage_daily_limit_usd + self.crypto_daily_limit_usd
+        if strategy_usd_total > self.daily_limit_usd:
+            logging.warning(
+                "Per-strategy daily limits (arbitrage=$%.2f + crypto=$%.2f = $%.2f) exceed "
+                "the global DAILY_LIMIT_USD ceiling ($%.2f)",
+                self.arbitrage_daily_limit_usd, self.crypto_daily_limit_usd,
+                strategy_usd_total, self.daily_limit_usd,
+            )
+
+        strategy_trades_total = self.arbitrage_max_daily_trades + self.crypto_max_daily_trades
+        if strategy_trades_total > self.max_daily_trades:
+            logging.warning(
+                "Per-strategy max daily trades (arbitrage=%d + crypto=%d = %d) exceed the "
+                "global MAX_DAILY_TRADES ceiling (%d)",
+                self.arbitrage_max_daily_trades, self.crypto_max_daily_trades,
+                strategy_trades_total, self.max_daily_trades,
+            )
+
     @classmethod
     def from_env(cls) -> "TradingConfig":
         # Load local .env values when running outside Docker/AWS. This is a
@@ -69,7 +117,7 @@ class TradingConfig:
         # process-env config — not on import of this module.
         load_dotenv("config/.env")
 
-        return cls(
+        cfg = cls(
             min_ev=float(os.getenv("MIN_EV", "0.30")),
             min_tte_minutes=int(os.getenv("MIN_TTE_MINUTES", "60")),
             max_tte_days=int(os.getenv("MAX_TTE_DAYS", "180")),
@@ -94,7 +142,15 @@ class TradingConfig:
             wang_min_edge=float(os.getenv("WANG_MIN_EDGE", "0.05")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.20")),
+            arbitrage_daily_limit_usd=float(os.getenv("ARBITRAGE_DAILY_LIMIT_USD", "50.0")),
+            arbitrage_max_daily_trades=int(os.getenv("ARBITRAGE_MAX_DAILY_TRADES", "50")),
+            crypto_daily_limit_usd=float(os.getenv("CRYPTO_DAILY_LIMIT_USD", "50.0")),
+            crypto_max_daily_trades=int(os.getenv("CRYPTO_MAX_DAILY_TRADES", "50")),
+            arbitrage_order_timeout_seconds=float(os.getenv("ARBITRAGE_ORDER_TIMEOUT_SECONDS", "60")),
+            arbitrage_crypto_first=_env_bool("ARBITRAGE_CRYPTO_FIRST", "True"),
         )
+        cfg._warn_if_strategy_budgets_exceed_ceiling()
+        return cfg
 
     @classmethod
     def from_file(cls, path: str) -> "TradingConfig":
@@ -123,4 +179,6 @@ class TradingConfig:
             for name in field_types
             if name in data and data[name] is not None
         }
-        return cls(**kwargs)
+        cfg = cls(**kwargs)
+        cfg._warn_if_strategy_budgets_exceed_ceiling()
+        return cfg

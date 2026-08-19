@@ -218,6 +218,9 @@ class SequentialTradingPipeline:
             self._set_spend(0.0)
             self.bridge.start_of_day_equity = 0.0
             self.budget_manager.total_spent_today = 0.0
+            self.budget_manager.spent_by_strategy = {}
+            self.budget_manager.trades_by_strategy = {}
+            self.executor.reset_daily_count()
 
     # ------------------------------------------------------------------
     # Strategy scan — constraint-based arbitrage, independent of the
@@ -282,20 +285,54 @@ class SequentialTradingPipeline:
                 continue
 
             for group_id, group_signals in self._group_signals(signals).items():
-                self._execute_strategy_group(strategy, group_id, group_signals)
+                await self._execute_strategy_group(strategy, group_id, group_signals)
 
-    def _execute_strategy_group(self, strategy: Strategy, group_id: str, signals: list):
+    def _group_has_leg_beyond_max_tte(self, signals: list, group_id: str, asset_type: str, log_func) -> bool:
+        """TTE filter: skip the whole arbitrage group if any single leg's
+        resolution date is farther out than config.max_tte_days.
+
+        You can't do partial arbitrage with missing legs, so one over-long
+        leg voids the whole group — that capital would otherwise sit locked
+        for months waiting on just that one outcome to resolve.
+        """
+        max_tte_days = float(self.config.max_tte_days)
+        for signal in signals:
+            days_to_expiry = calculate_tte(getattr(signal.market, "expiry_date", None))
+            if days_to_expiry > max_tte_days:
+                log_func("FILTERED", asset_type, group_id, {
+                    "reason": "tte_exceeds_max",
+                    "group_id": group_id,
+                    "leg_token_id": signal.market.market_id,
+                    "leg_expiry": str(getattr(signal.market, "expiry_date", None)),
+                    "days_to_expiry": round(days_to_expiry, 2),
+                    "max_tte_days": max_tte_days,
+                })
+                return True
+        return False
+
+    @staticmethod
+    def _leg_token_id(signal) -> str:
+        return (
+            signal.market.market_id if signal.side == "YES"
+            else str(getattr(signal.market, "no_market_id", None) or signal.market.market_id)
+        )
+
+    async def _execute_strategy_group(self, strategy: Strategy, group_id: str, signals: list):
         """Execute every leg of one strategy opportunity (e.g. every outcome
         of one event_sum arb) through the same TradeExecutor used by
-        model-driven trades, via the lower-level execute_trade() rather than
-        evaluate_and_execute(): the strategy already vetted the trade's
-        profitability itself (its own min_edge, not config.min_ev), and its
-        leg prices are expected to sit outside the single-market
+        model-driven trades, via TradeExecutor.execute_arbitrage_group()
+        rather than evaluate_and_execute(): the strategy already vetted the
+        trade's profitability itself (its own min_edge, not config.min_ev),
+        and its leg prices are expected to sit outside the single-market
         PRICE_FLOOR/PRICE_CEILING band by design.
 
-        Best-effort, not atomic: if a leg's order fails, the rest still
-        attempt to fill (same as oracle3's contrib strategy) — real
-        atomicity would require a settlement layer this pipeline doesn't have.
+        Each leg is placed as a limit order and given up to
+        config.arbitrage_order_timeout_seconds to fill (see
+        TradeExecutor.execute_arbitrage_group). Best-effort, not atomic: if
+        every leg gets at least one fill the group is kept (surplus fills
+        beyond the smallest leg become bonus directional exposure); if any
+        leg gets zero fills, the rest are cancelled — real atomicity would
+        require a settlement layer this pipeline doesn't have.
         """
         if not signals:
             return
@@ -303,22 +340,40 @@ class SequentialTradingPipeline:
         tagged_log = self._tag_log_func(strategy.strategy_type)
         asset_type = signals[0].market.asset_type
 
+        if self._group_has_leg_beyond_max_tte(signals, group_id, asset_type, tagged_log):
+            return
+
         total_cost = sum(float(s.bet_amount_usd) for s in signals)
         cash_balance = float(self.bridge.current_balance)
-        remaining_budget = float(self.budget_manager.get_remaining_budget())
+        remaining_budget = float(self.budget_manager.get_remaining_budget("arbitrage"))
 
-        if total_cost > cash_balance or total_cost > remaining_budget:
+        # Distinct reject reasons (Point 5): "can't afford it" (wallet cash)
+        # vs "budget exhausted" (this strategy's own daily allocation) are
+        # different failure modes worth telling apart in the log/analytics
+        # layer, so they're no longer folded into one generic reason.
+        if total_cost > cash_balance:
             tagged_log("REJECTED", asset_type, group_id, {
-                "reason": "insufficient_cash_or_budget_for_all_legs",
+                "reason": "insufficient_cash",
                 "group_id": group_id,
                 "n_legs": len(signals),
                 "total_cost": round(total_cost, 4),
                 "cash_balance": round(cash_balance, 4),
+            })
+            return
+
+        if total_cost > remaining_budget:
+            tagged_log("REJECTED", asset_type, group_id, {
+                "reason": "insufficient_budget",
+                "group_id": group_id,
+                "n_legs": len(signals),
+                "total_cost": round(total_cost, 4),
                 "remaining_budget": round(remaining_budget, 4),
             })
             return
 
-        if self.executor.trade_count_today + len(signals) > self.config.max_daily_trades:
+        arbitrage_max_daily_trades = self.executor._strategy_max_daily_trades("arbitrage")
+        arbitrage_trades_today = self.executor.trades_by_strategy.get("arbitrage", 0)
+        if arbitrage_trades_today + len(signals) > arbitrage_max_daily_trades:
             tagged_log("REJECTED", asset_type, group_id, {
                 "reason": "daily_trade_limit_would_be_exceeded",
                 "group_id": group_id,
@@ -326,27 +381,34 @@ class SequentialTradingPipeline:
             })
             return
 
-        executed_legs = 0
+        legs = []
         for signal in signals:
             shares = math.floor((signal.bet_amount_usd / signal.price) * 100.0) / 100.0
             if shares <= 0:
                 continue
+            legs.append({
+                "token_id": self._leg_token_id(signal),
+                "price": signal.price,
+                "shares": shares,
+                "side": signal.side,
+                "bet_amount_usd": signal.bet_amount_usd,
+                "asset_type": signal.market.asset_type,
+                "no_token_id": getattr(signal.market, "no_market_id", None),
+                "group_id": group_id,
+            })
 
-            token_id = (
-                signal.market.market_id if signal.side == "YES"
-                else str(getattr(signal.market, "no_market_id", None) or signal.market.market_id)
-            )
+        result = await self.executor.execute_arbitrage_group(
+            legs=legs,
+            timeout_seconds=float(getattr(self.config, "arbitrage_order_timeout_seconds", 60.0)),
+            log_func=tagged_log,
+            strategy_tag="arbitrage",
+        )
 
-            executed = self.executor.execute_trade(
-                token_id=signal.market.market_id,
-                current_poly_price=signal.price,
-                shares=shares,
-                bet_amount=signal.bet_amount_usd,
-                asset_type=signal.market.asset_type,
-                side=signal.side,
-                no_token_id=getattr(signal.market, "no_market_id", None),
-                log_func=tagged_log,
-            )
+        executed_legs = 0
+        for signal in signals:
+            token_id = self._leg_token_id(signal)
+            filled_shares = float(result["fills"].get(token_id, 0.0))
+            executed = filled_shares > 0.0
 
             tagged_log("STRATEGY-LEG", signal.market.asset_type, token_id, {
                 "group_id": group_id,
@@ -355,15 +417,15 @@ class SequentialTradingPipeline:
                 "edge": round(signal.edge, 4),
                 "price": round(signal.price, 4),
                 "bet_usd": round(signal.bet_amount_usd, 2),
-                "shares": shares,
+                "shares": filled_shares,
                 "side": signal.side,
                 "executed": bool(executed),
             })
 
             if executed:
                 executed_legs += 1
-                self.executor.trade_count_today += 1
-                self.budget_manager.record_trade(float(signal.bet_amount_usd))
+                spent_usd = filled_shares * float(signal.price)
+                self.budget_manager.record_trade(spent_usd, strategy_tag="arbitrage")
                 self.spent_today = float(self.budget_manager.total_spent_today)
                 self._set_spend(self.spent_today)
 
@@ -372,6 +434,9 @@ class SequentialTradingPipeline:
             "strategy_type": strategy.strategy_type,
             "n_legs": len(signals),
             "executed_legs": executed_legs,
+            "success": result["success"],
+            "arb_sets": result["arb_sets"],
+            "surplus": result["surplus"],
             "edge": round(signals[0].edge, 4),
             "total_cost": round(total_cost, 4),
         })
@@ -574,13 +639,15 @@ class SequentialTradingPipeline:
         target_bet = candidate.kelly_bet_usd
         desired_bet = min(target_bet, self.max_bet_size_usd)
 
-        budget_bet, budget_ok = self.budget_manager.cap_to_remaining_budget(desired_bet)
+        budget_bet, budget_ok = self.budget_manager.cap_to_remaining_budget(desired_bet, strategy_tag="crypto")
         if not budget_ok:
             return self._reject("REJECTED", candidate, {
                 "market_name": candidate.question,
                 "reason": "daily_limit_reached",
                 "kelly_size": round(candidate.kelly_size, 4),
                 "kelly_bet_usd": round(candidate.kelly_bet_usd, 4),
+                "strategy_daily_limit_usd": round(float(self.budget_manager._strategy_limit("crypto")), 4),
+                "strategy_spent_today": round(float(self.budget_manager.spent_by_strategy.get("crypto", 0.0)), 4),
                 "daily_limit_usd": round(float(self.budget_manager.daily_limit_usd), 4),
                 "spent_today": round(float(self.budget_manager.total_spent_today), 4),
             })
@@ -643,10 +710,11 @@ class SequentialTradingPipeline:
             bet_amount_usd=float(approved_bet),
             side=candidate.side,
             log_func=self.log_func,
+            strategy_tag="crypto",
         )
 
         if executed:
-            self.budget_manager.record_trade(float(approved_bet))
+            self.budget_manager.record_trade(float(approved_bet), strategy_tag="crypto")
             self.spent_today = float(self.budget_manager.total_spent_today)
             self._set_spend(self.spent_today)
             if not self.executor.dry_run:

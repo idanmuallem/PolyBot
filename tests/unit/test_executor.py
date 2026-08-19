@@ -1,4 +1,5 @@
-from unittest.mock import MagicMock
+import asyncio
+from unittest.mock import MagicMock, patch
 
 from core.models import MarketData
 from core.trading_config import TradingConfig
@@ -9,6 +10,12 @@ def _dry_config(**overrides):
         dry_run=True,
         min_ev=0.30,
         max_daily_trades=10,
+        # Per-strategy trade caps default to 50 each (core/trading_config.py);
+        # pin the "crypto" tag's cap to max_daily_trades here so pre-existing
+        # tests below — which exercise the default strategy_tag="crypto" and
+        # were written before per-strategy tracking existed — see the same
+        # ceiling as before.
+        crypto_max_daily_trades=10,
         bankroll_usd=1000.0,
         daily_limit_usd=15.0,
         max_bet_size_usd=3.0,
@@ -101,7 +108,7 @@ def test_ev_below_threshold_is_rejected():
 
 def test_daily_limit_blocks_trade():
     executor = _make_executor(max_daily_trades=10)
-    executor.trade_count_today = 10  # already at limit
+    executor.trades_by_strategy["crypto"] = 10  # already at limit
     market = _valid_market()
 
     log_calls = []
@@ -282,3 +289,117 @@ def test_get_open_positions_live_ev_normalization_at_boundary():
 def test_get_balance_dry_run_returns_configured_paper_balance():
     executor = _make_executor(paper_balance_usd=500.0)
     assert executor.get_balance() == 500.0
+
+
+# ── execute_arbitrage_group (Phase 3: limit order timeout + partial fills) ──
+
+def _live_executor(**config_overrides):
+    """A TradeExecutor wired for the "live" branch of execute_arbitrage_group
+    without a real ClobClient — client is a bare MagicMock so _submit_order/
+    _get_order_filled_shares/cancel can be patched directly."""
+    executor = _make_executor(dry_run=False, **config_overrides)
+    executor.client = MagicMock()
+    return executor
+
+
+def _mock_order_placement(fills_by_token: dict):
+    """Returns (fake_submit_order, fake_get_filled) matched by token_id via
+    a deterministic order_id, so tests can simulate arbitrary per-leg fills
+    without a real order book."""
+    def fake_submit_order(token_id, price, side, size):
+        return {"orderID": f"order_{token_id}"}
+
+    def fake_get_filled(order_id):
+        token_id = order_id.replace("order_", "")
+        return fills_by_token[token_id]
+
+    return fake_submit_order, fake_get_filled
+
+
+def test_execute_arbitrage_group_all_legs_fill_returns_success():
+    executor = _live_executor()
+    legs = [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
+        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES"},
+    ]
+    fake_submit, fake_get_filled = _mock_order_placement({"A": 3.0, "B": 2.0})
+
+    with patch.object(executor, "_submit_order", side_effect=fake_submit), \
+         patch.object(executor, "_get_order_filled_shares", side_effect=fake_get_filled):
+        result = asyncio.run(executor.execute_arbitrage_group(
+            legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
+        ))
+
+    assert result["success"] is True
+    assert result["arb_sets"] == 2.0  # min(3.0, 2.0)
+    assert result["unfilled"] == []
+    assert result["fills"] == {"A": 3.0, "B": 2.0}
+
+
+def test_execute_arbitrage_group_zero_fill_leg_cancels_remaining():
+    executor = _live_executor()
+    legs = [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
+        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES"},
+    ]
+    fake_submit, fake_get_filled = _mock_order_placement({"A": 3.0, "B": 0.0})
+
+    with patch.object(executor, "_submit_order", side_effect=fake_submit), \
+         patch.object(executor, "_get_order_filled_shares", side_effect=fake_get_filled):
+        result = asyncio.run(executor.execute_arbitrage_group(
+            legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
+        ))
+
+    assert result["success"] is False
+    assert result["arb_sets"] == 0
+    assert result["unfilled"] == ["B"]
+    # Both legs' resting orders get cancelled — no arbitrage without leg B.
+    assert executor.client.cancel.call_count == 2
+    cancelled_order_ids = {call.args[0] for call in executor.client.cancel.call_args_list}
+    assert cancelled_order_ids == {"order_A", "order_B"}
+
+
+def test_execute_arbitrage_group_uneven_fills_computes_surplus():
+    executor = _live_executor()
+    legs = [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
+        {"token_id": "B", "price": 0.30, "shares": 10.0, "side": "YES"},
+        {"token_id": "C", "price": 0.30, "shares": 5.0, "side": "YES"},
+    ]
+    fake_submit, fake_get_filled = _mock_order_placement({"A": 3.0, "B": 10.0, "C": 5.0})
+
+    with patch.object(executor, "_submit_order", side_effect=fake_submit), \
+         patch.object(executor, "_get_order_filled_shares", side_effect=fake_get_filled):
+        result = asyncio.run(executor.execute_arbitrage_group(
+            legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
+        ))
+
+    assert result["success"] is True
+    assert result["arb_sets"] == 3.0
+    assert result["surplus"] == {"B": 7.0, "C": 2.0}
+
+
+def test_execute_arbitrage_group_dry_run_simulates_full_fill_no_real_orders():
+    executor = _make_executor()  # default dry_run=True, client stays None
+    assert executor.client is None
+
+    legs = [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 1.0},
+        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES", "bet_amount_usd": 1.0},
+    ]
+    log_calls = []
+    result = asyncio.run(executor.execute_arbitrage_group(
+        legs=legs, timeout_seconds=60.0,
+        log_func=lambda level, *a, **kw: log_calls.append(level),
+    ))
+
+    assert result["success"] is True
+    assert result["fills"] == {"A": 3.0, "B": 2.0}
+    assert result["arb_sets"] == 2.0
+    assert result["surplus"] == {"A": 1.0}
+    # Simulated, not real: no client, and the per-leg DRY-RUN path fired
+    # (same as execute_trade()'s existing dry-run behavior) plus a clear
+    # group-level structure log.
+    assert executor.client is None
+    assert log_calls.count("DRY-RUN") == 2
+    assert "ARBITRAGE-FILL" in log_calls
