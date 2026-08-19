@@ -12,7 +12,11 @@ import ui.data_manager as data_manager
 from core.bridge import DataBridge
 from core.trading_config import TradingConfig
 from core.wallet_context import DATA_ROOT, WalletContext
-from trading.decision_pipeline import run_market_monitor
+from polymarket import PolymarketScannerHunter
+from trading.budget_manager import BudgetManager
+from trading.decision_pipeline import _default_log_func, run_market_monitor, sync_live_account_state
+from trading.executor import TradeExecutor
+from trading.risk_manager import PortfolioManager
 
 
 class WalletManager:
@@ -33,6 +37,35 @@ class WalletManager:
             db_path=db_path,
         )
         data_manager.init_db(db_path)
+
+        # Build this wallet's runtime components in dependency order and
+        # attach them to the context — WalletContext stays a plain
+        # container, the caller (here) builds and wires what it holds.
+        ctx.executor = TradeExecutor(config=ctx.config)
+        ctx.scanner = PolymarketScannerHunter(
+            bridge=ctx.bridge,
+            executor=ctx.executor,
+            config=ctx.config,
+        )
+        ctx.portfolio_manager = PortfolioManager(
+            bridge=ctx.bridge,
+            executor=ctx.executor,
+            config=ctx.config,
+            hunter=ctx.scanner,
+            db_path=ctx.db_path,
+        )
+
+        # Sync live balance before building BudgetManager so its
+        # initial_balance reflects the account's real collateral, not the
+        # DataBridge default of 0.0.
+        sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, _default_log_func(ctx))
+
+        ctx.budget_manager = BudgetManager(
+            bridge=ctx.bridge,
+            config=ctx.config,
+            initial_balance=float(ctx.bridge.current_balance),
+        )
+
         self.wallets[wallet_id] = ctx
         return ctx
 

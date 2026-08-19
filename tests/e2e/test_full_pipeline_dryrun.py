@@ -15,8 +15,28 @@ from core.models import MarketData
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
 from hunters.crypto import CryptoHunter
-from polymarket import PolymarketClient
+from polymarket import PolymarketClient, PolymarketScannerHunter
+from trading.budget_manager import BudgetManager
+from trading.decision_pipeline import sync_live_account_state
 from trading.executor import TradeExecutor
+from trading.risk_manager import PortfolioManager
+
+
+def _wire_ctx(ctx: WalletContext, log_func) -> None:
+    """Build and attach the four runtime components to ctx, in dependency
+    order, matching how ui/dashboard.py and core/wallet_manager.py wire a
+    real WalletContext. Must run with any TradeExecutor patches already
+    active, since it constructs a real TradeExecutor."""
+    ctx.executor = TradeExecutor(config=ctx.config)
+    ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
+    ctx.portfolio_manager = PortfolioManager(
+        bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
+        hunter=ctx.scanner, db_path=ctx.db_path,
+    )
+    sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
+    ctx.budget_manager = BudgetManager(
+        bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
+    )
 
 
 _DRY_CONFIG = TradingConfig(
@@ -97,6 +117,7 @@ async def test_single_pipeline_loop_dry_run(tmp_path):
          patch.object(CryptoHunter, "get_live_truth", return_value=97_000.0), \
          patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[]):
 
+        _wire_ctx(ctx, spy_log)
         pipeline = SequentialTradingPipeline(ctx=ctx, log_func=spy_log, delay=0.01)
 
         # Run the loop; TimeoutError is expected after 1 second
@@ -206,6 +227,7 @@ async def test_full_pipeline_loop_dry_run_wang_mode(tmp_path):
          patch.object(CryptoHunter, "get_live_truth", return_value=97_000.0), \
          patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[]):
 
+        _wire_ctx(ctx, spy_log)
         pipeline = SequentialTradingPipeline(ctx=ctx, log_func=spy_log, delay=0.01)
         assert pipeline.pricing_mode == "wang"
 

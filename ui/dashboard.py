@@ -18,9 +18,12 @@ import time
 import pandas as pd
 import streamlit as st
 
-from trading.decision_pipeline import run_market_monitor
+from trading.decision_pipeline import run_market_monitor, sync_live_account_state
+from trading.executor import TradeExecutor
+from trading.risk_manager import PortfolioManager
+from trading.budget_manager import BudgetManager
 import ui.data_manager as data_manager
-from polymarket import PolymarketClient
+from polymarket import PolymarketClient, PolymarketScannerHunter
 from core.bridge import get_bridge, DataBridge
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
@@ -150,8 +153,42 @@ def _ensure_engine_started_once(ctx: WalletContext) -> None:
 
     def _runner() -> None:
         asyncio.set_event_loop(loop)
+        log_func = _make_log_event(ctx)
         try:
-            loop.run_until_complete(run_market_monitor(ctx, _make_log_event(ctx)))
+            # Build this wallet's runtime components in dependency order and
+            # attach them to ctx. This runs here (in the background thread,
+            # only once — guarded by the early-return above) rather than in
+            # _ensure_engine_started_once itself, so nothing network-touching
+            # (CLOB auth in TradeExecutor.__init__, the live balance fetch
+            # below) blocks Streamlit's main thread. WalletContext stays a
+            # plain container — this is the one place that builds and wires
+            # what it holds.
+            ctx.executor = TradeExecutor(config=ctx.config)
+            ctx.scanner = PolymarketScannerHunter(
+                bridge=ctx.bridge,
+                executor=ctx.executor,
+                config=ctx.config,
+            )
+            ctx.portfolio_manager = PortfolioManager(
+                bridge=ctx.bridge,
+                executor=ctx.executor,
+                config=ctx.config,
+                hunter=ctx.scanner,
+                db_path=ctx.db_path,
+            )
+
+            # Sync live balance before building BudgetManager so its
+            # initial_balance reflects the account's real collateral, not
+            # the DB-restored snapshot from _bootstrap().
+            sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
+
+            ctx.budget_manager = BudgetManager(
+                bridge=ctx.bridge,
+                config=ctx.config,
+                initial_balance=float(ctx.bridge.current_balance),
+            )
+
+            loop.run_until_complete(run_market_monitor(ctx, log_func))
         except Exception as exc:
             import traceback
             import tempfile

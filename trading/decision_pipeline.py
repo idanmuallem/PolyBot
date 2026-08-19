@@ -19,11 +19,29 @@ from brains.base import calculate_tte
 from brains.pricing_engine import PricingEngine
 from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
-from polymarket import PolymarketClient, PolymarketScannerHunter
-from trading.budget_manager import BudgetManager
-from trading.executor import TradeExecutor
-from trading.risk_manager import PortfolioManager
+from polymarket import PolymarketClient
 from trading.strategies import EventSumStrategy, Strategy
+
+
+def sync_live_account_state(bridge, executor, portfolio_manager, log_func):
+    """Refresh live positions and collateral balance into bridge state.
+
+    Free function (not a pipeline method) so it can run before a
+    SequentialTradingPipeline exists — e.g. by a caller wiring up
+    WalletContext components, which needs a live balance to construct
+    BudgetManager with an accurate initial_balance.
+    """
+    try:
+        portfolio_manager._refresh_portfolio()
+    except Exception as exc:
+        log_func("SYNC-WARN", "Pipeline", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
+
+    try:
+        balance = float(executor.get_balance())
+        bridge.current_balance = balance
+        bridge.cash = balance
+    except Exception as exc:
+        log_func("SYNC-WARN", "Pipeline", "balance", {"reason": "balance_fetch_failed", "error": str(exc)})
 
 
 @dataclass
@@ -54,6 +72,15 @@ class CandidateTrade:
 
 class SequentialTradingPipeline:
     def __init__(self, ctx: WalletContext, log_func, delay: float | None = None):
+        if not all([ctx.executor, ctx.scanner, ctx.portfolio_manager, ctx.budget_manager]):
+            missing = [name for name, val in [
+                ("executor", ctx.executor),
+                ("scanner", ctx.scanner),
+                ("portfolio_manager", ctx.portfolio_manager),
+                ("budget_manager", ctx.budget_manager),
+            ] if val is None]
+            raise ValueError(f"WalletContext missing required components: {missing}")
+
         self.ctx = ctx
         self.bridge = ctx.bridge
         self.config = ctx.config
@@ -72,14 +99,8 @@ class SequentialTradingPipeline:
             base_lambda=float(getattr(self.config, "wang_base_lambda", 0.183))
         )
 
-        # TODO(di-cleanup): self-constructed rather than injected — the pipeline
-        # should receive its TradeExecutor via a constructor argument instead.
-        self.executor = TradeExecutor(config=self.config)
-        self.hunter = PolymarketScannerHunter(
-            bridge=self.bridge,
-            executor=self.executor,
-            config=self.config,
-        )
+        self.executor = ctx.executor
+        self.hunter = ctx.scanner
 
         # Constraint-based strategies (arbitrage) — model-free, run independently
         # of the brain/PricingEngine path above. See _stage_strategy_scan().
@@ -87,23 +108,13 @@ class SequentialTradingPipeline:
         self.strategies: list[Strategy] = [EventSumStrategy(config=self.config)]
         self.strategy_scan_interval = 30.0  # don't hammer the Gamma API every loop tick
         self._last_strategy_scan = 0.0
-        self.portfolio_manager = PortfolioManager(
-            bridge=self.bridge,
-            executor=self.executor,
-            config=self.config,
-            hunter=self.hunter,
-            db_path=self.db_path,
-        )
+        self.portfolio_manager = ctx.portfolio_manager
 
-        self._sync_live_account_state()
+        sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
         if float(getattr(self.bridge, "starting_balance", 0.0) or 0.0) <= 0.0:
             self.bridge.starting_balance = float(self.bridge.current_balance)
 
-        self.budget_manager = BudgetManager(
-            bridge=self.bridge,
-            config=self.config,
-            initial_balance=float(self.bridge.current_balance),
-        )
+        self.budget_manager = ctx.budget_manager
 
         self.spent_today = float(getattr(self.bridge, "spent_today", 0.0) or 0.0)
         self.spend_day = datetime.now(timezone.utc).date()
@@ -197,18 +208,6 @@ class SequentialTradingPipeline:
         }
 
     # ------------------------------------------------------------------
-
-    def _sync_live_account_state(self):
-        """Refresh live positions and collateral balance into bridge state."""
-        try:
-            self.portfolio_manager._refresh_portfolio()
-        except Exception as exc:
-            self.log_func("SYNC-WARN", "Pipeline", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
-
-        try:
-            self._set_cash(float(self.executor.get_balance()))
-        except Exception as exc:
-            self.log_func("SYNC-WARN", "Pipeline", "balance", {"reason": "balance_fetch_failed", "error": str(exc)})
 
     def _reset_daily_if_needed(self):
         current_day = datetime.now(timezone.utc).date()
@@ -687,9 +686,9 @@ class SequentialTradingPipeline:
             requested_live = bool(getattr(self.bridge, "live_trading", False))
             self.executor.dry_run = not requested_live
 
-            self._sync_live_account_state()
+            sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
             self.portfolio_manager.manage_portfolio(self.log_func)  # exits always run, even while paused
-            self._sync_live_account_state()
+            sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
             self._update_drawdown_guard()
 
             if self.ctx.drawdown_paused:

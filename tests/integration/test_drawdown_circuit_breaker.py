@@ -8,10 +8,14 @@ import pytest
 from core.bridge import DataBridge
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
+from polymarket import PolymarketScannerHunter
+from trading.budget_manager import BudgetManager
+from trading.executor import TradeExecutor
+from trading.risk_manager import PortfolioManager
 
 
 def _make_pipeline(balance=100.0, max_drawdown_pct=0.20):
-    from trading.decision_pipeline import SequentialTradingPipeline
+    from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
 
     bridge = DataBridge()
     bridge.current_balance = balance
@@ -29,12 +33,24 @@ def _make_pipeline(balance=100.0, max_drawdown_pct=0.20):
 
     ctx = WalletContext(wallet_id="test_wallet", config=config, bridge=bridge, db_path="test_wallet_trades.db")
     log_calls = []
+    log_func = lambda level, *a, **kw: log_calls.append(level)
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
+        ctx.executor = TradeExecutor(config=ctx.config)
+        ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
+        ctx.portfolio_manager = PortfolioManager(
+            bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
+            hunter=ctx.scanner, db_path=ctx.db_path,
+        )
+        sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
+        ctx.budget_manager = BudgetManager(
+            bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
+        )
+
         pipeline = SequentialTradingPipeline(
             ctx=ctx,
-            log_func=lambda level, *a, **kw: log_calls.append(level),
+            log_func=log_func,
             delay=0.01,
         )
 
