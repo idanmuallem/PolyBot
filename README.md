@@ -3,9 +3,7 @@
 
 A fully automated trading bot that hunts [Polymarket](https://polymarket.com) prediction markets for positive expected-value opportunities, evaluates them with domain-specific pricing models, and executes risk-managed trades — all surfaced through a live Streamlit dashboard.
 
-
 ---
-
 
 ## Table of Contents
 
