@@ -1,6 +1,6 @@
 """Integration: strategy signals flow through the same executor as
 model-driven trades, tagged with strategy_type for separate tracking."""
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 

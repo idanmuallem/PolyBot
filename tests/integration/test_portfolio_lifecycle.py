@@ -1,8 +1,6 @@
 """Integration: PortfolioManager + BudgetManager working together."""
 from unittest.mock import MagicMock
 
-import pytest
-
 from core.bridge import DataBridge
 from core.models import Position
 from core.trading_config import TradingConfig

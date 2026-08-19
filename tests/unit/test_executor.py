@@ -1,7 +1,4 @@
-import os
 from unittest.mock import MagicMock
-
-import pytest
 
 from core.models import MarketData
 from core.trading_config import TradingConfig
@@ -258,7 +255,6 @@ def test_none_response_is_invalid():
 def test_get_open_positions_live_ev_normalization_at_boundary():
     """A 1% gain (pnl_ratio=0.01) must produce live_ev=0.01."""
     executor = _make_executor()
-    import requests as _req
     from unittest.mock import patch as _patch
     raw_position = {
         "asset": "tok1",

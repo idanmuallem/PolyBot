@@ -18,7 +18,6 @@ This client is synchronous (uses the plain `ccxt` package, not
 """
 import math
 import time
-from typing import Optional
 
 import ccxt
 

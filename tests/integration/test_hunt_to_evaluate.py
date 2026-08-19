@@ -3,7 +3,6 @@ import json
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
-import pytest
 from freezegun import freeze_time
 
 from brains.crypto import HybridCryptoBrain

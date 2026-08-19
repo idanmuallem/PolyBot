@@ -6,7 +6,7 @@ Dynamic expiry dates are used instead.
 """
 import asyncio
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 

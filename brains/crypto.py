@@ -30,7 +30,7 @@ class HybridCryptoBrain(BaseBrain):
     }
 
     def __init__(self, volatilities: dict = None):
-        """Initialize CryptoBrain.
+        """Initialize HybridCryptoBrain.
 
         Args:
             volatilities: Dict mapping symbol prefixes to annualized vols.
@@ -293,8 +293,3 @@ class HybridCryptoBrain(BaseBrain):
 
         # Return CDF at d2
         return float(norm.cdf(d2))
-
-
-
-# Backward compatibility for existing imports/factory usage
-CryptoBrain = HybridCryptoBrain

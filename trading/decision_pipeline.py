@@ -14,21 +14,21 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from brains import get_brain_for_asset_type, BaseBrain
+from brains import get_brain_for_asset_type
 from brains.base import calculate_tte
 from brains.pricing_engine import PricingEngine
-from core.models import PRICE_FLOOR, PRICE_CEILING
+from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
 from polymarket import PolymarketClient, PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
 from trading.risk_manager import PortfolioManager
-from trading.strategies import EventSumStrategy, Strategy, StrategySignal
+from trading.strategies import EventSumStrategy, Strategy
 
 
 @dataclass
 class CandidateTrade:
-    market: object
+    market: MarketData
     token_id: str
     asset_type: str
     question: str
@@ -72,6 +72,8 @@ class SequentialTradingPipeline:
             base_lambda=float(getattr(self.config, "wang_base_lambda", 0.183))
         )
 
+        # TODO(di-cleanup): self-constructed rather than injected — the pipeline
+        # should receive its TradeExecutor via a constructor argument instead.
         self.executor = TradeExecutor(config=self.config)
         self.hunter = PolymarketScannerHunter(
             bridge=self.bridge,

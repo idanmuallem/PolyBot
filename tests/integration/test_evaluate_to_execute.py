@@ -49,7 +49,6 @@ def _make_pipeline(config=None, balance=100.0):
 
 
 def _market(price=0.40, strike=95_000.0, expiry_days=10, asset_type="Crypto::BTCUSDT"):
-    from freezegun import freeze_time as _ft
     expiry = (datetime(2026, 6, 2, tzinfo=timezone.utc) + timedelta(days=expiry_days)).isoformat()
     return MarketData(
         market_id="tok1", asset_type=asset_type,

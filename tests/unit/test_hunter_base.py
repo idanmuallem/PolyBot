@@ -2,9 +2,6 @@ import json
 import time
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-from core.models import MarketData
 from hunters.parsers import extract_crypto_strike
 
 
@@ -162,7 +159,7 @@ def test_required_keywords_filter():
     assert result.market_id == "tok1"
 
 
-def test_cooldown_cache_expires_after_600_seconds():
+def test_cooldown_cache_expires_after_cooldown_window():
     from polymarket import PolymarketScannerHunter
     from core.trading_config import TradingConfig
     from core.bridge import DataBridge
@@ -172,7 +169,7 @@ def test_cooldown_cache_expires_after_600_seconds():
     executor = MagicMock()
 
     scanner = PolymarketScannerHunter(bridge=bridge, executor=executor, config=config)
-    scanner.seen_markets["tok_old"] = time.time() - 601  # already expired
+    scanner.seen_markets["tok_old"] = time.time() - scanner._COOLDOWN_SECONDS - 1  # already expired
 
     active = scanner._get_active_seen_ids()
     assert "tok_old" not in active
