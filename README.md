@@ -38,28 +38,33 @@ PolyBot scans Polymarket's prediction markets for mispriced contracts using real
 
 ## Architecture
 
+Each wallet runs as a fully isolated unit — its own `TradingConfig`, its own live state (`DataBridge`), its own SQLite trade history — bundled into a `WalletContext`. The shipped Streamlit dashboard currently drives exactly one `WalletContext` (built from `config/.env` or a wallet `config.json`); `WalletManager` is the multi-wallet orchestrator that runs several `WalletContext`s concurrently as asyncio tasks, for callers that need more than one wallet at a time.
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Streamlit Dashboard                      │
-│              ui/dashboard.py  ·  ui/components.py           │
-└─────────────────────────┬───────────────────────────────────┘
-                          │ shared state (DataBridge singleton)
-┌─────────────────────────▼───────────────────────────────────┐
-│               SequentialTradingPipeline                      │
-│                 trading/decision_pipeline.py                 │
-│                                                             │
-│   ┌────────────┐   ┌─────────────┐   ┌──────────────────┐  │
-│   │  Hunters   │──▶│   Brains    │──▶│  TradeExecutor   │  │
-│   │ (discover) │   │ (price/EV)  │   │ (submit orders)  │  │
-│   └────────────┘   └─────────────┘   └──────────────────┘  │
-│                                              │               │
-│                         ┌────────────────────┘               │
-│                         │   PortfolioManager / BudgetMgr     │
-│                         │   (risk, P&L, spend limits)        │
-│                         └─────────────────────────────────── │
-└─────────────────────────────────────────────────────────────┘
-                          │
-                   SQLite (trades.db)
+┌────────────────────────────────┐    ┌────────────────────────────────┐
+│ Streamlit Dashboard            │    │ WalletManager                  │
+│ (one WalletContext)            │    │ (many, via asyncio)            │
+└────────────────────────────────┘    └────────────────────────────────┘
+                 │                                    │
+                 └────────────────────┬────────────────┘
+                                    ▼
+                              WalletContext
+                (config + DataBridge + db_path)
+                                    │
+┌────────────────────────────────────────────────────────────────────────────┐
+│                         SequentialTradingPipeline                          │
+│                                                                            │
+│     Hunters     ─▶     Brains     ─▶ PricingEngine  ─▶  Risk/Budget        │
+│    (discover)         (p_true)        (Wang edge)     (size, drawdown,     │
+│                                                       correlation, P&L)    │
+│                                                                            │
+│ + Strategies (trading/strategies/): model-free arbitrage, runs             │
+│   independently of Hunters/Brains/PricingEngine (e.g. EventSumStrategy)    │
+└────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                 TradeExecutor
+                                       │
+                      SQLite (data/{wallet_id}/trades.db)
 ```
 
 **Core patterns used:**
@@ -67,10 +72,12 @@ PolyBot scans Polymarket's prediction markets for mispriced contracts using real
 | Pattern | Where |
 |---|---|
 | Template Method | `BaseBrain.evaluate()` orchestrates; subclasses override `_calculate_probability()` |
-| Strategy | `BaseHunter` interface; `CryptoHunter`, `WeatherHunter`, `EconomyHunter` |
-| Singleton | `DataBridge` — Streamlit-cached shared state between dashboard and engine |
-| Sequential Pipeline | Hunt → Evaluate → Risk-check → Execute in `SequentialTradingPipeline` |
+| Strategy | `BaseHunter` interface; `CryptoHunter`, `WeatherHunter`, `EconomyHunter`. Also `trading/strategies/Strategy` for model-free arbitrage (`EventSumStrategy`) |
+| Constructor DI | `WalletContext` bundles a wallet's config/state/db_path; most components take their dependencies through `__init__` rather than reading globals |
+| Sequential Pipeline | Hunt → Evaluate (Brain + PricingEngine) → Risk-check → Execute in `SequentialTradingPipeline` |
 | Factory | `get_brain_for_asset_type()` returns the right pricing model by asset class |
+
+`DataBridge` is no longer a process-wide singleton — it's instantiated per wallet (`DataBridge(wallet_id=...)`) and reached through `WalletContext.bridge`. `core/bridge.py` keeps a `@st.cache_resource`-backed `get_bridge()` only as a backward-compatible singleton for the single-wallet dashboard.
 
 ---
 
@@ -79,55 +86,64 @@ PolyBot scans Polymarket's prediction markets for mispriced contracts using real
 ```
 PolyBot/
 │
-├── brains/                    # Fair-value pricing models
-│   ├── base.py                # BaseBrain: EV calc, Kelly sizing, tradability
-│   ├── crypto.py              # HybridCryptoBrain: Black-Scholes + Heston
-│   ├── weather.py             # WeatherBrain: normal distribution on temperature
-│   └── economy.py            # EconomyBrain: normal distribution on macro indicators
+├── brains/                     # Fair-value pricing models
+│   ├── base.py                 # BaseBrain: EV calc, Kelly sizing, tradability
+│   ├── crypto.py               # HybridCryptoBrain: Black-Scholes + Heston → raw probability
+│   ├── weather.py              # WeatherBrain: normal distribution on temperature
+│   ├── economy.py              # EconomyBrain: normal distribution on macro indicators
+│   └── pricing_engine.py       # PricingEngine: Wang Transform (raw probability → fair value/edge)
 │
-├── core/                      # Shared infrastructure
-│   ├── models.py              # MarketData, TradeSignal, Position dataclasses
-│   ├── trading_config.py      # TradingConfig loaded from config/.env
-│   └── bridge.py              # DataBridge singleton (dashboard ↔ engine state)
+├── core/                       # Shared infrastructure
+│   ├── models.py               # MarketData, TradeSignal, Position dataclasses
+│   ├── trading_config.py       # TradingConfig: from_env() (config/.env) or from_file() (wallet config.json)
+│   ├── bridge.py               # DataBridge: per-wallet live state (dashboard <-> engine)
+│   ├── wallet_context.py       # WalletContext: bundles a wallet's config + bridge + db_path
+│   └── wallet_manager.py       # WalletManager: runs multiple WalletContexts concurrently (asyncio)
 │
-├── hunters/                   # Market discovery and reference-data fetching
-│   ├── base.py                # BaseHunter interface + Polymarket pagination logic
-│   ├── crypto.py              # CryptoHunter (Binance anchor prices)
-│   ├── weather.py             # WeatherHunter (OpenWeather API)
-│   ├── economy.py             # EconomyHunter (FRED API)
-│   ├── parsers.py             # Strike extraction utilities
-│   └── clients/               # API clients (Binance, FRED)
+├── hunters/                    # Market discovery and reference-data fetching
+│   ├── base.py                 # BaseHunter interface + Polymarket pagination logic
+│   ├── crypto.py               # CryptoHunter (CCXT anchor prices)
+│   ├── weather.py              # WeatherHunter (OpenWeather API)
+│   ├── economy.py              # EconomyHunter (FRED API)
+│   ├── parsers.py              # Strike extraction utilities
+│   └── clients/                # API clients (CCXT, FRED)
+│       ├── ccxt_client.py      # CCXTDataClient: spot price, realized vol, funding rate, order book
+│       └── fred.py
 │
-├── trading/                   # Execution pipeline and risk management
-│   ├── decision_pipeline.py   # SequentialTradingPipeline + run_market_monitor()
-│   ├── executor.py            # TradeExecutor: dry/paper/live order submission
-│   ├── budget_manager.py      # Daily spend limits and bankroll enforcement
-│   └── risk_manager.py        # PortfolioManager: take-profit, stop-loss, fair-value lookup
+├── trading/                    # Execution pipeline and risk management
+│   ├── decision_pipeline.py    # SequentialTradingPipeline + run_market_monitor()
+│   ├── executor.py             # TradeExecutor: dry/paper/live order submission
+│   ├── budget_manager.py       # Daily spend limits, bankroll enforcement, Kelly sizing
+│   ├── risk_manager.py         # PortfolioManager: take-profit, stop-loss, drawdown circuit breaker
+│   ├── correlation.py          # CorrelationTracker: category/symbol correlation between open positions
+│   └── strategies/             # Constraint-based ("arbitrage") strategies — no brain/probability needed
+│       ├── base.py             # Strategy interface, StrategySignal
+│       └── event_sum.py        # EventSumStrategy: intra-event outcome-sum mispricing
 │
-├── ui/                        # Streamlit dashboard
-│   ├── dashboard.py           # Main app: engine startup, layout, live refresh
-│   ├── data_manager.py        # SQLite schema, trade/event logging, stats queries
-│   └── components.py          # Equity curve, EV chart, positions table
+├── ui/                         # Streamlit dashboard
+│   ├── dashboard.py            # Main app: engine startup, layout, live refresh
+│   ├── data_manager.py         # SQLite schema, trade/event logging, stats queries
+│   └── components.py           # Equity curve, EV chart, correlation matrix, positions table
 │
 ├── tests/
-│   ├── unit/                  # Per-module unit tests
-│   ├── integration/           # Multi-component integration tests
-│   ├── e2e/                   # Full dry-run pipeline end-to-end tests
-│   └── conftest.py            # Pytest fixtures
+│   ├── unit/                   # Per-module unit tests
+│   ├── integration/            # Multi-component integration tests
+│   ├── e2e/                    # Full dry-run pipeline end-to-end tests
+│   └── conftest.py             # Pytest fixtures
 │
 ├── config/
-│   ├── .env                   # Deployment credentials and runtime settings
-│   ├── requirements.txt       # Python dependencies
+│   ├── .env                    # Deployment credentials and runtime settings
+│   ├── requirements.txt        # Python dependencies
 │   └── Docker/
 │       ├── Dockerfile
 │       └── docker-compose.yml
 │
 ├── .github/
 │   └── workflows/
-│       ├── deploy.yml         # Build → ECR push → EC2 deploy on push to main
-│       └── claude.yml         # Claude Code bot for PR/issue automation
+│       ├── deploy.yml          # Build → ECR push → EC2 deploy on push to main
+│       └── claude.yml          # Claude Code bot for PR/issue automation
 │
-├── polymarket.py              # PolymarketClient (Gamma API + CLOB balance)
+├── polymarket.py               # PolymarketClient (Gamma API + CLOB balance) + PolymarketScannerHunter
 └── pytest.ini
 ```
 
@@ -141,36 +157,41 @@ Each hunter queries the Polymarket Gamma API for open markets matching its asset
 
 | Hunter | Markets | Anchor Source |
 |---|---|---|
-| `CryptoHunter` | BTC/ETH/SOL price markets | Binance spot price |
+| `CryptoHunter` | BTC/ETH/SOL price markets | Spot price, realized vol, funding rate via CCXT (`CCXTDataClient`) |
 | `WeatherHunter` | Temperature prediction markets | OpenWeather API |
 | `EconomyHunter` | Fed Rate, CPI, GDP markets | FRED API |
 
-### 2. Fair-Value Pricing (Brains)
+A separate, model-free path runs alongside the hunters: **strategies** (`trading/strategies/`) scan for arithmetic mispricings directly in market prices — no anchor value or brain involved. `EventSumStrategy` looks for multi-outcome events whose YES prices don't sum to $1.00.
 
-Each discovered market is passed to the matching `Brain`, which calculates the probability the market resolves YES based on the anchor value and a statistical model:
+### 2. Fair-Value Pricing (Brains + PricingEngine)
+
+Each discovered market is passed to the matching `Brain`, which produces a **raw probability** the market resolves YES from the anchor value and a domain-specific statistical model:
 
 - **Crypto**: Black-Scholes for short TTE, Heston model for longer-dated contracts. Uses per-asset implied volatility (BTC 50%, ETH 70%, SOL 90%).
 - **Weather**: Normal distribution around the forecast with a configurable standard deviation.
 - **Economy**: Normal distribution around the current macro reading with historical volatility.
 
-The brain returns an **expected value (EV)** = `(fair_prob - market_price)`. A positive EV means the market is underpriced; negative means overpriced.
+That raw probability is then passed through `PricingEngine` (`pricing_mode=wang`, the default), which applies a Wang Transform risk-premium adjustment to produce a market-consistent **fair value** and the resulting **edge** against the live market price. Setting `PRICING_MODE=legacy` skips the Wang adjustment and uses the brain's raw probability directly, for A/B comparison.
 
 ### 3. Trade Decision
 
 The pipeline filters markets through several gates before executing:
 
-1. EV must exceed `MIN_EV` (default 0.30)
+1. Wang edge must exceed `WANG_MIN_EDGE` (default 0.05 probability points; `MIN_EV` under legacy pricing)
 2. Time to expiry must be between `MIN_TTE_MINUTES` and `MAX_TTE_DAYS`
 3. Daily spend must be below `DAILY_LIMIT_USD`
 4. Available balance must exceed `MIN_TRADING_BALANCE`
-5. Position size is Kelly-criterion-scaled, capped at `MAX_BET_SIZE_USD`
+5. New entries are paused while the wallet is in drawdown circuit-breaker pause (see below)
+6. Position size is Kelly-criterion-scaled (`KELLY_FRACTION`, default quarter-Kelly), discounted by correlation exposure to already-open positions, and capped at `MAX_BET_SIZE_USD`
 
 ### 4. Position Management
 
 Open positions are monitored each cycle. A position is closed when:
 - PnL reaches `TAKE_PROFIT_PCT` (default +20%)
 - PnL falls below `STOP_LOSS_PCT` (default -50%)
-- EV drops below `MIN_HOLD_EV` (default -0.10) on re-evaluation
+- EV (or Wang edge) drops below `MIN_HOLD_EV` (default -0.10) on re-evaluation
+
+Separately, a **drawdown circuit breaker** tracks each wallet's peak equity: if current equity falls more than `MAX_DRAWDOWN_PCT` (default 20%) below that peak, new trade entries pause (existing positions still get managed/exited normally) until equity recovers.
 
 ### 5. Dashboard
 
@@ -214,7 +235,12 @@ cp config/.env config/.env.local   # or edit config/.env directly
 
 ## Configuration
 
-All configuration lives in `config/.env`. Copy the template and fill in your values:
+The dashboard supports two ways to configure a wallet:
+
+1. **`config/.env`** (default, single-wallet) — process environment variables, loaded via `TradingConfig.from_env()`.
+2. **A wallet `config.json`** (multi-wallet) — set `WALLET_CONFIG_PATH` to a JSON file (e.g. `data/wallet_alpha/config.json`) matching `TradingConfig`'s fields; loaded via `TradingConfig.from_file()`. This is what `WalletManager` uses to run several wallets concurrently, each isolated in its own `data/{wallet_id}/` directory with its own trade history.
+
+For the single-wallet `.env` path, copy the template and fill in your values:
 
 ```dotenv
 # Polymarket wallet credentials (required)
@@ -241,6 +267,15 @@ MIN_HOLD_EV=-0.10
 # Market filter
 MIN_TTE_MINUTES=60
 MAX_TTE_DAYS=180
+
+# Wang Transform pricing (see brains/pricing_engine.py)
+PRICING_MODE=wang            # "wang" or "legacy"
+WANG_BASE_LAMBDA=0.183
+WANG_MIN_EDGE=0.05
+
+# Risk management
+KELLY_FRACTION=0.25           # quarter-Kelly
+MAX_DRAWDOWN_PCT=0.20         # pause new entries past this equity drawdown
 
 # External API keys (optional — enables weather/macro hunters)
 OPENWEATHER_API_KEY=...
@@ -346,6 +381,12 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `STOP_LOSS_PCT` | `-0.50` | Close position at -50% PnL |
 | `MIN_HOLD_EV` | `-0.10` | Close position if re-evaluated EV drops below this |
 | `ENGINE_LOOP_DELAY` | `2.0` | Seconds between scan cycles |
-| `TRADES_DB_PATH` | `/app/trades.db` | SQLite database path |
+| `TRADES_DB_PATH` | `/app/trades.db` | SQLite database path (single-wallet mode) |
+| `WALLET_CONFIG_PATH` | — | Path to a wallet `config.json`; if set, overrides `.env`-based config for that wallet |
+| `PRICING_MODE` | `wang` | `wang` (Wang Transform fair value) or `legacy` (brain's raw probability, no adjustment) |
+| `WANG_BASE_LAMBDA` | `0.183` | Base risk-premium parameter for the Wang Transform |
+| `WANG_MIN_EDGE` | `0.05` | Minimum \|Wang edge\| (probability points) to consider a trade |
+| `KELLY_FRACTION` | `0.25` | Fraction of full Kelly used for position sizing |
+| `MAX_DRAWDOWN_PCT` | `0.20` | Equity drop from peak that pauses new entries (exits still run) |
 | `OPENWEATHER_API_KEY` | — | Required for WeatherHunter |
 | `FRED_API_KEY` | — | Required for EconomyHunter |

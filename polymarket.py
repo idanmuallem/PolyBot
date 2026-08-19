@@ -163,6 +163,9 @@ class PolymarketScannerHunter:
     # Cooldown cache
     # ------------------------------------------------------------------
 
+    # TODO(log-noise): [CACHE]/[SCANNER] fire on every loop tick per hunter
+    # and aren't part of the DB-backed structured log flow — consider gating
+    # behind a log-level flag instead of always-on stdout prints.
     def _get_active_seen_ids(self) -> List[str]:
         now = time.time()
         expired = [mid for mid, ts in self.seen_markets.items() if now - ts >= self._COOLDOWN_SECONDS]

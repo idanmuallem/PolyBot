@@ -45,14 +45,6 @@ class TradeExecutor:
         self.proxy_address = self.config.proxy_address
         self.client = None
 
-        print("\n" + "=" * 30)
-        print("=== EXECUTOR BOOT DIAGNOSTIC ===")
-        print(f"1. CLOB Import OK:    {CLOB_IMPORT_OK}")
-        print(f"2. Private Key Found: {bool(self.config.private_key)}")
-        print(f"3. Proxy Addr Found:  {bool(self.config.proxy_address)}")
-        print(f"4. Dry Run Mode:      {self.dry_run}")
-        print("=" * 30 + "\n")
-
         if not CLOB_IMPORT_OK:
             print("[FATAL] py-clob-client is not loaded correctly!")
             return

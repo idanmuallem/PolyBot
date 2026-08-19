@@ -120,6 +120,10 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
         paper = bridge.level_counts.get("PAPER-TRADE", 0)
         avg_ev = sum(bridge.ev_samples) / len(bridge.ev_samples) if bridge.ev_samples else 0.0
         max_ev = max(bridge.ev_samples) if bridge.ev_samples else 0.0
+        # TODO(log-noise): this periodic stdout dump (with its own "=" * 90
+        # separators) duplicates data already in bridge/opportunity_map and
+        # isn't part of the DB-backed structured log flow — worth deciding
+        # whether it earns its keep or should move behind a log-level flag.
         print("=" * 90)
         print(f"[PERF] events={bridge.event_count} | live={live} | dry={dry} | paper={paper}")
         print(f"[PERF] avg_ev={avg_ev:.4f} | max_ev={max_ev:.4f} | daily_spend=${bridge.daily_spend:.2f} | balance=${bridge.current_balance:.2f}")
