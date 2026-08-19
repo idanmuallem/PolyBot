@@ -15,6 +15,7 @@ import os
 import threading
 import time
 
+from dotenv import load_dotenv
 import pandas as pd
 import streamlit as st
 
@@ -54,6 +55,13 @@ def _validate_runtime_env(bridge: DataBridge) -> WalletContext:
     to TradingConfig.from_env() for backward compatibility with deployments
     that only set process env vars and have no wallet config file yet.
     """
+    # Load config/.env into the process environment before checking for
+    # required vars below — otherwise a fresh `streamlit run` (with nothing
+    # already exported into the shell) always fails this check even when
+    # config/.env has real values, since TradingConfig.from_env() (which also
+    # calls load_dotenv) only runs after this validation passes.
+    load_dotenv("config/.env")
+
     wallet_config_path = _get_env("WALLET_CONFIG_PATH")
 
     if wallet_config_path:
