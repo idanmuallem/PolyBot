@@ -1,6 +1,10 @@
 import json
 import os
 import sqlite3
+from typing import List, Optional
+
+from brains.pricing_engine import PricingEngine
+from trading.correlation import CorrelationTracker
 
 
 def _parse_payload(payload_value) -> dict:
@@ -19,26 +23,29 @@ def _parse_payload(payload_value) -> dict:
             return {}
 
 
-_DB_CANDIDATES = ["trades.db", "/app/trades.db"]
-
-
-def _db_path() -> str:
-    for candidate in _DB_CANDIDATES:
-        if os.path.isdir(candidate):
-            candidate = os.path.join(candidate, "trades.db")
-        if os.path.exists(candidate):
-            return candidate
-    return _DB_CANDIDATES[0]
-
-
 class PortfolioManager:
-    def __init__(self, bridge, executor, config, hunter=None):
+    def __init__(self, bridge, executor, config, hunter=None, db_path: Optional[str] = None):
         self.bridge = bridge
         self.executor = executor
         self.hunter = hunter
+        self.db_path = db_path  # this wallet's trades.db — no guessing, the caller (WalletContext) owns it
         self.take_profit_pct = float(config.take_profit_pct)
         self.stop_loss_pct = float(config.stop_loss_pct)
         self.min_hold_ev = float(config.min_hold_ev)
+
+        # Wang edge decay exit (see _check_wang_edge_decay): an additional,
+        # earlier exit signal alongside take-profit/stop-loss, not a
+        # replacement for them.
+        self.wang_min_edge = float(getattr(config, "wang_min_edge", 0.05))
+        self.wang_decay_threshold = self.wang_min_edge / 2.0
+        self.pricing_engine = PricingEngine(
+            base_lambda=float(getattr(config, "wang_base_lambda", 0.183))
+        )
+
+        # Correlation exposure (see trading/correlation.py) — used both to
+        # log correlation_exposure on new candidates and to feed the
+        # dashboard's correlation matrix visualization.
+        self.correlation_tracker = CorrelationTracker(config=config)
 
     def _refresh_portfolio(self):
         positions = self.executor.get_open_positions()
@@ -60,11 +67,10 @@ class PortfolioManager:
 
     def _fair_value_from_db(self, token_id: str, market_id: str):
         """Look up latest fair value for a position from the trade history DB."""
-        db_file = _db_path()
-        if not os.path.exists(db_file):
+        if not self.db_path or not os.path.exists(self.db_path):
             return None
         try:
-            with sqlite3.connect(db_file, timeout=5) as conn:
+            with sqlite3.connect(self.db_path, timeout=5) as conn:
                 cursor = conn.cursor()
                 for lookup_id in (token_id, market_id):
                     if not lookup_id:
@@ -114,6 +120,144 @@ class PortfolioManager:
 
         # 3. DB fallback
         return self._fair_value_from_db(token_id, market_id)
+
+    def _field_from_db(self, token_id: str, market_id: str, field_key: str, caster=float):
+        """Look up a single field from this position's most recent
+        trade-history row (same table/scan _fair_value_from_db uses),
+        converting it with `caster` (float by default; pass str for text
+        fields like asset_type)."""
+        if not self.db_path or not os.path.exists(self.db_path):
+            return None
+        try:
+            with sqlite3.connect(self.db_path, timeout=5) as conn:
+                cursor = conn.cursor()
+                for lookup_id in (token_id, market_id):
+                    if not lookup_id:
+                        continue
+                    cursor.execute(
+                        """
+                        SELECT payload FROM hunt_history
+                        WHERE token_id = ?
+                          AND level IN ('AUTO-TRADE', 'LIVE-TRADE', 'DRY-RUN', 'PAPER-TRADE', 'TRACK')
+                        ORDER BY id DESC LIMIT 10
+                        """,
+                        (lookup_id,),
+                    )
+                    for (payload_raw,) in cursor.fetchall():
+                        payload = _parse_payload(payload_raw)
+                        if payload.get(field_key) is not None:
+                            try:
+                                return caster(payload[field_key])
+                            except Exception:
+                                continue
+        except Exception:
+            pass
+        return None
+
+    def _resolve_position_field(self, position, payload_key: str, direct_key: Optional[str] = None, caster=float):
+        """Generic 3-tier lookup shared by the raw_probability/asset_type/
+        entry-wang_edge resolvers below: direct attribute -> bridge
+        opportunity_map (fast path, populated by ui/data_manager.log_event)
+        -> trade-history DB (slow path, works even across process restarts).
+        """
+        if direct_key:
+            direct = self._position_field(position, direct_key)
+            if direct is not None:
+                try:
+                    return caster(direct)
+                except Exception:
+                    pass
+
+        token_id = str(self._position_field(position, "token_id", "") or "")
+        market_id = str(self._position_field(position, "market_id", "") or "")
+
+        for key in (token_id, market_id):
+            snapshot = getattr(self.bridge, "opportunity_map", {}).get(key, {}) if key else {}
+            val = snapshot.get(payload_key) if isinstance(snapshot, dict) else None
+            if val is not None:
+                try:
+                    return caster(val)
+                except Exception:
+                    pass
+
+        return self._field_from_db(token_id, market_id, payload_key, caster=caster)
+
+    def _resolve_position_raw_probability(self, position):
+        """Look up the brain's raw probability estimate (p_true) recorded for
+        this position at entry (see decision_pipeline.py's TRACK payload,
+        Phase 3) — needed to re-derive the Wang edge without re-running the
+        brain/hunter for a position that's already open.
+        """
+        return self._resolve_position_field(position, "raw_probability")
+
+    def _resolve_position_asset_type(self, position):
+        """Look up this position's asset_type (e.g. "Crypto::BTCUSDT") —
+        needed for correlation exposure, since Position itself doesn't carry it."""
+        val = self._resolve_position_field(position, "asset_type", direct_key="asset_type", caster=str)
+        return val or None
+
+    def _resolve_position_entry_wang_edge(self, position):
+        """Look up the Wang edge recorded at entry, for the dashboard's edge-decay display."""
+        return self._resolve_position_field(position, "wang_edge")
+
+    def _recompute_position_wang_edge(self, position) -> Optional[dict]:
+        """Re-derive the CURRENT Wang edge for an open position from its
+        entry-time raw probability and the position's current market price.
+
+        Returns the PricingEngine.compute_edge() result, or None when there's
+        nothing on record to re-evaluate (e.g. a position opened before this
+        existed). Used both by _check_wang_edge_decay (the exit signal) and
+        by manage_portfolio's bridge.position_analytics snapshot (dashboard
+        edge-decay tracking) — computed once per position per cycle, not twice.
+
+        Note: volume/days_to_expiry aren't persisted per-position, so this
+        re-derives lambda from the pooled base_lambda prior rather than the
+        hierarchical (volume/duration-aware) one used at entry — the dominant
+        driver of edge decay over a short hold is the market price moving
+        toward or away from fair value, which this still captures directly.
+        """
+        raw_probability = self._resolve_position_raw_probability(position)
+        if raw_probability is None:
+            return None
+
+        current_price = float(self._position_field(position, "current_price", 0.0) or 0.0)
+        if current_price <= 0.0:
+            return None
+
+        # current_price is already the price of whichever side is held
+        # (TradeExecutor.get_open_positions() reads it per-token), so only
+        # the probability needs translating into "probability my side wins".
+        side = str(self._position_field(position, "side", "YES") or "YES").upper()
+        p_true_for_side = raw_probability if side != "NO" else (1.0 - raw_probability)
+
+        return self.pricing_engine.compute_edge(p_true=p_true_for_side, market_price=current_price)
+
+    def _check_wang_edge_decay(self, wang_result: Optional[dict]) -> Optional[dict]:
+        """Given an already-recomputed Wang edge result (see
+        _recompute_position_wang_edge), return it if the edge has collapsed
+        below wang_min_edge/2, else None. A position with no recorded
+        raw_probability is left alone — falls through to the existing
+        P&L-based exits.
+        """
+        if wang_result is None:
+            return None
+        if abs(wang_result["edge"]) < self.wang_decay_threshold:
+            return wang_result
+        return None
+
+    def get_book_asset_types(self) -> List[str]:
+        """Resolved asset_type for every currently open position — the input
+        to correlation exposure/matrix calculations."""
+        asset_types = []
+        for position in list(getattr(self.bridge, "current_portfolio", []) or []):
+            asset_type = self._resolve_position_asset_type(position)
+            if asset_type:
+                asset_types.append(asset_type)
+        return asset_types
+
+    def correlation_exposure_for(self, asset_type: str) -> float:
+        """Average correlation between a candidate asset_type and the current book."""
+        return self.correlation_tracker.exposure_for_new_position(asset_type, self.get_book_asset_types())
 
     def _liquidate_position_value(self, position, log_func) -> float:
         token_id = str(self._position_field(position, "token_id", "") or "")
@@ -270,11 +414,45 @@ class PortfolioManager:
         self._refresh_portfolio()
         return float(self.bridge.current_balance) >= float(required_amount)
 
+    def _update_position_analytics(self, position, wang_result: Optional[dict]) -> None:
+        """Stash per-position analytics on the bridge for the dashboard —
+        entry-vs-current Wang edge ("edge decay tracking") and asset_type
+        (for the correlation matrix). Not part of any exit decision itself.
+        """
+        if not hasattr(self.bridge, "position_analytics") or not isinstance(
+            getattr(self.bridge, "position_analytics", None), dict
+        ):
+            self.bridge.position_analytics = {}
+
+        token_id = str(self._position_field(position, "token_id", "") or "")
+        if not token_id:
+            return
+
+        entry_edge = self._resolve_position_entry_wang_edge(position)
+        current_edge = wang_result["edge"] if wang_result else None
+
+        self.bridge.position_analytics[token_id] = {
+            "asset_type": self._resolve_position_asset_type(position),
+            "raw_probability": self._resolve_position_raw_probability(position),
+            "entry_wang_edge": entry_edge,
+            "current_wang_edge": current_edge,
+            "current_wang_fair_value": wang_result["fair_value"] if wang_result else None,
+            "edge_delta": (
+                (current_edge - entry_edge)
+                if (current_edge is not None and entry_edge is not None) else None
+            ),
+        }
+
     def manage_portfolio(self, log_func):
         self._refresh_portfolio()
 
         for position in list(self.bridge.current_portfolio):
             pnl_ratio = float(self._position_field(position, "pnl_ratio", 0.0) or 0.0)
+
+            # Computed once per position per cycle — feeds both the decay
+            # exit check below and the dashboard's edge-decay display.
+            wang_result = self._recompute_position_wang_edge(position)
+            self._update_position_analytics(position, wang_result)
 
             if pnl_ratio >= self.take_profit_pct:
                 self._exit_position(position, "TAKE-PROFIT", self.take_profit_pct,
@@ -284,6 +462,20 @@ class PortfolioManager:
             if pnl_ratio <= self.stop_loss_pct:
                 self._exit_position(position, "STOP-LOSS", self.stop_loss_pct,
                                     {"pnl_ratio": pnl_ratio}, log_func)
+                continue
+
+            # Wang edge decay: an additional, earlier exit signal alongside
+            # the hard take-profit/stop-loss limits above, not a replacement
+            # for them. A position that no longer has edge is dead money
+            # even if it hasn't hit stop-loss yet.
+            wang_decay = self._check_wang_edge_decay(wang_result)
+            if wang_decay is not None:
+                self._exit_position(position, "WANG-EDGE-DECAY", self.wang_decay_threshold, {
+                    "pnl_ratio": pnl_ratio,
+                    "wang_edge": round(wang_decay["edge"], 4),
+                    "wang_fair_value": round(wang_decay["fair_value"], 4),
+                    "reason": "edge collapsed below wang_min_edge/2 — closing regardless of P&L",
+                }, log_func)
                 continue
 
             estimated_hold_ev = self._position_live_ev(position)

@@ -3,13 +3,12 @@ import json
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
-import pytest
 from freezegun import freeze_time
 
 from brains.crypto import HybridCryptoBrain
 from core.models import MarketData
 from core.trading_config import TradingConfig
-from hunters.clients.binance import BinanceClient
+from hunters.clients.ccxt_client import CCXTDataClient
 from hunters.crypto import CryptoHunter
 
 
@@ -44,7 +43,7 @@ def test_hunt_returns_marketdata_with_valid_fields():
     hunter = CryptoHunter(symbols=["BTCUSDT"])
     event = _gamma_event(question="Will BTC exceed $95000?", price=0.55, volume=500_000)
 
-    with patch.object(BinanceClient, "get_latest_value", return_value=95_000.0), \
+    with patch.object(CCXTDataClient, "get_latest_value", return_value=95_000.0), \
          patch("hunters.base.crequests.get") as mock_gamma:
         mock_gamma.side_effect = [_mock_resp([event]), _mock_resp([])]
 
@@ -68,7 +67,7 @@ def test_hunt_result_feeds_brain_evaluate():
         question="Will BTC exceed $95000?", price=0.55, volume=500_000,
     )
     # Inject expiry into the market after hunt
-    with patch.object(BinanceClient, "get_latest_value", return_value=97_000.0), \
+    with patch.object(CCXTDataClient, "get_latest_value", return_value=97_000.0), \
          patch("hunters.base.crequests.get") as mock_gamma:
         mock_gamma.side_effect = [_mock_resp([event]), _mock_resp([])]
         market = hunter.hunt(skip_ids=[])
@@ -95,7 +94,7 @@ def test_asset_mismatch_guard_blocks_cross_contamination():
         question="Will ETH exceed $5000?",
         price=0.50, volume=500_000,
     )
-    with patch.object(BinanceClient, "get_latest_value", return_value=95_000.0), \
+    with patch.object(CCXTDataClient, "get_latest_value", return_value=95_000.0), \
          patch("hunters.base.crequests.get") as mock_gamma:
         # Both alias scans ("Bitcoin" and "BTC") get the eth event
         mock_gamma.side_effect = [

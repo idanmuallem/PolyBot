@@ -1,14 +1,13 @@
 """Domain-specific fair value brains: Crypto (Black-Scholes/Heston), Weather (normal), Economy (normal)."""
 
 from .base import BaseBrain
-from .crypto import CryptoBrain, HybridCryptoBrain
+from .crypto import HybridCryptoBrain
 from .weather import WeatherBrain
 from .economy import EconomyBrain
 
 __all__ = [
     "BaseBrain",
     "HybridCryptoBrain",
-    "CryptoBrain",
     "WeatherBrain",
     "EconomyBrain",
 ]

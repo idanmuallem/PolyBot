@@ -133,3 +133,49 @@ def test_sigmoid_zero_current_price_returns_half():
 def test_sigmoid_zero_strike_price_returns_half():
     brain = HybridCryptoBrain()
     assert brain._price_short_term(100_000.0, 0) == 0.5
+
+
+# ── Enriched live_truth (CCXTDataClient dict) ────────────────────────────────
+
+def test_calculate_probability_accepts_enriched_dict():
+    brain = HybridCryptoBrain()
+    market = _make_market()
+    enriched = {
+        "spot_price": 95_000.0,
+        "vol_30d": 0.4,
+        "vol_60d": 0.45,
+        "vol_90d": 0.5,
+        "funding_rate": 0.0001,
+        "volume_24h": 1_000_000.0,
+        "spread": 0.001,
+    }
+    # Should not raise, and should match the float-only call using the same spot price.
+    prob_dict = brain._calculate_probability(market, enriched)
+    prob_float = brain._calculate_probability(market, 95_000.0)
+    assert 0.0 <= prob_dict <= 1.0
+    # They can differ (dict path uses realized vol instead of the hardcoded
+    # default), but both must be valid probabilities computed from the same spot.
+    assert isinstance(prob_float, float)
+
+
+def test_select_volatility_prefers_realized_vol_when_enriched():
+    brain = HybridCryptoBrain()
+    market = _make_market(expiry="2026-06-15")  # short horizon -> vol_30d
+    enriched = {"spot_price": 95_000.0, "vol_30d": 0.42, "vol_60d": 0.5, "vol_90d": 0.6}
+    with freeze_time("2026-06-01T00:00:00+00:00"):
+        vol = brain._select_volatility(market, enriched)
+    assert vol == pytest.approx(0.42)
+
+
+def test_select_volatility_falls_back_without_enriched_data():
+    brain = HybridCryptoBrain()
+    market = _make_market(asset_type="Crypto::BTCUSDT")
+    assert brain._select_volatility(market, None) == brain.get_volatility_for_symbol("Crypto::BTCUSDT")
+
+
+def test_unpack_live_truth_float_vs_dict():
+    spot, enriched = HybridCryptoBrain._unpack_live_truth(95_000.0)
+    assert spot == 95_000.0 and enriched is None
+
+    spot, enriched = HybridCryptoBrain._unpack_live_truth({"spot_price": 95_000.0, "vol_30d": 0.4})
+    assert spot == 95_000.0 and enriched == {"spot_price": 95_000.0, "vol_30d": 0.4}

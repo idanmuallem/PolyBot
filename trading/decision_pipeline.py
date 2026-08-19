@@ -8,27 +8,52 @@ Pipeline order per loop:
 """
 
 import asyncio
+import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 from brains import get_brain_for_asset_type
-from core.models import PRICE_FLOOR, PRICE_CEILING
-from core.trading_config import TradingConfig
-from polymarket import PolymarketScannerHunter
-from trading.budget_manager import BudgetManager
-from trading.executor import TradeExecutor
-from trading.risk_manager import PortfolioManager
+from brains.base import calculate_tte
+from brains.pricing_engine import PricingEngine
+from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
+from core.wallet_context import WalletContext
+from polymarket import PolymarketClient
+from trading.strategies import EventSumStrategy, Strategy
+
+
+def sync_live_account_state(bridge, executor, portfolio_manager, log_func):
+    """Refresh live positions and collateral balance into bridge state.
+
+    Free function (not a pipeline method) so it can run before a
+    SequentialTradingPipeline exists — e.g. by a caller wiring up
+    WalletContext components, which needs a live balance to construct
+    BudgetManager with an accurate initial_balance.
+    """
+    try:
+        portfolio_manager._refresh_portfolio()
+    except Exception as exc:
+        log_func("SYNC-WARN", "Pipeline", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
+
+    try:
+        balance = float(executor.get_balance())
+        bridge.current_balance = balance
+        bridge.cash = balance
+    except Exception as exc:
+        log_func("SYNC-WARN", "Pipeline", "balance", {"reason": "balance_fetch_failed", "error": str(exc)})
 
 
 @dataclass
 class CandidateTrade:
-    market: object
+    market: MarketData
     token_id: str
     asset_type: str
     question: str
     fair_value: float
-    kelly_size: float
+    raw_probability: float
+    kelly_size: float       # raw Kelly criterion fraction (edge/odds), before confidence/kelly_fraction scaling
+    kelly_bet_usd: float    # final dollar bet size — confidence- and kelly_fraction-scaled, clamped to max_bet_size_usd
     model_used: str
     price_yes: float
     side: str
@@ -36,44 +61,70 @@ class CandidateTrade:
     ev_no: float
     final_ev: float
     entry_price: float
+    pricing_mode: str = "wang"
+    wang_lambda: Optional[float] = None
+    wang_fair_value: Optional[float] = None
+    wang_edge: Optional[float] = None
+    strategy_type: str = "model"       # "model" for brain-driven trades, "arbitrage" etc. for strategies
+    kelly_fraction_used: float = 0.0   # the config.kelly_fraction applied when this bet was sized
+    correlation_exposure: float = 0.0  # avg correlation with the currently open book (see trading/correlation.py)
 
 
 class SequentialTradingPipeline:
-    def __init__(self, bridge, log_func, delay: float | None = None):
-        self.bridge = bridge
+    def __init__(self, ctx: WalletContext, log_func, delay: float | None = None):
+        if not all([ctx.executor, ctx.scanner, ctx.portfolio_manager, ctx.budget_manager]):
+            missing = [name for name, val in [
+                ("executor", ctx.executor),
+                ("scanner", ctx.scanner),
+                ("portfolio_manager", ctx.portfolio_manager),
+                ("budget_manager", ctx.budget_manager),
+            ] if val is None]
+            raise ValueError(f"WalletContext missing required components: {missing}")
+
+        self.ctx = ctx
+        self.bridge = ctx.bridge
+        self.config = ctx.config
+        self.db_path = ctx.db_path
         self.log_func = log_func
-        self.config = TradingConfig.from_env()
         self.loop_delay = float(delay) if delay is not None else float(self.config.loop_delay_seconds)
         self.min_ev_threshold = float(self.config.min_ev)
         self.max_bet_size_usd = float(self.config.max_bet_size_usd)
         self.safe_minimum = 1.0
 
-        self.executor = TradeExecutor()
-        self.hunter = PolymarketScannerHunter(
-            bridge=self.bridge,
-            executor=self.executor,
-            config=self.config,
-        )
-        self.portfolio_manager = PortfolioManager(
-            bridge=self.bridge,
-            executor=self.executor,
-            config=self.config,
-            hunter=self.hunter,
+        # Wang Transform pricing (see brains/pricing_engine.py). "legacy" skips
+        # the Wang adjustment and uses the brain's raw EV, for A/B comparison.
+        self.pricing_mode = str(getattr(self.config, "pricing_mode", "wang") or "wang").lower()
+        self.wang_min_edge = float(getattr(self.config, "wang_min_edge", 0.05))
+        self.pricing_engine = PricingEngine(
+            base_lambda=float(getattr(self.config, "wang_base_lambda", 0.183))
         )
 
-        self._sync_live_account_state()
+        self.executor = ctx.executor
+        self.hunter = ctx.scanner
+
+        # Constraint-based strategies (arbitrage) — model-free, run independently
+        # of the brain/PricingEngine path above. See _stage_strategy_scan().
+        self.polymarket_client = PolymarketClient()
+        self.strategies: list[Strategy] = [EventSumStrategy(config=self.config)]
+        self.strategy_scan_interval = 30.0  # don't hammer the Gamma API every loop tick
+        self._last_strategy_scan = 0.0
+        self.portfolio_manager = ctx.portfolio_manager
+
+        sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
         if float(getattr(self.bridge, "starting_balance", 0.0) or 0.0) <= 0.0:
             self.bridge.starting_balance = float(self.bridge.current_balance)
 
-        self.budget_manager = BudgetManager(
-            bridge=self.bridge,
-            config=self.config,
-            initial_balance=float(self.bridge.current_balance),
-        )
+        self.budget_manager = ctx.budget_manager
 
         self.spent_today = float(getattr(self.bridge, "spent_today", 0.0) or 0.0)
         self.spend_day = datetime.now(timezone.utc).date()
         self.start_of_day_equity = float(getattr(self.bridge, "start_of_day_equity", 0.0) or 0.0)
+
+        # Drawdown circuit breaker — pauses new trade entry (not exits) once
+        # equity has fallen more than max_drawdown_pct from its peak.
+        self.max_drawdown_pct = float(getattr(self.config, "max_drawdown_pct", 0.20))
+        self.peak_equity = self._total_equity()
+        self._update_drawdown_guard()
 
     # ------------------------------------------------------------------
     # Bridge helpers — keep related fields in sync
@@ -90,25 +141,73 @@ class SequentialTradingPipeline:
     def _total_equity(self) -> float:
         return float(self.bridge.current_balance) + float(self.bridge.open_position_value)
 
+    def _update_drawdown_guard(self):
+        """Drawdown circuit breaker: pause new trade entry (not position
+        management/exits) once equity has fallen more than max_drawdown_pct
+        from its peak. Call every loop tick, after balances/positions are synced.
+
+        The peak-tracking/threshold pattern mirrors oracle3's
+        StandardRiskManager._check_drawdown() (oracle3/risk/risk_manager.py) -
+        https://github.com/YichengYang-Ethan/oracle3, licensed under the
+        Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+        """
+        current_equity = self._total_equity()
+        if current_equity > self.peak_equity:
+            self.peak_equity = current_equity
+
+        drawdown_pct = (
+            (self.peak_equity - current_equity) / self.peak_equity
+            if self.peak_equity > 0 else 0.0
+        )
+        should_pause = drawdown_pct >= self.max_drawdown_pct
+
+        was_paused = bool(getattr(self.ctx, "drawdown_paused", False))
+        self.ctx.drawdown_paused = should_pause
+        self.bridge.drawdown_paused = should_pause
+        self.bridge.peak_equity = self.peak_equity
+        self.bridge.current_drawdown_pct = drawdown_pct
+
+        if should_pause and not was_paused:
+            self.log_func("CIRCUIT-BREAKER", "Pipeline", "drawdown", {
+                "reason": "max_drawdown_pct breached — new trade entry paused; "
+                          "position management/exits still run",
+                "peak_equity": round(self.peak_equity, 4),
+                "current_equity": round(current_equity, 4),
+                "drawdown_pct": round(drawdown_pct, 4),
+                "max_drawdown_pct": self.max_drawdown_pct,
+            })
+        elif was_paused and not should_pause:
+            self.log_func("CIRCUIT-BREAKER-CLEAR", "Pipeline", "drawdown", {
+                "reason": "equity recovered above max_drawdown_pct — new trade entry resumed",
+                "peak_equity": round(self.peak_equity, 4),
+                "current_equity": round(current_equity, 4),
+                "drawdown_pct": round(drawdown_pct, 4),
+            })
+
     def _reject(self, level: str, candidate: CandidateTrade, payload: dict):
         """Log a rejection, cool down the market, and signal the pipeline to skip."""
         self.log_func(level, candidate.asset_type, candidate.token_id, payload)
         self.hunter.add_to_cooldown(candidate.token_id)
         return 0.0, None
 
+    @staticmethod
+    def _analytics_log_fields(candidate: CandidateTrade) -> dict:
+        """Pricing/risk fields for log payloads (Phase 3 Wang fields, Phase 7
+        strategy/kelly/correlation fields) — lets us compare raw-brain EV
+        against the Wang-adjusted edge, and separate model-driven from
+        strategy-driven performance, from the trade history alone."""
+        return {
+            "pricing_mode": candidate.pricing_mode,
+            "raw_probability": round(candidate.raw_probability, 4),
+            "wang_lambda": round(candidate.wang_lambda, 4) if candidate.wang_lambda is not None else None,
+            "wang_fair_value": round(candidate.wang_fair_value, 4) if candidate.wang_fair_value is not None else None,
+            "wang_edge": round(candidate.wang_edge, 4) if candidate.wang_edge is not None else None,
+            "strategy_type": candidate.strategy_type,
+            "kelly_fraction_used": round(candidate.kelly_fraction_used, 4),
+            "correlation_exposure": round(candidate.correlation_exposure, 4),
+        }
+
     # ------------------------------------------------------------------
-
-    def _sync_live_account_state(self):
-        """Refresh live positions and collateral balance into bridge state."""
-        try:
-            self.portfolio_manager._refresh_portfolio()
-        except Exception as exc:
-            self.log_func("SYNC-WARN", "Pipeline", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
-
-        try:
-            self._set_cash(float(self.executor.get_balance()))
-        except Exception as exc:
-            self.log_func("SYNC-WARN", "Pipeline", "balance", {"reason": "balance_fetch_failed", "error": str(exc)})
 
     def _reset_daily_if_needed(self):
         current_day = datetime.now(timezone.utc).date()
@@ -119,6 +218,163 @@ class SequentialTradingPipeline:
             self._set_spend(0.0)
             self.bridge.start_of_day_equity = 0.0
             self.budget_manager.total_spent_today = 0.0
+
+    # ------------------------------------------------------------------
+    # Strategy scan — constraint-based arbitrage, independent of the
+    # brain/PricingEngine path (no probability estimate needed).
+    # ------------------------------------------------------------------
+
+    def _tag_log_func(self, strategy_type: str):
+        """Wrap self.log_func so every payload it forwards carries
+        strategy_type — strategy-driven trades share the executor's own
+        internal log_func calls (AUTO-TRADE, DRY-RUN, ...) with model-driven
+        ones, so this is how their P&L stays separable in the log/analytics
+        layer.
+        """
+        base_log_func = self.log_func
+
+        def _tagged(level, asset_type, token_id, payload):
+            if isinstance(payload, dict):
+                payload = {**payload, "strategy_type": strategy_type}
+            else:
+                payload = {"message": payload, "strategy_type": strategy_type}
+            base_log_func(level, asset_type, token_id, payload)
+
+        return _tagged
+
+    @staticmethod
+    def _group_signals(signals: list) -> dict:
+        groups: dict = {}
+        for signal in signals:
+            groups.setdefault(signal.group_id, []).append(signal)
+        return groups
+
+    async def _stage_strategy_scan(self):
+        """Run every registered Strategy and execute any signals it emits.
+
+        Runs alongside _stage_evaluate_ev (not instead of it): strategies
+        find trades directly from market-price arithmetic, so they skip the
+        brain/PricingEngine path entirely and go straight to execution.
+        """
+        if not self.strategies:
+            return
+
+        now = time.monotonic()
+        if now - self._last_strategy_scan < self.strategy_scan_interval:
+            return
+        self._last_strategy_scan = now
+
+        try:
+            events = self.polymarket_client.get_multi_outcome_events(limit=100)
+        except Exception as exc:
+            self.log_func("SYNC-WARN", "Strategy", "event_fetch", {
+                "reason": "event_fetch_failed", "error": str(exc),
+            })
+            return
+
+        for strategy in self.strategies:
+            try:
+                signals = await strategy.scan(events)
+            except Exception as exc:
+                self.log_func("SYNC-WARN", "Strategy", strategy.strategy_type, {
+                    "reason": "scan_failed", "error": str(exc),
+                })
+                continue
+
+            for group_id, group_signals in self._group_signals(signals).items():
+                self._execute_strategy_group(strategy, group_id, group_signals)
+
+    def _execute_strategy_group(self, strategy: Strategy, group_id: str, signals: list):
+        """Execute every leg of one strategy opportunity (e.g. every outcome
+        of one event_sum arb) through the same TradeExecutor used by
+        model-driven trades, via the lower-level execute_trade() rather than
+        evaluate_and_execute(): the strategy already vetted the trade's
+        profitability itself (its own min_edge, not config.min_ev), and its
+        leg prices are expected to sit outside the single-market
+        PRICE_FLOOR/PRICE_CEILING band by design.
+
+        Best-effort, not atomic: if a leg's order fails, the rest still
+        attempt to fill (same as oracle3's contrib strategy) — real
+        atomicity would require a settlement layer this pipeline doesn't have.
+        """
+        if not signals:
+            return
+
+        tagged_log = self._tag_log_func(strategy.strategy_type)
+        asset_type = signals[0].market.asset_type
+
+        total_cost = sum(float(s.bet_amount_usd) for s in signals)
+        cash_balance = float(self.bridge.current_balance)
+        remaining_budget = float(self.budget_manager.get_remaining_budget())
+
+        if total_cost > cash_balance or total_cost > remaining_budget:
+            tagged_log("REJECTED", asset_type, group_id, {
+                "reason": "insufficient_cash_or_budget_for_all_legs",
+                "group_id": group_id,
+                "n_legs": len(signals),
+                "total_cost": round(total_cost, 4),
+                "cash_balance": round(cash_balance, 4),
+                "remaining_budget": round(remaining_budget, 4),
+            })
+            return
+
+        if self.executor.trade_count_today + len(signals) > self.config.max_daily_trades:
+            tagged_log("REJECTED", asset_type, group_id, {
+                "reason": "daily_trade_limit_would_be_exceeded",
+                "group_id": group_id,
+                "n_legs": len(signals),
+            })
+            return
+
+        executed_legs = 0
+        for signal in signals:
+            shares = math.floor((signal.bet_amount_usd / signal.price) * 100.0) / 100.0
+            if shares <= 0:
+                continue
+
+            token_id = (
+                signal.market.market_id if signal.side == "YES"
+                else str(getattr(signal.market, "no_market_id", None) or signal.market.market_id)
+            )
+
+            executed = self.executor.execute_trade(
+                token_id=signal.market.market_id,
+                current_poly_price=signal.price,
+                shares=shares,
+                bet_amount=signal.bet_amount_usd,
+                asset_type=signal.market.asset_type,
+                side=signal.side,
+                no_token_id=getattr(signal.market, "no_market_id", None),
+                log_func=tagged_log,
+            )
+
+            tagged_log("STRATEGY-LEG", signal.market.asset_type, token_id, {
+                "group_id": group_id,
+                "market_name": signal.market.market_name,
+                "reasoning": signal.reasoning,
+                "edge": round(signal.edge, 4),
+                "price": round(signal.price, 4),
+                "bet_usd": round(signal.bet_amount_usd, 2),
+                "shares": shares,
+                "side": signal.side,
+                "executed": bool(executed),
+            })
+
+            if executed:
+                executed_legs += 1
+                self.executor.trade_count_today += 1
+                self.budget_manager.record_trade(float(signal.bet_amount_usd))
+                self.spent_today = float(self.budget_manager.total_spent_today)
+                self._set_spend(self.spent_today)
+
+        tagged_log("STRATEGY-GROUP", asset_type, group_id, {
+            "group_id": group_id,
+            "strategy_type": strategy.strategy_type,
+            "n_legs": len(signals),
+            "executed_legs": executed_legs,
+            "edge": round(signals[0].edge, 4),
+            "total_cost": round(total_cost, 4),
+        })
 
     def _stage_hunt(self):
         market, hunter = self.hunter.get_active_markets(self.log_func)
@@ -165,28 +421,87 @@ class SequentialTradingPipeline:
             self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "live_truth unavailable"})
             return None
 
-        self.bridge.market_actual = live_truth
+        # live_truth is a bare float for most hunters, but CryptoHunter now
+        # returns CCXTDataClient's enriched data package (dict) — keep the
+        # bridge display field numeric either way.
+        self.bridge.market_actual = (
+            float(live_truth.get("spot_price") or 0.0) if isinstance(live_truth, dict) else float(live_truth)
+        )
         brain = get_brain_for_asset_type(asset_type)
-        signal = brain.evaluate(market, float(live_truth), min_ev=self.min_ev_threshold)
+        raw_probability = float(brain.get_raw_probability(market, live_truth))
         model_used = getattr(brain, "last_model_used", "unknown")
 
-        self.bridge.forecast = float(signal.fair_value)
-        self.bridge.ev = float(signal.expected_value)
+        wang_lambda = wang_fair_value = wang_edge = None
+        confidence = 1.0
+
+        if self.pricing_mode == "legacy":
+            fair_value = raw_probability
+        else:
+            volume = float(getattr(market, "volume", 0.0) or 0.0)
+            days_to_expiry = calculate_tte(getattr(market, "expiry_date", None))
+            edge_result = self.pricing_engine.compute_edge(
+                p_true=raw_probability,
+                market_price=poly_price,
+                volume=volume,
+                days_to_expiry=days_to_expiry,
+            )
+            wang_lambda = float(edge_result["lambda_used"])
+            wang_fair_value = float(edge_result["fair_value"])
+            wang_edge = float(edge_result["edge"])
+            confidence = float(edge_result["confidence"])
+            fair_value = wang_fair_value
+
+            if abs(wang_edge) < self.wang_min_edge:
+                self.log_func("SCAN-SKIP", asset_type, token_id, {
+                    "reason": "wang_edge below minimum",
+                    "raw_probability": round(raw_probability, 4),
+                    "wang_lambda": round(wang_lambda, 4),
+                    "wang_fair_value": round(wang_fair_value, 4),
+                    "wang_edge": round(wang_edge, 4),
+                    "wang_min_edge": self.wang_min_edge,
+                })
+                return None
+
+        self.bridge.forecast = float(fair_value)
 
         price_yes = float(poly_price)
-        ev_yes = (float(signal.fair_value) / float(price_yes) - 1.0) if price_yes > 0 else -1.0
+        ev_yes = (float(fair_value) / float(price_yes) - 1.0) if price_yes > 0 else -1.0
         price_no = max(1e-9, 1.0 - float(price_yes))
-        fair_no = 1.0 - float(signal.fair_value)
+        fair_no = 1.0 - float(fair_value)
         ev_no = (fair_no / price_no - 1.0) if price_no > 0 else -1.0
+        self.bridge.ev = float(ev_yes)
 
         side = "YES" if ev_yes > ev_no else "NO"
         final_ev = max(ev_yes, ev_no)
         entry_price = float(price_yes if side == "YES" else price_no)
 
+        # Kelly sizing (BudgetManager.compute_kelly_bet_size): kelly_optimal =
+        # edge/odds for whichever side was actually picked — YES odds are
+        # (1 - price), NO odds are the complementary YES price — scaled by
+        # model confidence and kelly_fraction (quarter-Kelly by default),
+        # then clamped to max_bet_size_usd as a hard ceiling.
+        if side == "YES":
+            kelly_edge = float(fair_value) - price_yes
+            kelly_odds = 1.0 - price_yes
+        else:
+            kelly_edge = fair_no - price_no
+            kelly_odds = price_yes  # == 1 - price_no
+
+        kelly_raw_fraction = max(0.0, kelly_edge / kelly_odds) if kelly_odds > 0 else 0.0
+        kelly_bet_usd = self.budget_manager.compute_kelly_bet_size(kelly_edge, kelly_odds, confidence)
+
+        # Correlation exposure (see trading/correlation.py): how correlated
+        # this candidate is with the currently open book, on average — logged
+        # for analysis, not yet a hard sizing input (that's future work).
+        correlation_exposure = self.portfolio_manager.correlation_exposure_for(asset_type)
+
         diag = (
-            f"[EV-MATH] YES(P: {price_yes:.3f}, FV: {float(signal.fair_value):.3f}, EV: {ev_yes:.2f}) | "
+            f"[EV-MATH] mode={self.pricing_mode} raw_p={raw_probability:.3f} "
+            f"YES(P: {price_yes:.3f}, FV: {float(fair_value):.3f}, EV: {ev_yes:.2f}) | "
             f"NO(P: {price_no:.3f}, FV: {fair_no:.3f}, EV: {ev_no:.2f}) | PICK: {side}"
         )
+        if wang_edge is not None:
+            diag += f" | wang_lambda={wang_lambda:.3f} wang_edge={wang_edge:.3f}"
         print(diag)
         self.bridge.terminal_logs.appendleft(diag)
 
@@ -195,8 +510,10 @@ class SequentialTradingPipeline:
             token_id=token_id,
             asset_type=asset_type,
             question=question,
-            fair_value=float(signal.fair_value),
-            kelly_size=float(signal.kelly_size),
+            fair_value=float(fair_value),
+            raw_probability=raw_probability,
+            kelly_size=float(kelly_raw_fraction),
+            kelly_bet_usd=float(kelly_bet_usd),
             model_used=model_used,
             price_yes=price_yes,
             side=side,
@@ -204,11 +521,17 @@ class SequentialTradingPipeline:
             ev_no=float(ev_no),
             final_ev=float(final_ev),
             entry_price=float(entry_price),
+            pricing_mode=self.pricing_mode,
+            wang_lambda=wang_lambda,
+            wang_fair_value=wang_fair_value,
+            wang_edge=wang_edge,
+            strategy_type="model",
+            kelly_fraction_used=self.budget_manager.kelly_fraction,
+            correlation_exposure=float(correlation_exposure),
         )
 
     def _stage_risk_and_budget(self, candidate: CandidateTrade):
         cash_balance = float(self.bridge.current_balance)
-        total_equity = self._total_equity()
 
         if cash_balance < self.safe_minimum:
             self.bridge.status = "Portfolio Management Mode (cash below $1.00)"
@@ -229,6 +552,7 @@ class SequentialTradingPipeline:
                 "side": candidate.side,
                 "ev": round(candidate.final_ev, 4),
                 "threshold": self.min_ev_threshold,
+                **self._analytics_log_fields(candidate),
             })
 
         if candidate.entry_price < PRICE_FLOOR or candidate.entry_price > PRICE_CEILING:
@@ -243,15 +567,20 @@ class SequentialTradingPipeline:
                 "price_no": round(1.0 - candidate.price_yes, 4),
             })
 
-        target_bet = total_equity * candidate.kelly_size
+        # candidate.kelly_bet_usd is already confidence/kelly_fraction-scaled
+        # and clamped to max_bet_size_usd by BudgetManager.compute_kelly_bet_size();
+        # re-apply the ceiling explicitly here too, since it must hold as a
+        # hard cap regardless of how the bet size was derived upstream.
+        target_bet = candidate.kelly_bet_usd
         desired_bet = min(target_bet, self.max_bet_size_usd)
 
-        budget_bet, budget_ok = self.budget_manager.check_and_cap_bet(candidate.kelly_size)
+        budget_bet, budget_ok = self.budget_manager.cap_to_remaining_budget(desired_bet)
         if not budget_ok:
             return self._reject("REJECTED", candidate, {
                 "market_name": candidate.question,
                 "reason": "daily_limit_reached",
                 "kelly_size": round(candidate.kelly_size, 4),
+                "kelly_bet_usd": round(candidate.kelly_bet_usd, 4),
                 "daily_limit_usd": round(float(self.budget_manager.daily_limit_usd), 4),
                 "spent_today": round(float(self.budget_manager.total_spent_today), 4),
             })
@@ -335,6 +664,7 @@ class SequentialTradingPipeline:
                 "side": candidate.side,
                 "kelly": round(float(candidate.kelly_size), 4),
                 "bet_usd": round(float(approved_bet), 2),
+                **self._analytics_log_fields(candidate),
                 "executed": bool(executed),
                 "total_equity": round(float(total_equity), 4),
                 "max_bet_size_usd": round(float(self.max_bet_size_usd), 2),
@@ -356,9 +686,15 @@ class SequentialTradingPipeline:
             requested_live = bool(getattr(self.bridge, "live_trading", False))
             self.executor.dry_run = not requested_live
 
-            self._sync_live_account_state()
-            self.portfolio_manager.manage_portfolio(self.log_func)
-            self._sync_live_account_state()
+            sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
+            self.portfolio_manager.manage_portfolio(self.log_func)  # exits always run, even while paused
+            sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
+            self._update_drawdown_guard()
+
+            if self.ctx.drawdown_paused:
+                continue  # circuit breaker: skip new-entry scanning/execution below
+
+            await self._stage_strategy_scan()
 
             stage1 = self._stage_hunt()
             if not stage1:
@@ -376,7 +712,32 @@ class SequentialTradingPipeline:
             self._stage_execute(candidate, approved_bet, risk_context)
 
 
-async def run_market_monitor(bridge, log_func, delay: float | None = None):
-    """Canonical entrypoint for the trading monitor loop."""
-    pipeline = SequentialTradingPipeline(bridge=bridge, log_func=log_func, delay=delay)
+def _default_log_func(ctx: WalletContext):
+    """Bare log_func that just persists events to this wallet's own DB.
+
+    Callers that want richer behavior (e.g. the dashboard's terminal-log
+    formatting) build and pass their own log_func instead — this default only
+    exists so a caller like WalletManager can drive a wallet from nothing more
+    than its WalletContext.
+    """
+    import ui.data_manager as data_manager
+
+    def _log(level, asset_type, token_id, payload):
+        data_manager.log_event(ctx.bridge, level, asset_type, token_id, payload, db_path=ctx.db_path)
+
+    return _log
+
+
+async def run_market_monitor(ctx: WalletContext, log_func=None, delay: float | None = None):
+    """Canonical entrypoint for the trading monitor loop.
+
+    log_func stays a separate, optional parameter (not a WalletContext field)
+    because it's the caller's event-logging closure — it already captures
+    ctx.db_path itself when persisting events (see ui/dashboard.py's
+    _log_event), so the pipeline never needs to know about database paths
+    directly. Omit it to fall back to a bare per-wallet logger.
+    """
+    if log_func is None:
+        log_func = _default_log_func(ctx)
+    pipeline = SequentialTradingPipeline(ctx=ctx, log_func=log_func, delay=delay)
     await pipeline.run_forever()

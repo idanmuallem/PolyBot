@@ -5,7 +5,6 @@ Wraps the Polymarket CLOB client. Execution is gated by EV threshold, daily
 trade count, and price bounds. Supports dry-run, paper-trade, and live modes.
 """
 
-import os
 import logging
 import math
 from typing import Optional, Dict, Any, Callable, List
@@ -38,21 +37,13 @@ class TradeExecutor:
     Modes: dry_run (simulate only), paper_trade (log only), live (real orders).
     """
 
-    def __init__(self):
-        self.config = TradingConfig.from_env()
+    def __init__(self, config: TradingConfig):
+        self.config = config
         self.trade_count_today = 0
         self.dry_run = self.config.dry_run
         self.paper_trade_mode = self.config.paper_trade_mode
         self.proxy_address = self.config.proxy_address
         self.client = None
-
-        print("\n" + "=" * 30)
-        print("=== EXECUTOR BOOT DIAGNOSTIC ===")
-        print(f"1. CLOB Import OK:    {CLOB_IMPORT_OK}")
-        print(f"2. Private Key Found: {bool(self.config.private_key)}")
-        print(f"3. Proxy Addr Found:  {bool(self.config.proxy_address)}")
-        print(f"4. Dry Run Mode:      {self.dry_run}")
-        print("=" * 30 + "\n")
 
         if not CLOB_IMPORT_OK:
             print("[FATAL] py-clob-client is not loaded correctly!")
@@ -145,7 +136,7 @@ class TradeExecutor:
     def get_balance(self) -> float:
         """Fetch available CLOB collateral balance (deployable cash)."""
         if self.dry_run or self.client is None:
-            return float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
+            return float(self.config.paper_balance_usd)
 
         try:
             if hasattr(self.client, "get_collateral_balance"):

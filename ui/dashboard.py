@@ -18,25 +18,26 @@ import time
 import pandas as pd
 import streamlit as st
 
-from trading.decision_pipeline import run_market_monitor
+from trading.decision_pipeline import run_market_monitor, sync_live_account_state
+from trading.executor import TradeExecutor
+from trading.risk_manager import PortfolioManager
+from trading.budget_manager import BudgetManager
 import ui.data_manager as data_manager
-from polymarket import PolymarketClient
-from core.bridge import get_bridge
-from ui.components import render_activity_chart, render_equity_curve, render_ev_chart, render_positions
+from polymarket import PolymarketClient, PolymarketScannerHunter
+from core.bridge import get_bridge, DataBridge
+from core.trading_config import TradingConfig
+from core.wallet_context import WalletContext
+from ui.components import (
+    render_activity_chart, render_correlation_matrix, render_equity_curve,
+    render_ev_chart, render_positions,
+)
 
 st.set_page_config(page_title="PolyBot Quant Pro", page_icon="🛰️", layout="wide")
-bridge = get_bridge()
 
 
 # ---------------------------------------------------------------------------
 # Environment helpers
 # ---------------------------------------------------------------------------
-
-def _as_bool(raw: str, default: bool) -> bool:
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
 
 def _get_env(*names: str) -> str:
     for name in names:
@@ -46,23 +47,32 @@ def _get_env(*names: str) -> str:
     return ""
 
 
-def _validate_runtime_env() -> dict:
-    private_key = _get_env("POLYMARKET_PRIVATE_KEY", "POLYGON_PRIVATE_KEY")
-    proxy_address = _get_env("POLYMARKET_PROXY_ADDRESS", "POLY_ADDRESS")
-    if not private_key or not proxy_address:
-        raise ValueError(
-            "Missing required environment variables: "
-            "POLYMARKET_PRIVATE_KEY/POLYGON_PRIVATE_KEY and "
-            "POLYMARKET_PROXY_ADDRESS/POLY_ADDRESS. "
-            "Pass them at runtime with --env-file."
-        )
-    return {
-        "dry_run": _as_bool(os.getenv("DRY_RUN", "true"), True),
-        "paper_trade_mode": _as_bool(os.getenv("PAPER_TRADE_MODE", "false"), False),
-        "daily_limit_usd": float(os.getenv("DAILY_LIMIT_USD", "100.0")),
-        "paper_balance_usd": float(os.getenv("PAPER_BALANCE_USD", "1000.0")),
-        "trades_db_path": os.getenv("TRADES_DB_PATH", "/app/trades.db"),
-    }
+def _validate_runtime_env(bridge: DataBridge) -> WalletContext:
+    """Build the single WalletContext this dashboard drives.
+
+    Prefers a wallet config file (WALLET_CONFIG_PATH) if one is set; falls back
+    to TradingConfig.from_env() for backward compatibility with deployments
+    that only set process env vars and have no wallet config file yet.
+    """
+    wallet_config_path = _get_env("WALLET_CONFIG_PATH")
+
+    if wallet_config_path:
+        config = TradingConfig.from_file(wallet_config_path)
+    else:
+        private_key = _get_env("POLYMARKET_PRIVATE_KEY", "POLYGON_PRIVATE_KEY")
+        proxy_address = _get_env("POLYMARKET_PROXY_ADDRESS", "POLY_ADDRESS")
+        if not private_key or not proxy_address:
+            raise ValueError(
+                "Missing required environment variables: "
+                "POLYMARKET_PRIVATE_KEY/POLYGON_PRIVATE_KEY and "
+                "POLYMARKET_PROXY_ADDRESS/POLY_ADDRESS. "
+                "Pass them at runtime with --env-file, or set WALLET_CONFIG_PATH "
+                "to a wallet config.json."
+            )
+        config = TradingConfig.from_env()
+
+    db_path = os.getenv("TRADES_DB_PATH", "/app/trades.db")
+    return WalletContext(wallet_id="default", config=config, bridge=bridge, db_path=db_path)
 
 
 _balance_lock = threading.Lock()
@@ -108,48 +118,87 @@ def _fetch_live_balance() -> tuple[float, bool]:
 # Engine startup
 # ---------------------------------------------------------------------------
 
-def _ensure_engine_started_once() -> None:
+def _make_log_event(ctx: WalletContext):
+    """Build this wallet's log_func — captures ctx (and its db_path) via closure
+    instead of reading db_path back out of a module-level dict each call."""
+
+    def _log_event(level, asset_type, token_id, payload):
+        payload_dict = payload if isinstance(payload, dict) else {}
+        reason = str(payload_dict.get("reason", "")).strip()
+        market_name = str(payload_dict.get("market_name", "")).strip()
+        ev_value = payload_dict.get("ev")
+        detail = reason or market_name or str(payload)[:140]
+        ev_suffix = f" | ev={ev_value}" if ev_value is not None else ""
+        ctx.bridge.terminal_logs.appendleft(f"[{level}] {asset_type} - {detail}{ev_suffix}")
+
+        if str(level) in {"REJECTED", "FILTERED", "SCAN-SKIP"} and token_id:
+            ctx.bridge.seen_markets[str(token_id)] = str(payload_dict.get("market_name", ""))
+            if len(ctx.bridge.seen_markets) > 500:
+                keys = list(ctx.bridge.seen_markets.keys())
+                for key in keys[:100]:
+                    ctx.bridge.seen_markets.pop(key, None)
+
+        data_manager.log_event(ctx.bridge, level, asset_type, token_id, payload, db_path=ctx.db_path)
+
+    return _log_event
+
+
+def _ensure_engine_started_once(ctx: WalletContext) -> None:
     # Thread is stored on bridge (a @st.cache_resource singleton) so it
     # survives Streamlit reruns that would otherwise reset a module-level var.
-    if bridge._engine_thread is not None and bridge._engine_thread.is_alive():
+    if ctx.bridge._engine_thread is not None and ctx.bridge._engine_thread.is_alive():
         return
 
     loop = asyncio.new_event_loop()
 
     def _runner() -> None:
         asyncio.set_event_loop(loop)
+        log_func = _make_log_event(ctx)
         try:
-            loop.run_until_complete(run_market_monitor(bridge, _log_event))
+            # Build this wallet's runtime components in dependency order and
+            # attach them to ctx. This runs here (in the background thread,
+            # only once — guarded by the early-return above) rather than in
+            # _ensure_engine_started_once itself, so nothing network-touching
+            # (CLOB auth in TradeExecutor.__init__, the live balance fetch
+            # below) blocks Streamlit's main thread. WalletContext stays a
+            # plain container — this is the one place that builds and wires
+            # what it holds.
+            ctx.executor = TradeExecutor(config=ctx.config)
+            ctx.scanner = PolymarketScannerHunter(
+                bridge=ctx.bridge,
+                executor=ctx.executor,
+                config=ctx.config,
+            )
+            ctx.portfolio_manager = PortfolioManager(
+                bridge=ctx.bridge,
+                executor=ctx.executor,
+                config=ctx.config,
+                hunter=ctx.scanner,
+                db_path=ctx.db_path,
+            )
+
+            # Sync live balance before building BudgetManager so its
+            # initial_balance reflects the account's real collateral, not
+            # the DB-restored snapshot from _bootstrap().
+            sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
+
+            ctx.budget_manager = BudgetManager(
+                bridge=ctx.bridge,
+                config=ctx.config,
+                initial_balance=float(ctx.bridge.current_balance),
+            )
+
+            loop.run_until_complete(run_market_monitor(ctx, log_func))
         except Exception as exc:
             import traceback
             import tempfile
-            bridge.terminal_logs.appendleft(f"[ENGINE-CRASH] {exc}")
+            ctx.bridge.terminal_logs.appendleft(f"[ENGINE-CRASH] {exc}")
             log_path = Path(tempfile.gettempdir()) / "polybot_crash.log"
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"[ENGINE-CRASH] {exc}\n{traceback.format_exc()}\n")
 
-    bridge._engine_thread = threading.Thread(target=_runner, daemon=True, name="polybot-engine")
-    bridge._engine_thread.start()
-
-
-def _log_event(level, asset_type, token_id, payload):
-    payload_dict = payload if isinstance(payload, dict) else {}
-    reason = str(payload_dict.get("reason", "")).strip()
-    market_name = str(payload_dict.get("market_name", "")).strip()
-    ev_value = payload_dict.get("ev")
-    detail = reason or market_name or str(payload)[:140]
-    ev_suffix = f" | ev={ev_value}" if ev_value is not None else ""
-    bridge.terminal_logs.appendleft(f"[{level}] {asset_type} - {detail}{ev_suffix}")
-
-    if str(level) in {"REJECTED", "FILTERED", "SCAN-SKIP"} and token_id:
-        bridge.seen_markets[str(token_id)] = str(payload_dict.get("market_name", ""))
-        if len(bridge.seen_markets) > 500:
-            keys = list(bridge.seen_markets.keys())
-            for key in keys[:100]:
-                bridge.seen_markets.pop(key, None)
-
-    db_path = runtime_env.get("trades_db_path", "/app/trades.db")
-    data_manager.log_event(bridge, level, asset_type, token_id, payload, db_path=db_path)
+    ctx.bridge._engine_thread = threading.Thread(target=_runner, daemon=True, name="polybot-engine")
+    ctx.bridge._engine_thread.start()
 
 
 # ---------------------------------------------------------------------------
@@ -157,13 +206,16 @@ def _log_event(level, asset_type, token_id, payload):
 # ---------------------------------------------------------------------------
 
 def _bootstrap() -> None:
-    global runtime_env
-    # runtime_env is reset to {} on each Streamlit script rerun — re-populate it.
-    runtime_env = _validate_runtime_env()
-    data_manager.init_db(runtime_env["trades_db_path"])
+    global bridge, wallet_ctx
+    # bridge is the cached @st.cache_resource singleton — same instance across
+    # reruns. wallet_ctx itself is rebuilt each rerun (cheap; picks up env
+    # changes) but always wraps that same bridge instance.
+    bridge = get_bridge()
+    wallet_ctx = _validate_runtime_env(bridge)
+    data_manager.init_db(wallet_ctx.db_path)
 
     restored = data_manager.restore_runtime_state(
-        db_path=runtime_env["trades_db_path"],
+        db_path=wallet_ctx.db_path,
         fallback_starting_balance=0.0,
     )
 
@@ -177,16 +229,17 @@ def _bootstrap() -> None:
     bridge.spent_today = float(restored["spent_today"])
     bridge.daily_spend = float(restored["spent_today"])
     bridge.state_bootstrap_source = str(restored["source"])
-    bridge.live_trading = not (bool(runtime_env["dry_run"]) or bool(runtime_env["paper_trade_mode"]))
+    bridge.live_trading = not (bool(wallet_ctx.config.dry_run) or bool(wallet_ctx.config.paper_trade_mode))
     bridge.last_balance_sync_at = 0.0
 
     if bridge.starting_balance <= 0.0:
         bridge.starting_balance = float(restored["current_balance"])
 
-    _ensure_engine_started_once()
+    _ensure_engine_started_once(wallet_ctx)
 
 
-runtime_env: dict = {}
+bridge: DataBridge = None
+wallet_ctx: WalletContext = None
 _bootstrap()
 
 
@@ -210,12 +263,15 @@ def _render_global_kpis() -> None:
 # ---------------------------------------------------------------------------
 
 def _render_hunter_history_table() -> None:
-    history_df = data_manager.fetch_latest_history(limit=80)
+    history_df = data_manager.fetch_latest_history(wallet_ctx.db_path, limit=80)
     if history_df.empty:
         st.info("No hunt history yet. Engine is scanning markets...")
         return
 
-    keep_cols = ["Time", "Action", "Asset", "Side", "EV", "Market Name", "Reject Reason"]
+    keep_cols = [
+        "Time", "Action", "Asset", "Side", "Strategy", "EV",
+        "Raw Prob", "Wang λ", "Wang Edge", "Market Name", "Reject Reason",
+    ]
     compact_df = history_df[[col for col in keep_cols if col in history_df.columns]].copy()
 
     if "Market Name" in compact_df.columns:
@@ -273,6 +329,8 @@ def _render_portfolio_view() -> None:
     render_positions(bridge)
     st.markdown("#### EV by Market")
     render_ev_chart(bridge)
+    st.markdown("#### Correlation")
+    render_correlation_matrix(bridge, wallet_ctx.config)
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +338,7 @@ def _render_portfolio_view() -> None:
 # ---------------------------------------------------------------------------
 
 def _render_balance_stats_row() -> None:
-    stats = data_manager.get_trade_stats()
+    stats = data_manager.get_trade_stats(wallet_ctx.db_path)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Win Rate",     f"{float(stats.get('win_rate', 0.0)):.2f}%")
@@ -298,7 +356,7 @@ def _render_balance_stats_row() -> None:
 def _render_balance_view() -> None:
     st.markdown("### Balance")
     _render_balance_stats_row()
-    render_equity_curve(data_manager)
+    render_equity_curve(data_manager, wallet_ctx.db_path)
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ from typing import Optional
 
 from core.models import MarketData
 from .parsers import extract_crypto_strike
-from .clients.binance import BinanceClient
+from .clients.ccxt_client import CCXTDataClient
 
 from .base import BasePolymarketHunter
 
@@ -14,7 +14,9 @@ from .base import BasePolymarketHunter
 class CryptoHunter(BasePolymarketHunter):
     """Hunt markets related to cryptocurrency prices (BTC, ETH, SOL).
 
-    Anchor: Binance spot price via BinanceClient.
+    Anchor: spot price via CCXTDataClient. Live truth: CCXTDataClient's full
+    enriched data package (spot price, realized vol, funding rate, volume,
+    spread) — the brain uses more than just the spot price now.
     """
 
     DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
@@ -36,14 +38,14 @@ class CryptoHunter(BasePolymarketHunter):
     def __init__(self, symbols: Optional[list] = None, **kwargs):
         super().__init__(**kwargs)
         self.symbols = symbols or list(self.DEFAULT_SYMBOLS)
-        self.binance_client = BinanceClient()
+        self.data_client = CCXTDataClient()
 
     def get_topic_type(self) -> str:
         return "Crypto"
 
     def get_anchor_value(self) -> Optional[float]:
         for symbol in self.symbols:
-            price = self.binance_client.get_latest_value(symbol)
+            price = self.data_client.get_latest_value(symbol)
             if price and price > 0:
                 return price
         return None
@@ -55,11 +57,11 @@ class CryptoHunter(BasePolymarketHunter):
         return ["bitcoin", "btc", "ethereum", "eth", "solana", "sol"]
 
     def _resolve_keyword(self, anchor, event, market, current_keyword, matched_alias):
-        # Look up the asset-specific Binance price so strike validation always
+        # Look up the asset-specific spot price so strike validation always
         # uses the correct anchor (e.g. ETH ~$2k, not BTC ~$67k).
         symbol = self._ALIAS_TO_SYMBOL.get(matched_alias.lower())
         if symbol:
-            price = self.binance_client.get_latest_value(symbol)
+            price = self.data_client.get_latest_value(symbol)
             if price and price > 0:
                 return price, symbol
         return anchor, current_keyword
@@ -74,7 +76,7 @@ class CryptoHunter(BasePolymarketHunter):
         highest_volume = 0.0
 
         for symbol in self.symbols:
-            anchor_price = self.binance_client.get_latest_value(symbol)
+            anchor_price = self.data_client.get_latest_value(symbol)
             if not anchor_price or anchor_price <= 0:
                 print(f"[CryptoHunter] No anchor for {symbol}, skipping")
                 continue
@@ -117,12 +119,17 @@ class CryptoHunter(BasePolymarketHunter):
             print("[CryptoHunter] No markets found")
         return best_market
 
-    def get_live_truth(self, market: MarketData) -> Optional[float]:
+    def get_live_truth(self, market: MarketData) -> Optional[dict]:
+        """Return the full enriched data package (spot price, realized vol,
+        funding rate, volume, spread) — not just a spot price. HybridCryptoBrain
+        uses the richer package; anything expecting a plain float should read
+        the "spot_price" key.
+        """
         if not market or not market.asset_type.startswith("Crypto::"):
             return None
         try:
             symbol = market.asset_type.split("::", 1)[1]
-            return self.binance_client.get_latest_value(symbol)
+            return self.data_client.get_enriched_data(symbol)
         except Exception as e:
             print(f"[CryptoHunter] get_live_truth error: {e}")
             return None

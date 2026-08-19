@@ -58,6 +58,26 @@ class PolymarketClient:
         events = resp.json()
         return events if events else []
 
+    def get_multi_outcome_events(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """Fetch active events with no keyword filter, for strategies (e.g.
+        EventSumStrategy) that need to see whole events — including all of
+        their outcome markets — rather than search by a single keyword like
+        the domain hunters do.
+        """
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": limit,
+            "offset": offset,
+            "order": "volume",
+            "ascending": "false",
+        }
+        resp = crequests.get(self.BASE_URL, params=params, impersonate="chrome120", timeout=15)
+        if resp.status_code != 200:
+            return []
+        events = resp.json()
+        return events if events else []
+
     def get_proxy_balance(self, proxy_address: str, private_key: str) -> float:
         """Fetch proxy wallet USDC balance from Polymarket CLOB API.
 
@@ -143,6 +163,9 @@ class PolymarketScannerHunter:
     # Cooldown cache
     # ------------------------------------------------------------------
 
+    # TODO(log-noise): [CACHE]/[SCANNER] fire on every loop tick per hunter
+    # and aren't part of the DB-backed structured log flow — consider gating
+    # behind a log-level flag instead of always-on stdout prints.
     def _get_active_seen_ids(self) -> List[str]:
         now = time.time()
         expired = [mid for mid, ts in self.seen_markets.items() if now - ts >= self._COOLDOWN_SECONDS]

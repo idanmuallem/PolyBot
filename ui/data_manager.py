@@ -1,16 +1,9 @@
 import json
 import os
-import shutil
 import sqlite3
 from datetime import datetime
 
 import pandas as pd
-
-
-DEFAULT_DB_PATH = "/app/trades.db"
-FALLBACK_DB_PATH = "trades.db"
-
-_ACTIVE_DB_PATH: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -37,51 +30,18 @@ def _parse_payload_value(payload_value) -> dict:
 # DB connection
 # ---------------------------------------------------------------------------
 
-def _resolve_db(db_path: str) -> str:
-    global _ACTIVE_DB_PATH
-    if _ACTIVE_DB_PATH:
-        return _ACTIVE_DB_PATH
-
-    for candidate in [db_path, DEFAULT_DB_PATH, FALLBACK_DB_PATH]:
-        normalized = str(candidate or "").strip()
-        if not normalized:
-            continue
-        if os.path.isdir(normalized):
-            normalized = os.path.join(normalized, "trades.db")
-        parent = os.path.dirname(normalized)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        try:
-            with sqlite3.connect(normalized, timeout=5) as conn:
-                conn.execute("SELECT 1")
-            _ACTIVE_DB_PATH = normalized
-            return normalized
-        except sqlite3.OperationalError:
-            continue
-
-    # Last resort: trust the caller's path even without verification
-    _ACTIVE_DB_PATH = db_path or DEFAULT_DB_PATH
-    return _ACTIVE_DB_PATH
-
-
 def _open_db(db_path: str, timeout: int = 10):
-    return sqlite3.connect(_resolve_db(db_path), timeout=timeout)
+    return sqlite3.connect(db_path, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
 
-def init_db(db_path: str = DEFAULT_DB_PATH):
-    resolved = _resolve_db(db_path)
-
-    # Migrate legacy misnamed DB (trades.db/trades.db) if present
-    legacy = os.path.normpath(os.path.join("trades.db", "trades.db"))
-    if os.path.exists(legacy) and not os.path.exists(resolved):
-        parent = os.path.dirname(resolved)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        shutil.copy2(legacy, resolved)
+def init_db(db_path: str):
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
     with _open_db(db_path) as conn:
         conn.execute(
@@ -102,7 +62,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH):
 # Event logging
 # ---------------------------------------------------------------------------
 
-def log_event(bridge, level, asset_type, token_id, payload, db_path: str = DEFAULT_DB_PATH):
+def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     bridge.event_count += 1
@@ -129,7 +89,7 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str = DEFAU
 
     if isinstance(payload, dict) and "ev" in payload:
         try:
-            bridge.opportunity_map[str(token_id)] = {
+            entry = {
                 "token_id": str(token_id),
                 "asset_type": str(asset_type),
                 "ev": float(payload.get("ev", 0.0)),
@@ -139,6 +99,17 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str = DEFAU
                     or bridge.market_name_by_token.get(str(token_id), bridge.market_question)
                 ),
             }
+            # Phase 7: carry the Wang/strategy/risk analytics fields through
+            # too, so PortfolioManager's in-memory lookups (raw_probability,
+            # wang_edge, asset_type for correlation) hit this fast path
+            # instead of always falling back to a DB query.
+            for key in (
+                "raw_probability", "wang_lambda", "wang_fair_value", "wang_edge",
+                "strategy_type", "kelly_fraction_used", "correlation_exposure",
+            ):
+                if payload.get(key) is not None:
+                    entry[key] = payload[key]
+            bridge.opportunity_map[str(token_id)] = entry
         except Exception:
             pass
 
@@ -149,6 +120,10 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str = DEFAU
         paper = bridge.level_counts.get("PAPER-TRADE", 0)
         avg_ev = sum(bridge.ev_samples) / len(bridge.ev_samples) if bridge.ev_samples else 0.0
         max_ev = max(bridge.ev_samples) if bridge.ev_samples else 0.0
+        # TODO(log-noise): this periodic stdout dump (with its own "=" * 90
+        # separators) duplicates data already in bridge/opportunity_map and
+        # isn't part of the DB-backed structured log flow — worth deciding
+        # whether it earns its keep or should move behind a log-level flag.
         print("=" * 90)
         print(f"[PERF] events={bridge.event_count} | live={live} | dry={dry} | paper={paper}")
         print(f"[PERF] avg_ev={avg_ev:.4f} | max_ev={max_ev:.4f} | daily_spend=${bridge.daily_spend:.2f} | balance=${bridge.current_balance:.2f}")
@@ -182,7 +157,23 @@ def _extract_payload_columns(parsed: pd.Series) -> dict:
         "Model Used":  _get("model_used"),
         "Reject Reason": _get("reason"),
         "Side":        _get("side"),
+        # Phase 7: Wang pricing / strategy-source / risk-sizing analytics —
+        # expanded into the existing payload JSON rather than new DB columns,
+        # matching how Phases 3-5 already log these fields per trade.
+        "Raw Prob":    _get("raw_probability"),
+        "Wang λ":      _get("wang_lambda"),
+        "Wang FV":     _get("wang_fair_value"),
+        "Wang Edge":   _get("wang_edge"),
+        "Strategy":    _get("strategy_type"),
+        "Kelly Frac":  _get("kelly_fraction_used"),
+        "Correlation": _get("correlation_exposure"),
     }
+
+
+_NUMERIC_DISPLAY_COLS = [
+    "Price", "Fair Value", "EV", "Bet ($)", "Shares",
+    "Raw Prob", "Wang λ", "Wang FV", "Wang Edge", "Kelly Frac", "Correlation",
+]
 
 
 def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
@@ -201,7 +192,7 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
     for col, series in _extract_payload_columns(parsed).items():
         out[col] = series
 
-    for col in ["Price", "Fair Value", "EV", "Bet ($)", "Shares"]:
+    for col in _NUMERIC_DISPLAY_COLS:
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
     out["_ts"] = pd.to_datetime(out.get("timestamp"), errors="coerce")
@@ -210,11 +201,14 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
     out["Time"] = out["_ts"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("-")
     out = out.drop(columns=[c for c in ["payload", "token_id", "_ts"] if c in out.columns])
 
-    desired = ["Time", "Action", "Asset", "Side", "Market Name", "Reject Reason", "Model Used",
-               "Price", "Fair Value", "EV", "Bet ($)", "Shares", "Token"]
+    desired = [
+        "Time", "Action", "Asset", "Side", "Strategy", "Market Name", "Reject Reason", "Model Used",
+        "Price", "Fair Value", "EV", "Raw Prob", "Wang λ", "Wang FV", "Wang Edge",
+        "Bet ($)", "Kelly Frac", "Correlation", "Shares", "Token",
+    ]
     out = out[[c for c in desired if c in out.columns]]
 
-    numeric_cols = {"Price", "Fair Value", "EV", "Bet ($)", "Shares"}
+    numeric_cols = set(_NUMERIC_DISPLAY_COLS)
     for col in out.columns:
         if col not in numeric_cols:
             out[col] = out[col].fillna("-")
@@ -225,7 +219,7 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
 # Queries
 # ---------------------------------------------------------------------------
 
-def fetch_latest_history(limit: int = 50, db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def fetch_latest_history(db_path: str, limit: int = 50) -> pd.DataFrame:
     try:
         with _open_db(db_path) as conn:
             df = pd.read_sql_query(
@@ -238,7 +232,7 @@ def fetch_latest_history(limit: int = 50, db_path: str = DEFAULT_DB_PATH) -> pd.
         return pd.DataFrame()
 
 
-def get_trade_stats(db_path: str = DEFAULT_DB_PATH) -> dict:
+def get_trade_stats(db_path: str) -> dict:
     _empty = {
         "win_rate": 0.0, "total_trades": 0, "avg_win": 0.0, "avg_loss": 0.0,
         "total_yes_trades": 0, "yes_win_rate": 0.0, "total_no_trades": 0, "no_win_rate": 0.0,
@@ -305,7 +299,7 @@ def get_trade_stats(db_path: str = DEFAULT_DB_PATH) -> dict:
     }
 
 
-def get_equity_curve(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def get_equity_curve(db_path: str) -> pd.DataFrame:
     try:
         with _open_db(db_path) as conn:
             df = pd.read_sql_query(

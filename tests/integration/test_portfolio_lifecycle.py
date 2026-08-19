@@ -1,11 +1,10 @@
 """Integration: PortfolioManager + BudgetManager working together."""
 from unittest.mock import MagicMock
 
-import pytest
-
 from core.bridge import DataBridge
 from core.models import Position
 from core.trading_config import TradingConfig
+from core.wallet_context import WalletContext
 from trading.budget_manager import BudgetManager
 from trading.risk_manager import PortfolioManager
 
@@ -40,12 +39,14 @@ def _make_components(initial_balance=50.0, take_profit=0.20, stop_loss=-0.50):
         bankroll_usd=1000.0,
         daily_limit_usd=15.0,
     )
+    ctx = WalletContext(wallet_id="test_wallet", config=config, bridge=bridge, db_path="test_wallet_trades.db")
+
     executor = MagicMock()
     executor.get_open_positions.return_value = []
     executor.sell_position.return_value = True
 
-    pm = PortfolioManager(bridge=bridge, executor=executor, config=config)
-    budget = BudgetManager(bridge=bridge, config=config, initial_balance=initial_balance)
+    pm = PortfolioManager(bridge=ctx.bridge, executor=executor, config=ctx.config, db_path=ctx.db_path)
+    budget = BudgetManager(bridge=ctx.bridge, config=ctx.config, initial_balance=initial_balance)
 
     return pm, budget, bridge, executor
 

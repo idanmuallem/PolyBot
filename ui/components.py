@@ -66,9 +66,9 @@ def render_ev_chart(bridge):
     }, height=380)
 
 
-def render_equity_curve(data_manager):
+def render_equity_curve(data_manager, db_path: str):
     st.subheader("Equity Curve")
-    df = data_manager.get_equity_curve()
+    df = data_manager.get_equity_curve(db_path)
     if df.empty:
         st.info("No equity history available yet.")
         return
@@ -174,26 +174,58 @@ def render_positions(bridge):
     c2.metric("Total Value", f"${total_value:,.2f}")
     c3.metric("Unrealized PnL", f"${total_pnl:,.2f}")
 
+    analytics = getattr(bridge, "position_analytics", {}) or {}
+
     rows = []
     for pos in positions:
         try:
-            rows.append(asdict(pos))
+            row = asdict(pos)
         except Exception:
-            rows.append(pos.__dict__ if hasattr(pos, "__dict__") else {})
+            row = pos.__dict__ if hasattr(pos, "__dict__") else {}
+
+        # Phase 7: edge-decay tracking — how the Wang edge has moved since
+        # entry, re-derived by PortfolioManager every management cycle.
+        snapshot = analytics.get(str(row.get("token_id", "")), {})
+        row["wang_edge_entry"] = snapshot.get("entry_wang_edge")
+        row["wang_edge_now"] = snapshot.get("current_wang_edge")
+        row["wang_edge_delta"] = snapshot.get("edge_delta")
+        rows.append(row)
 
     pos_df = pd.DataFrame(rows)
-    desired_cols = ["market_id", "token_id", "side", "shares", "initial_price", "current_price", "value", "pnl_ratio"]
+    desired_cols = [
+        "market_id", "token_id", "side", "shares", "initial_price", "current_price", "value", "pnl_ratio",
+        "wang_edge_entry", "wang_edge_now", "wang_edge_delta",
+    ]
     pos_df = pos_df[[c for c in desired_cols if c in pos_df.columns]]
+    pos_df = pos_df.rename(columns={
+        "wang_edge_entry": "Wang Edge (entry)",
+        "wang_edge_now": "Wang Edge (now)",
+        "wang_edge_delta": "Edge Δ",
+    })
 
-    styled = pos_df.style.format({
+    format_map = {
         "initial_price": "{:.4f}",
         "current_price": "{:.4f}",
         "value": "${:,.2f}",
         "pnl_ratio": "{:.2%}",
-    }).map(
+    }
+    for col in ("Wang Edge (entry)", "Wang Edge (now)", "Edge Δ"):
+        if col in pos_df.columns:
+            format_map[col] = lambda v: "-" if pd.isna(v) else f"{v:.4f}"
+
+    styled = pos_df.style.format(format_map, na_rep="-").map(
         lambda v: "color: #16a34a" if v > 0 else ("color: #dc2626" if v < 0 else ""),
         subset=["pnl_ratio"],
     )
+
+    if "Edge Δ" in pos_df.columns:
+        styled = styled.map(
+            lambda v: "" if pd.isna(v) else (
+                "color: #dc2626; font-weight: 700;" if v < 0  # edge decaying since entry
+                else ("color: #16a34a;" if v > 0 else "")
+            ),
+            subset=["Edge Δ"],
+        )
 
     if "side" in pos_df.columns:
         styled = styled.map(
@@ -203,3 +235,69 @@ def render_positions(bridge):
         )
 
     st.dataframe(styled, hide_index=True, use_container_width=True)
+
+
+def render_correlation_matrix(bridge, config):
+    """Correlation matrix heatmap for currently open positions.
+
+    The dashboard runs in a separate thread/process from the live pipeline,
+    so this reads bridge.position_analytics (stashed every management cycle
+    by PortfolioManager, same pattern as bridge.opportunity_map/current_portfolio)
+    rather than holding a reference to a live PortfolioManager.
+
+    Uses trading/correlation.py's CorrelationTracker — a static category/symbol
+    estimate, not a live price-history correlation (that's future work; see
+    that module's docstring).
+    """
+    st.subheader("Correlation Matrix")
+
+    from trading.correlation import CorrelationTracker
+
+    analytics = getattr(bridge, "position_analytics", {}) or {}
+    open_tokens = {str(getattr(p, "token_id", "")) for p in (bridge.current_portfolio or [])}
+    asset_types = sorted({
+        snapshot["asset_type"]
+        for token_id, snapshot in analytics.items()
+        if token_id in open_tokens and snapshot.get("asset_type")
+    })
+
+    if len(asset_types) < 2:
+        st.info("Need at least 2 open positions with known asset types to show correlation.")
+        return
+
+    tracker = CorrelationTracker(config=config)
+    matrix = tracker.correlation_matrix(asset_types)
+    grid = [[round(matrix[(a, b)], 2) for b in asset_types] for a in asset_types]
+
+    heat_data = [
+        [j, i, grid[i][j]]
+        for i in range(len(asset_types))
+        for j in range(len(asset_types))
+    ]
+
+    _echarts({
+        "backgroundColor": "transparent",
+        "tooltip": {"position": "top"},
+        "grid": {"left": "18%", "right": "4%", "top": "4%", "bottom": "20%", "containLabel": True},
+        "xAxis": {
+            "type": "category", "data": asset_types,
+            "axisLabel": {"color": "#94a3b8", "rotate": 30, "fontSize": 10},
+            "splitArea": {"show": True},
+        },
+        "yAxis": {
+            "type": "category", "data": asset_types,
+            "axisLabel": {"color": "#94a3b8", "fontSize": 10},
+            "splitArea": {"show": True},
+        },
+        "visualMap": {
+            "min": 0, "max": 1, "calculable": True, "orient": "horizontal",
+            "left": "center", "bottom": "0%",
+            "inRange": {"color": ["#0f172a", "#38bdf8", "#ef4444"]},
+            "textStyle": {"color": "#94a3b8"},
+        },
+        "series": [{
+            "type": "heatmap",
+            "data": heat_data,
+            "label": {"show": True, "color": "#e2e8f0"},
+        }],
+    }, height=max(280, 60 * len(asset_types)))

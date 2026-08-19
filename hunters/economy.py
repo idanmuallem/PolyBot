@@ -28,10 +28,10 @@ class EconomyHunter(BasePolymarketHunter):
 
     DEFAULT_INDICATORS = ["FedRate"]
 
-    def __init__(self, indicators: Optional[list] = None, **kwargs):
+    def __init__(self, indicators: Optional[list] = None, fred_api_key: Optional[str] = None, **kwargs):
         super().__init__(**kwargs)
         self.indicators = indicators or list(self.DEFAULT_INDICATORS)
-        self.fred_client = FredClient()
+        self.fred_client = FredClient(api_key=fred_api_key)
 
     def get_topic_type(self) -> str:
         return "Economy"
