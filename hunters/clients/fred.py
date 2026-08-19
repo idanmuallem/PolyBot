@@ -1,4 +1,3 @@
-import os
 import requests
 from typing import Optional
 
@@ -17,7 +16,7 @@ class FredClient(BaseApiClient):
     }
 
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("FRED_API_KEY")
+        self.api_key = api_key or ""
 
     def get_latest_value(self, indicator: str) -> float:
         """Return the latest observation for the given indicator.

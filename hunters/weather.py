@@ -1,10 +1,10 @@
 """
 WeatherHunter: Hunts Polymarket for weather prediction markets.
 
-Requires OPENWEATHER_API_KEY; returns None from hunt() if the key is absent.
+Requires an OpenWeather API key (injected via constructor); returns None from
+hunt() if the key is absent.
 """
 
-import os
 import re
 from typing import Optional
 
@@ -23,10 +23,10 @@ class WeatherHunter(BasePolymarketHunter):
 
     DEFAULT_LOCATIONS = ["Miami", "New York", "London"]
 
-    def __init__(self, locations: Optional[list] = None, **kwargs):
+    def __init__(self, api_key: Optional[str] = None, locations: Optional[list] = None, **kwargs):
         super().__init__(**kwargs)
         self.locations = locations or list(self.DEFAULT_LOCATIONS)
-        self.api_key = os.getenv("OPENWEATHER_API_KEY")
+        self.api_key = api_key or ""
 
     def get_topic_type(self) -> str:
         return "Weather"
@@ -38,7 +38,7 @@ class WeatherHunter(BasePolymarketHunter):
 
     def _fetch_temperature(self, location: str) -> Optional[float]:
         if not self.api_key:
-            print("[WeatherHunter] OPENWEATHER_API_KEY not set — weather disabled.")
+            print("[WeatherHunter] api_key not configured — weather disabled.")
             return None
         try:
             url = (
@@ -70,7 +70,7 @@ class WeatherHunter(BasePolymarketHunter):
             skip_ids = []
 
         if not self.api_key:
-            print("[WeatherHunter] Skipping hunt: OPENWEATHER_API_KEY not configured.")
+            print("[WeatherHunter] Skipping hunt: api_key not configured.")
             return None
 
         print(f"[WeatherHunter] Starting hunt: {len(self.locations)} locations, {len(skip_ids)} skipped")

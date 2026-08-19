@@ -4,6 +4,8 @@ HybridCryptoBrain: Time-aware fair value calculation for cryptocurrency markets.
 Uses a Black-Scholes style CDF approach with annualized volatility.
 """
 import math
+from typing import Optional, Union
+
 import numpy as np
 from scipy.stats import norm
 from core.models import MarketData
@@ -53,26 +55,54 @@ class HybridCryptoBrain(BaseBrain):
         # Default fallback
         return 0.6
 
+    @staticmethod
+    def _unpack_live_truth(live_truth: Union[float, dict]) -> tuple:
+        """Accept either a bare spot price or CCXTDataClient's enriched dict.
+
+        Returns (spot_price, enriched_dict_or_None).
+        """
+        if isinstance(live_truth, dict):
+            return float(live_truth.get("spot_price") or 0.0), live_truth
+        return float(live_truth), None
+
+    def _select_volatility(self, market: MarketData, enriched: Optional[dict]) -> float:
+        """Prefer CCXT realized volatility (matched to the contract's time
+        horizon) over the hardcoded per-symbol default, when available."""
+        if enriched:
+            tte_days = calculate_tte(getattr(market, "expiry_date", None))
+            if tte_days < 30.0:
+                realized = enriched.get("vol_30d")
+            elif tte_days < 60.0:
+                realized = enriched.get("vol_60d")
+            else:
+                realized = enriched.get("vol_90d")
+            if realized:
+                return float(realized)
+        return self.get_volatility_for_symbol(market.asset_type)
+
     def _calculate_probability(
         self,
         market: MarketData,
-        live_truth: float
+        live_truth: Union[float, dict],
     ) -> float:
         """Calculate probability using TTE-aware model switching.
 
         Args:
             market: MarketData object with strike_price and other details
-            live_truth: Current spot price (e.g., BTC/USDT)
+            live_truth: Current spot price (float), or CCXTDataClient's
+                enriched data package (dict with "spot_price", "vol_30d",
+                "vol_60d", "vol_90d", ...). Either form is accepted so
+                existing callers/tests that pass a bare spot price keep working.
 
         Returns:
             Probability (CDF value) in [0.0, 1.0]
         """
-        # Extract volatility for the asset type (BTC, ETH, etc.)
-        vol = self.get_volatility_for_symbol(market.asset_type)
+        spot_price, enriched = self._unpack_live_truth(live_truth)
+        vol = self._select_volatility(market, enriched)
 
         base_prob = self.evaluate_fair_value(
             market=market,
-            live_truth=live_truth,
+            live_truth=spot_price,
             volatility=vol,
         )
 

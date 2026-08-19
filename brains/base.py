@@ -72,7 +72,22 @@ class BaseBrain(ABC):
 
     @abstractmethod
     def _calculate_probability(self, market: MarketData, live_truth: float) -> float:
-        """Return a probability in [0.0, 1.0] for *market* given *live_truth*."""
+        """Return a probability in [0.0, 1.0] for *market* given *live_truth*.
+
+        *live_truth* is usually a bare spot/anchor value, but a hunter may pass
+        a richer data package (e.g. CryptoHunter's CCXTDataClient dict) — see
+        the concrete brain for what it accepts.
+        """
+
+    def get_raw_probability(self, market: MarketData, live_truth: float) -> float:
+        """Return this brain's raw probability estimate (p_true), clamped to [0, 1].
+
+        This is the brain's unadjusted opinion — the "raw" input that
+        PricingEngine.compute_edge() Wang-adjusts into a market-consistent
+        fair value. evaluate() below still uses it directly for the legacy
+        (pre-Wang) EV/Kelly path.
+        """
+        return max(0.0, min(1.0, self._calculate_probability(market, live_truth)))
 
     def evaluate(
         self,
@@ -81,7 +96,7 @@ class BaseBrain(ABC):
         min_ev: float = DEFAULT_MIN_EV,
     ) -> TradeSignal:
         """Compute fair value, EV, Kelly size, and tradability for *market*."""
-        fair_value = max(0.0, min(1.0, self._calculate_probability(market, live_truth)))
+        fair_value = self.get_raw_probability(market, live_truth)
 
         expected_value = (
             (fair_value - market.initial_price) / market.initial_price

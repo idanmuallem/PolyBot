@@ -1,15 +1,22 @@
+import pytest
+
 from core.bridge import DataBridge
 from core.trading_config import TradingConfig
 from trading.budget_manager import BudgetManager
 
 
-def _make_manager(initial_balance=100.0, daily_limit=15.0, min_balance=5.0, bankroll=1000.0):
+def _make_manager(
+    initial_balance=100.0, daily_limit=15.0, min_balance=5.0, bankroll=1000.0,
+    max_bet_size_usd=3.0, kelly_fraction=0.25,
+):
     bridge = DataBridge()
     bridge.current_balance = initial_balance
     config = TradingConfig(
         bankroll_usd=bankroll,
         daily_limit_usd=daily_limit,
         min_trading_balance=min_balance,
+        max_bet_size_usd=max_bet_size_usd,
+        kelly_fraction=kelly_fraction,
         dry_run=True,
     )
     mgr = BudgetManager(bridge=bridge, config=config, initial_balance=initial_balance)
@@ -80,3 +87,87 @@ def test_remaining_budget_decreases_after_record():
     assert mgr.get_remaining_budget() == 15.0
     mgr.record_trade(5.0)
     assert mgr.get_remaining_budget() == 10.0
+
+
+# ── compute_kelly_bet_size ────────────────────────────────────────────────────
+
+def test_compute_kelly_bet_size_clamped_to_max_bet_size():
+    mgr, _ = _make_manager(bankroll=1000.0, max_bet_size_usd=3.0, kelly_fraction=0.25)
+    # kelly_raw = 0.30/0.60 = 0.5, scaled = 0.125, dollar = $125 -> clamped
+    bet = mgr.compute_kelly_bet_size(edge=0.30, odds=0.60, confidence=1.0)
+    assert bet == 3.0
+
+
+def test_compute_kelly_bet_size_below_ceiling_is_not_clamped():
+    mgr, _ = _make_manager(bankroll=1000.0, max_bet_size_usd=100.0, kelly_fraction=0.25)
+    bet = mgr.compute_kelly_bet_size(edge=0.01, odds=0.99, confidence=1.0)
+    expected = (0.01 / 0.99) * 0.25 * 1000.0
+    assert bet == pytest.approx(expected)
+    assert 0.0 < bet < 100.0
+
+
+def test_compute_kelly_bet_size_zero_for_non_positive_edge():
+    mgr, _ = _make_manager()
+    assert mgr.compute_kelly_bet_size(edge=0.0, odds=0.5) == 0.0
+    assert mgr.compute_kelly_bet_size(edge=-0.1, odds=0.5) == 0.0
+
+
+def test_compute_kelly_bet_size_zero_for_non_positive_odds():
+    mgr, _ = _make_manager()
+    assert mgr.compute_kelly_bet_size(edge=0.3, odds=0.0) == 0.0
+    assert mgr.compute_kelly_bet_size(edge=0.3, odds=-0.2) == 0.0
+
+
+def test_compute_kelly_bet_size_scales_with_confidence():
+    mgr, _ = _make_manager(bankroll=1000.0, max_bet_size_usd=100.0)
+    full_conf = mgr.compute_kelly_bet_size(edge=0.01, odds=0.99, confidence=1.0)
+    half_conf = mgr.compute_kelly_bet_size(edge=0.01, odds=0.99, confidence=0.5)
+    assert half_conf == pytest.approx(full_conf * 0.5)
+
+
+def test_compute_kelly_bet_size_confidence_clamped_to_unit_interval():
+    mgr, _ = _make_manager(bankroll=1000.0, max_bet_size_usd=100.0)
+    over_conf = mgr.compute_kelly_bet_size(edge=0.01, odds=0.99, confidence=5.0)
+    full_conf = mgr.compute_kelly_bet_size(edge=0.01, odds=0.99, confidence=1.0)
+    assert over_conf == pytest.approx(full_conf)
+
+    negative_conf = mgr.compute_kelly_bet_size(edge=0.3, odds=0.6, confidence=-1.0)
+    assert negative_conf == 0.0
+
+
+def test_compute_kelly_bet_size_scales_with_kelly_fraction():
+    quarter, _ = _make_manager(bankroll=1000.0, max_bet_size_usd=100.0, kelly_fraction=0.25)
+    half, _ = _make_manager(bankroll=1000.0, max_bet_size_usd=100.0, kelly_fraction=0.50)
+    bet_quarter = quarter.compute_kelly_bet_size(edge=0.01, odds=0.99, confidence=1.0)
+    bet_half = half.compute_kelly_bet_size(edge=0.01, odds=0.99, confidence=1.0)
+    assert bet_half == pytest.approx(bet_quarter * 2.0)
+
+
+def test_kelly_fraction_defaults_to_quarter_kelly():
+    mgr, _ = _make_manager()
+    assert mgr.kelly_fraction == 0.25
+
+
+# ── cap_to_remaining_budget ────────────────────────────────────────────────────
+
+def test_cap_to_remaining_budget_under_limit():
+    mgr, _ = _make_manager()
+    bet, ok = mgr.cap_to_remaining_budget(1.0)
+    assert ok is True
+    assert bet == 1.0
+
+
+def test_cap_to_remaining_budget_caps_at_remaining():
+    mgr, _ = _make_manager()
+    mgr.total_spent_today = 12.0  # $3 remaining
+    bet, ok = mgr.cap_to_remaining_budget(10.0)
+    assert ok is True
+    assert bet == 3.0
+
+
+def test_cap_to_remaining_budget_zero_at_limit():
+    mgr, _ = _make_manager()
+    mgr.total_spent_today = 15.0
+    bet, ok = mgr.cap_to_remaining_budget(1.0)
+    assert ok is False
+    assert bet == 0.0

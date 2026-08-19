@@ -6,6 +6,17 @@ _st_mock = MagicMock()
 _st_mock.cache_resource = lambda fn: fn  # no-op decorator
 sys.modules["streamlit"] = _st_mock
 
+# ui/components.py does `import streamlit.components.v1 as components` for its
+# ECharts embeds — register that submodule explicitly too, since Python's
+# import machinery won't resolve "streamlit.components.v1" through a mocked
+# parent package's (fake) __path__.
+_st_components_mock = MagicMock()
+_st_components_v1_mock = MagicMock()
+_st_mock.components = _st_components_mock
+_st_components_mock.v1 = _st_components_v1_mock
+sys.modules["streamlit.components"] = _st_components_mock
+sys.modules["streamlit.components.v1"] = _st_components_v1_mock
+
 # Mock eth_utils (Ethereum dependency not installable in this test env).
 _eth_mock = MagicMock()
 _eth_mock.to_checksum_address = lambda addr: str(addr)
@@ -16,6 +27,7 @@ import pytest
 from core.bridge import DataBridge
 from core.models import MarketData
 from core.trading_config import TradingConfig
+from core.wallet_context import WalletContext
 
 
 @pytest.fixture
@@ -33,6 +45,17 @@ def dry_run_config():
         max_bet_size_usd=3.0,
         min_trading_balance=5.0,
         max_daily_trades=10,
+    )
+
+
+@pytest.fixture
+def wallet_context(tmp_path, dry_run_config, bridge):
+    """A fully self-contained WalletContext: its own config, bridge, and temp db path."""
+    return WalletContext(
+        wallet_id="test_wallet",
+        config=dry_run_config,
+        bridge=bridge,
+        db_path=str(tmp_path / "trades.db"),
     )
 
 

@@ -1,5 +1,5 @@
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -26,9 +26,7 @@ def _make_executor(**config_overrides):
     """Create a TradeExecutor with a controlled TradingConfig (no real CLOB)."""
     from trading.executor import TradeExecutor
     config = _dry_config(**config_overrides)
-    with patch("trading.executor.TradingConfig.from_env", return_value=config):
-        executor = TradeExecutor()
-    return executor
+    return TradeExecutor(config=config)
 
 
 def _valid_market():
@@ -285,7 +283,6 @@ def test_get_open_positions_live_ev_normalization_at_boundary():
 
 # ── get_balance in dry-run ────────────────────────────────────────────────────
 
-def test_get_balance_dry_run_returns_env_default(monkeypatch):
-    monkeypatch.setenv("PAPER_BALANCE_USD", "500.0")
-    executor = _make_executor()
+def test_get_balance_dry_run_returns_configured_paper_balance():
+    executor = _make_executor(paper_balance_usd=500.0)
     assert executor.get_balance() == 500.0

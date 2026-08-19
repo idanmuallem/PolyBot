@@ -5,7 +5,6 @@ Wraps the Polymarket CLOB client. Execution is gated by EV threshold, daily
 trade count, and price bounds. Supports dry-run, paper-trade, and live modes.
 """
 
-import os
 import logging
 import math
 from typing import Optional, Dict, Any, Callable, List
@@ -38,8 +37,8 @@ class TradeExecutor:
     Modes: dry_run (simulate only), paper_trade (log only), live (real orders).
     """
 
-    def __init__(self):
-        self.config = TradingConfig.from_env()
+    def __init__(self, config: TradingConfig):
+        self.config = config
         self.trade_count_today = 0
         self.dry_run = self.config.dry_run
         self.paper_trade_mode = self.config.paper_trade_mode
@@ -145,7 +144,7 @@ class TradeExecutor:
     def get_balance(self) -> float:
         """Fetch available CLOB collateral balance (deployable cash)."""
         if self.dry_run or self.client is None:
-            return float(os.getenv("PAPER_BALANCE_USD", "1000.0"))
+            return float(self.config.paper_balance_usd)
 
         try:
             if hasattr(self.client, "get_collateral_balance"):
