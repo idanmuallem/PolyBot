@@ -441,8 +441,21 @@ class SequentialTradingPipeline:
             "total_cost": round(total_cost, 4),
         })
 
-    def _stage_hunt(self):
-        market, hunter = self.hunter.get_active_markets(self.log_func)
+    async def _stage_hunt(self):
+        """Run market discovery off the event loop.
+
+        get_active_markets() does up to 30 synchronous HTTP round-trips
+        (see PolymarketScannerHunter.get_active_markets / CryptoHunter.hunt)
+        — calling it directly would block this coroutine's single-threaded
+        event loop for the whole scan, starving every other stage (including
+        the arbitrage strategy scan) until it returns. asyncio.to_thread
+        runs it on a worker thread instead, so the loop stays free.
+        """
+        t0 = time.monotonic()
+        market, hunter = await asyncio.to_thread(self.hunter.get_active_markets, self.log_func)
+        elapsed = time.monotonic() - t0
+        self.log_func("HUNT-TIMING", "Pipeline", "", {"elapsed_s": round(elapsed, 1)})
+
         if not market or not hunter:
             self.bridge.status = "No markets found. Waiting..."
             return None
@@ -764,7 +777,7 @@ class SequentialTradingPipeline:
 
             await self._stage_strategy_scan()
 
-            stage1 = self._stage_hunt()
+            stage1 = await self._stage_hunt()
             if not stage1:
                 continue
 

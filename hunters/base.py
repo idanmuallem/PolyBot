@@ -60,7 +60,7 @@ class BasePolymarketHunter(BaseHunter):
         anchor: float,
         keyword: str,
         skip_ids: list = None,
-        max_pages: int = 5,
+        max_pages: int = 2,
         required_keywords: list = None,
         add_cooldown_func=None,
     ) -> Optional[MarketData]:
@@ -70,7 +70,11 @@ class BasePolymarketHunter(BaseHunter):
             anchor: Real-world reference value used for strike validation.
             keyword: Primary query term sent to the API.
             skip_ids: Market IDs to ignore (cooldown cache).
-            max_pages: Page budget for the scan.
+            max_pages: Page budget for the scan. The Gamma API returns
+                results sorted by volume descending, so pages beyond the
+                first couple are low-volume markets that almost always get
+                rejected anyway — not worth the extra HTTP round-trips on
+                every hunt() call (see decision_pipeline.SequentialTradingPipeline._stage_hunt).
             required_keywords: Extra strings that must appear in event title/slug.
             add_cooldown_func: Callback to register rejected market IDs.
         """

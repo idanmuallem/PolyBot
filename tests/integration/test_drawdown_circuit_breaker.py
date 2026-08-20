@@ -1,7 +1,7 @@
 """Integration: drawdown circuit breaker pauses new trade entry but not
 position management/exits."""
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -134,7 +134,7 @@ async def test_paused_pipeline_skips_new_entry_but_runs_exits():
     pipeline, ctx, bridge, log_calls = _make_pipeline(balance=100.0, max_drawdown_pct=0.20)
     pipeline.peak_equity = 100.0
 
-    pipeline._stage_hunt = MagicMock(return_value=None)
+    pipeline._stage_hunt = AsyncMock(return_value=None)  # _stage_hunt is now async (Phase 6a)
     pipeline._stage_strategy_scan = MagicMock(side_effect=lambda: asyncio.sleep(0))
     pipeline.portfolio_manager.manage_portfolio = MagicMock()
 
@@ -157,7 +157,7 @@ async def test_unpaused_pipeline_still_scans_for_new_entries():
     pipeline, ctx, bridge, log_calls = _make_pipeline(balance=100.0, max_drawdown_pct=0.20)
     # No drawdown -- stays well within limits.
 
-    pipeline._stage_hunt = MagicMock(return_value=None)
+    pipeline._stage_hunt = AsyncMock(return_value=None)  # _stage_hunt is now async (Phase 6a)
     pipeline._stage_strategy_scan = MagicMock(side_effect=lambda: asyncio.sleep(0))
     pipeline.portfolio_manager.manage_portfolio = MagicMock()
 
