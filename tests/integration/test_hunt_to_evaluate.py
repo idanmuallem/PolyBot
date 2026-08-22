@@ -79,7 +79,7 @@ def test_hunt_result_feeds_brain_evaluate():
     brain = HybridCryptoBrain()
     signal = brain.evaluate(market, 97_000.0, min_ev=0.01)
 
-    assert 0.0 <= signal.fair_value <= 1.0
+    assert 0.0 <= signal.post_prob <= 1.0
     assert isinstance(signal.expected_value, float)
     assert isinstance(signal.kelly_size, float)
 

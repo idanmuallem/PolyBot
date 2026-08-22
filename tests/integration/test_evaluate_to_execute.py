@@ -223,31 +223,31 @@ def test_wang_mode_populates_pricing_fields():
 
     assert candidate is not None
     assert candidate.pricing_mode == "wang"
-    assert candidate.raw_probability == pytest.approx(0.70)
-    # fair_value is Wang-adjusted then market-blended, not the raw probability.
-    assert candidate.fair_value != pytest.approx(0.70)
+    assert candidate.pre_prob == pytest.approx(0.70)
+    # post_prob is Wang-adjusted then market-blended, not the raw probability.
+    assert candidate.post_prob != pytest.approx(0.70)
 
     expected_wang_fair = wang_transform(0.70, pipeline.config.wang_lambda)
     assert candidate.wang_fair_value == pytest.approx(expected_wang_fair)
-    # fair_value (post market-blend) is distinct from wang_fair_value
+    # post_prob (post market-blend) is distinct from wang_fair_value
     # (Wang-only, pre-blend) now that blending sits between the two.
     expected_blended = (
         pipeline.config.model_weight * expected_wang_fair
         + (1.0 - pipeline.config.model_weight) * 0.30
     )
-    assert candidate.fair_value == pytest.approx(expected_blended)
+    assert candidate.post_prob == pytest.approx(expected_blended)
 
     assert candidate.wang_lambda is not None
-    assert candidate.wang_edge == pytest.approx(candidate.fair_value - 0.30)
-    # EV is computed off the final (Wang + blended) fair value, not the raw probability.
-    assert candidate.final_ev == pytest.approx(candidate.fair_value / 0.30 - 1.0, rel=0.01)
+    assert candidate.wang_edge == pytest.approx(candidate.post_prob - 0.30)
+    # EV is computed off the final (Wang + blended) post_prob, not the raw probability.
+    assert candidate.final_ev == pytest.approx(candidate.post_prob / 0.30 - 1.0, rel=0.01)
 
 
 @freeze_time("2026-06-02T00:00:00+00:00")
 def test_wang_mode_skips_market_below_min_edge():
     pipeline, bridge, log_calls = _wang_pipeline(wang_min_edge=0.05)
     # Market price set exactly to the Wang-only fair value: blending a value
-    # with itself is a no-op, so the final fair_value == market_price and
+    # with itself is a no-op, so the final post_prob == market_price and
     # wang_edge == 0.0 exactly.
     wang_fair = wang_transform(0.70, pipeline.config.wang_lambda)
     market = _market(price=wang_fair, expiry_days=10)
@@ -273,8 +273,8 @@ def test_legacy_mode_leaves_wang_fields_none():
 
     assert candidate is not None
     assert candidate.pricing_mode == "legacy"
-    assert candidate.raw_probability == pytest.approx(0.70)
-    assert candidate.fair_value == pytest.approx(0.70)  # unchanged by any Wang adjustment
+    assert candidate.pre_prob == pytest.approx(0.70)
+    assert candidate.post_prob == pytest.approx(0.70)  # unchanged by any Wang adjustment
     assert candidate.wang_lambda is None
     assert candidate.wang_fair_value is None
     assert candidate.wang_edge is None
@@ -304,10 +304,10 @@ def test_wang_mode_track_log_includes_pricing_fields():
     track_calls = [c for c in captured if c[0] == "TRACK"]
     assert track_calls, "No TRACK entry found"
     payload = track_calls[0][1][2]
-    for key in ("raw_probability", "wang_lambda", "wang_fair_value", "wang_edge", "pricing_mode"):
+    for key in ("pre_prob", "wang_lambda", "wang_fair_value", "wang_edge", "pricing_mode"):
         assert key in payload, f"TRACK payload missing key: {key!r}"
     assert payload["pricing_mode"] == "wang"
-    assert payload["raw_probability"] == pytest.approx(0.85)
+    assert payload["pre_prob"] == pytest.approx(0.85)
 
 
 # ── Phase 7: strategy_type / kelly_fraction_used / correlation_exposure ──────

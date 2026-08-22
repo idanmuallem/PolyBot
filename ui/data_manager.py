@@ -93,18 +93,18 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
                 "token_id": str(token_id),
                 "asset_type": str(asset_type),
                 "ev": float(payload.get("ev", 0.0)),
-                "fair": float(payload.get("fair", 0.0)),
+                "post_prob": float(payload.get("post_prob", 0.0)),
                 "market_name": str(
                     payload.get("market_name")
                     or bridge.market_name_by_token.get(str(token_id), bridge.market_question)
                 ),
             }
             # Phase 7: carry the Wang/strategy/risk analytics fields through
-            # too, so PortfolioManager's in-memory lookups (raw_probability,
+            # too, so PortfolioManager's in-memory lookups (pre_prob,
             # wang_edge, asset_type for correlation) hit this fast path
             # instead of always falling back to a DB query.
             for key in (
-                "raw_probability", "wang_lambda", "wang_fair_value", "wang_edge",
+                "pre_prob", "wang_lambda", "wang_fair_value", "wang_edge",
                 "strategy_type", "kelly_fraction_used", "correlation_exposure",
             ):
                 if payload.get(key) is not None:
@@ -150,7 +150,11 @@ def _extract_payload_columns(parsed: pd.Series) -> dict:
     return {
         "Market Name": _get("market_name"),
         "Price":       _get("price", "market_price"),
-        "Fair Value":  _get("fair_value", "fair"),
+        # "post_prob" is the current key (see decision_pipeline.py's TRACK
+        # payload); "fair_value"/"fair" are kept as fallbacks for rows logged
+        # before the pre_prob/post_prob rename (and "fair_value" is still
+        # what TradeExecutor's own AUTO-TRADE/DRY-RUN log entries use).
+        "Fair Value":  _get("post_prob", "fair_value", "fair"),
         "EV":          _get("ev"),
         "Bet ($)":     _get("bet_usd", "bet_amount_usd"),
         "Shares":      _get("shares"),
@@ -160,7 +164,7 @@ def _extract_payload_columns(parsed: pd.Series) -> dict:
         # Phase 7: Wang pricing / strategy-source / risk-sizing analytics —
         # expanded into the existing payload JSON rather than new DB columns,
         # matching how Phases 3-5 already log these fields per trade.
-        "Raw Prob":    _get("raw_probability"),
+        "Raw Prob":    _get("pre_prob", "raw_probability"),
         "Wang λ":      _get("wang_lambda"),
         "Wang FV":     _get("wang_fair_value"),
         "Wang Edge":   _get("wang_edge"),

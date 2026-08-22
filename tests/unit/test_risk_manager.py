@@ -99,10 +99,10 @@ def test_no_exit_within_bounds():
 
 def test_wang_edge_decay_triggers_exit():
     pm, bridge, executor = _make_pm()
-    # raw_probability=0.55 -> Wang fair_value (base_lambda=0.183) ≈ 0.6212;
+    # pre_prob=0.55 -> Wang fair_value (base_lambda=0.183) ≈ 0.6212;
     # pricing the position exactly at that fair value collapses the edge to 0.
     pos = _pos(pnl_ratio=0.05, live_ev=0.0, token_id="decayed_tok", price=0.6212104251426875)
-    bridge.opportunity_map = {"decayed_tok": {"raw_probability": 0.55}}
+    bridge.opportunity_map = {"decayed_tok": {"pre_prob": 0.55}}
     executor.get_open_positions.side_effect = [[pos], []]
     executor.sell_position.return_value = True
 
@@ -115,9 +115,9 @@ def test_wang_edge_decay_triggers_exit():
 
 def test_healthy_wang_edge_does_not_trigger_exit():
     pm, bridge, executor = _make_pm()
-    # Same raw_probability, but priced well below fair value -> healthy edge.
+    # Same pre_prob, but priced well below fair value -> healthy edge.
     pos = _pos(pnl_ratio=0.05, live_ev=0.0, token_id="healthy_tok", price=0.35)
-    bridge.opportunity_map = {"healthy_tok": {"raw_probability": 0.55}}
+    bridge.opportunity_map = {"healthy_tok": {"pre_prob": 0.55}}
     executor.get_open_positions.return_value = [pos]
 
     log_levels = []
@@ -146,7 +146,7 @@ def test_take_profit_still_wins_over_decayed_edge():
     # TAKE-PROFIT even though its Wang edge has also collapsed to zero.
     pm, bridge, executor = _make_pm(take_profit=0.20)
     pos = _pos(pnl_ratio=0.25, live_ev=0.0, token_id="tp_tok", price=0.6212104251426875)
-    bridge.opportunity_map = {"tp_tok": {"raw_probability": 0.55}}
+    bridge.opportunity_map = {"tp_tok": {"pre_prob": 0.55}}
     executor.get_open_positions.side_effect = [[pos], []]
     executor.sell_position.return_value = True
 
@@ -159,14 +159,14 @@ def test_take_profit_still_wins_over_decayed_edge():
 
 
 def test_wang_edge_decay_translates_no_side_probability():
-    # raw_probability is always recorded in YES-space; for a NO position the
-    # "probability my side wins" is 1 - raw_probability. p=0.30 (YES) ->
+    # pre_prob is always recorded in YES-space; for a NO position the
+    # "probability my side wins" is 1 - pre_prob. p=0.30 (YES) ->
     # 0.70 (NO) -> Wang fair_value ≈ 0.7603 for that translated probability;
     # pricing the NO leg exactly there collapses its edge to 0.
     pm, bridge, executor = _make_pm()
     pos = _pos(pnl_ratio=0.05, live_ev=0.0, token_id="no_tok",
                price=0.7603411908017963, side="NO")
-    bridge.opportunity_map = {"no_tok": {"raw_probability": 0.30}}
+    bridge.opportunity_map = {"no_tok": {"pre_prob": 0.30}}
     executor.get_open_positions.side_effect = [[pos], []]
     executor.sell_position.return_value = True
 
@@ -227,7 +227,7 @@ def test_manage_portfolio_stashes_position_analytics():
     pm, bridge, executor = _make_pm()
     pos = _pos(pnl_ratio=0.05, token_id="analytics_tok", price=0.40)
     bridge.opportunity_map = {
-        "analytics_tok": {"raw_probability": 0.50, "wang_edge": 0.10, "asset_type": "Crypto::BTCUSDT"},
+        "analytics_tok": {"pre_prob": 0.50, "wang_edge": 0.10, "asset_type": "Crypto::BTCUSDT"},
     }
     executor.get_open_positions.return_value = [pos]
 
@@ -235,7 +235,7 @@ def test_manage_portfolio_stashes_position_analytics():
 
     snapshot = bridge.position_analytics["analytics_tok"]
     assert snapshot["asset_type"] == "Crypto::BTCUSDT"
-    assert snapshot["raw_probability"] == pytest.approx(0.50)
+    assert snapshot["pre_prob"] == pytest.approx(0.50)
     assert snapshot["entry_wang_edge"] == pytest.approx(0.10)
     assert snapshot["current_wang_edge"] is not None
     assert snapshot["edge_delta"] == pytest.approx(snapshot["current_wang_edge"] - 0.10)
@@ -257,10 +257,10 @@ def test_position_analytics_none_without_raw_probability():
 
 def test_cull_weak_position():
     pm, bridge, executor = _make_pm()
-    # Position: fair_value=0.10, current_price=0.50 → live_ev=-0.80
+    # Position: post_prob=0.10, current_price=0.50 → live_ev=-0.80
     # Candidate: ev=0.55; 0.55 >= -0.80 + 0.10 → cull ✓
     pos = _pos(pnl_ratio=0.0, token_id="weak_tok", price=0.50, shares=10.0, value=5.0)
-    bridge.opportunity_map = {"weak_tok": {"fair_value": 0.10}}
+    bridge.opportunity_map = {"weak_tok": {"post_prob": 0.10}}
     executor.get_open_positions.return_value = [pos]
     executor.sell_position.return_value = True
 
@@ -274,10 +274,10 @@ def test_cull_weak_position():
 
 def test_no_cull_competitive_position():
     pm, bridge, executor = _make_pm()
-    # Position: fair_value=0.80, current_price=0.50 → live_ev=0.60
+    # Position: post_prob=0.80, current_price=0.50 → live_ev=0.60
     # Candidate: ev=0.55; 0.55 < 0.60 + 0.10=0.70 → don't cull ✓
     pos = _pos(pnl_ratio=0.0, token_id="comp_tok", price=0.50, shares=10.0, value=5.0)
-    bridge.opportunity_map = {"comp_tok": {"fair_value": 0.80}}
+    bridge.opportunity_map = {"comp_tok": {"post_prob": 0.80}}
     executor.get_open_positions.return_value = [pos]
 
     freed = pm.optimize_for_candidate(

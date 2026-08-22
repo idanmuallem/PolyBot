@@ -111,21 +111,21 @@ class BaseBrain(ABC):
         Three layers run in order, each correcting what the last couldn't:
 
         1. Wang Transform — risk-adjusts the raw model probability. Shrinks
-           toward a no-op as raw_fair approaches 0 or 1, so on its own it
+           toward a no-op as pre_prob approaches 0 or 1, so on its own it
            barely dents an already-overconfident (near-certain) model output.
         2. Market blending — pulls the Wang-adjusted value toward the
            market's own price by (1 - model_weight), which is what actually
            reins in a saturated raw probability the Wang step alone can't.
-        3. Disagreement ratio cap — a safety net: if the blended fair value
+        3. Disagreement ratio cap — a safety net: if the blended post_prob
            still disagrees with the market by more than max_disagreement_ratio
            (either direction), the signal is rejected outright rather than
            traded on.
         """
-        raw_fair = self.get_raw_probability(market, live_truth)
+        pre_prob = self.get_raw_probability(market, live_truth)
         market_price = float(market.initial_price) if market.initial_price > 0 else 0.5
 
         # Step 1: Wang Transform.
-        wang_fair = wang_transform(raw_fair, wang_lambda)
+        wang_fair = wang_transform(pre_prob, wang_lambda)
 
         # Step 2: Market blending. model_weight is a caller-supplied knob
         # (ultimately from config/env - see MODEL_WEIGHT in core/trading_config.py),
@@ -137,18 +137,18 @@ class BaseBrain(ABC):
             )
             model_weight = max(0.0, min(1.0, model_weight))
         blended_fair = model_weight * wang_fair + (1.0 - model_weight) * market_price
-        fair_value = max(0.0, min(1.0, blended_fair))
+        post_prob = max(0.0, min(1.0, blended_fair))
 
-        # Step 3: Disagreement ratio cap (direction-agnostic: catches the
-        # fair value being either too far above or too far below the market).
-        hi = max(fair_value, market_price)
-        lo = max(1e-9, min(fair_value, market_price))
+        # Step 3: Disagreement ratio cap (direction-agnostic: catches
+        # post_prob being either too far above or too far below the market).
+        hi = max(post_prob, market_price)
+        lo = max(1e-9, min(post_prob, market_price))
         disagreement_capped = (hi / lo) > max_disagreement_ratio
 
         price_yes = market_price
         price_no = max(1e-9, 1.0 - price_yes)
-        fair_no = 1.0 - fair_value
-        ev_yes = (fair_value / price_yes - 1.0) if price_yes > 0 else -1.0
+        fair_no = 1.0 - post_prob
+        ev_yes = (post_prob / price_yes - 1.0) if price_yes > 0 else -1.0
         ev_no = (fair_no / price_no - 1.0) if price_no > 0 else -1.0
 
         side = "YES" if ev_yes >= ev_no else "NO"
@@ -157,7 +157,7 @@ class BaseBrain(ABC):
 
         kelly_size = max(
             0.0,
-            self._calculate_kelly(fair_value, price_yes) if side == "YES"
+            self._calculate_kelly(post_prob, price_yes) if side == "YES"
             else self._calculate_kelly(fair_no, price_no),
         )
 
@@ -168,14 +168,14 @@ class BaseBrain(ABC):
         )
 
         return TradeSignal(
-            fair_value=fair_value,
+            post_prob=post_prob,
             expected_value=expected_value,
             kelly_size=kelly_size,
             is_tradable=is_tradable,
-            raw_probability=raw_fair,
+            pre_prob=pre_prob,
             wang_fair_value=wang_fair,
             wang_lambda=wang_lambda,
-            wang_edge=fair_value - market_price,
+            wang_edge=post_prob - market_price,
             confidence=1.0,
             side=side,
             ev_yes=ev_yes,

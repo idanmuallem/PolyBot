@@ -49,8 +49,8 @@ class CandidateTrade:
     token_id: str
     asset_type: str
     question: str
-    fair_value: float
-    raw_probability: float
+    post_prob: float
+    pre_prob: float
     kelly_size: float       # raw Kelly criterion fraction (edge/odds), before confidence/kelly_fraction scaling
     kelly_bet_usd: float    # final dollar bet size — confidence- and kelly_fraction-scaled, clamped to max_bet_size_usd
     model_used: str
@@ -197,7 +197,7 @@ class SequentialTradingPipeline:
         strategy-driven performance, from the trade history alone."""
         return {
             "pricing_mode": candidate.pricing_mode,
-            "raw_probability": round(candidate.raw_probability, 4),
+            "pre_prob": round(candidate.pre_prob, 4),
             "wang_lambda": round(candidate.wang_lambda, 4) if candidate.wang_lambda is not None else None,
             "wang_fair_value": round(candidate.wang_fair_value, 4) if candidate.wang_fair_value is not None else None,
             "wang_edge": round(candidate.wang_edge, 4) if candidate.wang_edge is not None else None,
@@ -525,8 +525,8 @@ class SequentialTradingPipeline:
                 max_disagreement_ratio=self.config.max_disagreement_ratio,
             )
 
-        raw_probability = signal.raw_probability
-        fair_value = signal.fair_value
+        pre_prob = signal.pre_prob
+        post_prob = signal.post_prob
         confidence = signal.confidence
 
         if self.pricing_mode == "legacy":
@@ -540,9 +540,9 @@ class SequentialTradingPipeline:
                 self.log_func("REJECTED", asset_type, token_id, {
                     "market_name": question,
                     "reason": "model disagrees with market beyond max_disagreement_ratio",
-                    "raw_probability": round(raw_probability, 4),
+                    "pre_prob": round(pre_prob, 4),
                     "wang_fair_value": round(wang_fair_value, 4),
-                    "blended_fair_value": round(fair_value, 4),
+                    "blended_fair_value": round(post_prob, 4),
                     "market_price": round(poly_price, 4),
                     "max_disagreement_ratio": self.config.max_disagreement_ratio,
                 })
@@ -552,7 +552,7 @@ class SequentialTradingPipeline:
             if abs(wang_edge) < self.wang_min_edge:
                 self.log_func("SCAN-SKIP", asset_type, token_id, {
                     "reason": "wang_edge below minimum",
-                    "raw_probability": round(raw_probability, 4),
+                    "pre_prob": round(pre_prob, 4),
                     "wang_lambda": round(wang_lambda, 4),
                     "wang_fair_value": round(wang_fair_value, 4),
                     "wang_edge": round(wang_edge, 4),
@@ -560,11 +560,11 @@ class SequentialTradingPipeline:
                 })
                 return None
 
-        self.bridge.forecast = float(fair_value)
+        self.bridge.forecast = float(post_prob)
 
         price_yes = float(poly_price)
         price_no = max(1e-9, 1.0 - price_yes)
-        fair_no = 1.0 - float(fair_value)
+        fair_no = 1.0 - float(post_prob)
         ev_yes = signal.ev_yes
         ev_no = signal.ev_no
         self.bridge.ev = float(ev_yes)
@@ -579,7 +579,7 @@ class SequentialTradingPipeline:
         # model confidence and kelly_fraction (quarter-Kelly by default),
         # then clamped to max_bet_size_usd as a hard ceiling.
         if side == "YES":
-            kelly_edge = float(fair_value) - price_yes
+            kelly_edge = float(post_prob) - price_yes
             kelly_odds = 1.0 - price_yes
         else:
             kelly_edge = fair_no - price_no
@@ -594,8 +594,8 @@ class SequentialTradingPipeline:
         correlation_exposure = self.portfolio_manager.correlation_exposure_for(asset_type)
 
         diag = (
-            f"[EV-MATH] mode={self.pricing_mode} raw_p={raw_probability:.3f} "
-            f"YES(P: {price_yes:.3f}, FV: {float(fair_value):.3f}, EV: {ev_yes:.2f}) | "
+            f"[EV-MATH] mode={self.pricing_mode} raw_p={pre_prob:.3f} "
+            f"YES(P: {price_yes:.3f}, FV: {float(post_prob):.3f}, EV: {ev_yes:.2f}) | "
             f"NO(P: {price_no:.3f}, FV: {fair_no:.3f}, EV: {ev_no:.2f}) | PICK: {side}"
         )
         if wang_edge is not None:
@@ -608,8 +608,8 @@ class SequentialTradingPipeline:
             token_id=token_id,
             asset_type=asset_type,
             question=question,
-            fair_value=float(fair_value),
-            raw_probability=raw_probability,
+            post_prob=float(post_prob),
+            pre_prob=pre_prob,
             kelly_size=float(kelly_raw_fraction),
             kelly_bet_usd=float(kelly_bet_usd),
             model_used=model_used,
@@ -737,7 +737,7 @@ class SequentialTradingPipeline:
     def _stage_execute(self, candidate: CandidateTrade, approved_bet: float, risk_context: dict):
         executed = self.executor.evaluate_and_execute(
             market=candidate.market,
-            fair_value=float(candidate.fair_value),
+            fair_value=float(candidate.post_prob),
             ev=float(candidate.final_ev),
             current_poly_price=float(candidate.price_yes),
             bet_amount_usd=float(approved_bet),
@@ -758,7 +758,7 @@ class SequentialTradingPipeline:
             self.log_func("TRACK", candidate.asset_type, candidate.token_id, {
                 "market_name": candidate.question,
                 "model_used": candidate.model_used,
-                "fair": round(float(candidate.fair_value), 4),
+                "post_prob": round(float(candidate.post_prob), 4),
                 "ev": round(float(candidate.final_ev), 4),
                 "ev_yes": round(float(candidate.ev_yes), 4),
                 "ev_no": round(float(candidate.ev_no), 4),

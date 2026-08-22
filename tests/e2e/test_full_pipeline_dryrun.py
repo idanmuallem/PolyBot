@@ -146,7 +146,7 @@ async def test_single_pipeline_loop_dry_run(tmp_path):
     track_entries = [c for c in log_calls if c["level"] == "TRACK"]
     assert track_entries, "No TRACK entry found"
     track_payload = track_entries[0]["payload"]
-    for key in ("fair", "ev", "bet_usd", "side"):
+    for key in ("post_prob", "ev", "bet_usd", "side"):
         assert key in track_payload, f"TRACK payload missing key: {key!r}"
     # legacy mode: no Wang adjustment applied.
     assert track_payload["pricing_mode"] == "legacy"
@@ -251,8 +251,8 @@ async def test_full_pipeline_loop_dry_run_wang_mode(tmp_path):
     payload = track_entries[0]["payload"]
 
     assert payload["pricing_mode"] == "wang"
-    for key in ("raw_probability", "wang_lambda", "wang_fair_value", "wang_edge"):
+    for key in ("pre_prob", "wang_lambda", "wang_fair_value", "wang_edge"):
         assert key in payload and payload[key] is not None, f"TRACK payload missing/None: {key!r}"
-    # The Wang adjustment should have moved fair value away from the brain's
-    # raw probability — that's the whole point of routing through PricingEngine.
-    assert payload["fair"] != pytest.approx(payload["raw_probability"])
+    # The Wang adjustment should have moved post_prob away from the brain's
+    # raw probability — that's the whole point of routing through evaluate().
+    assert payload["post_prob"] != pytest.approx(payload["pre_prob"])

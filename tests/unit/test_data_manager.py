@@ -47,7 +47,7 @@ def test_log_event_updates_ev_samples(db):
 
 def test_log_event_updates_opportunity_map(db):
     bridge = DataBridge()
-    payload = {"ev": 0.60, "fair": 0.70, "market_name": "BTC >100k"}
+    payload = {"ev": 0.60, "post_prob": 0.70, "market_name": "BTC >100k"}
     dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok1", payload, db_path=db)
 
     assert "tok1" in bridge.opportunity_map
@@ -57,15 +57,15 @@ def test_log_event_updates_opportunity_map(db):
 def test_log_event_opportunity_map_carries_wang_and_strategy_fields(db):
     bridge = DataBridge()
     payload = {
-        "ev": 0.60, "fair": 0.70, "market_name": "BTC >100k",
-        "raw_probability": 0.55, "wang_lambda": 0.12, "wang_fair_value": 0.62,
+        "ev": 0.60, "post_prob": 0.70, "market_name": "BTC >100k",
+        "pre_prob": 0.55, "wang_lambda": 0.12, "wang_fair_value": 0.62,
         "wang_edge": 0.08, "strategy_type": "model",
         "kelly_fraction_used": 0.25, "correlation_exposure": 0.4,
     }
     dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok1", payload, db_path=db)
 
     entry = bridge.opportunity_map["tok1"]
-    assert entry["raw_probability"] == 0.55
+    assert entry["pre_prob"] == 0.55
     assert entry["wang_lambda"] == 0.12
     assert entry["wang_fair_value"] == 0.62
     assert entry["wang_edge"] == 0.08
@@ -76,10 +76,10 @@ def test_log_event_opportunity_map_carries_wang_and_strategy_fields(db):
 
 def test_log_event_opportunity_map_omits_missing_wang_fields(db):
     bridge = DataBridge()
-    dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok1", {"ev": 0.5, "fair": 0.5}, db_path=db)
+    dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok1", {"ev": 0.5, "post_prob": 0.5}, db_path=db)
 
     entry = bridge.opportunity_map["tok1"]
-    assert "raw_probability" not in entry
+    assert "pre_prob" not in entry
     assert "wang_edge" not in entry
 
 
@@ -116,8 +116,8 @@ def test_get_trade_stats_counts_sides(db):
 def test_display_table_surfaces_wang_and_strategy_columns(db):
     bridge = DataBridge()
     payload = {
-        "market_name": "BTC >100k", "price": 0.40, "fair": 0.55, "ev": 0.375,
-        "raw_probability": 0.50, "wang_lambda": 0.15, "wang_fair_value": 0.55,
+        "market_name": "BTC >100k", "price": 0.40, "post_prob": 0.55, "ev": 0.375,
+        "pre_prob": 0.50, "wang_lambda": 0.15, "wang_fair_value": 0.55,
         "wang_edge": 0.15, "strategy_type": "model",
         "kelly_fraction_used": 0.25, "correlation_exposure": 0.3,
     }
