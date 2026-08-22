@@ -16,7 +16,6 @@ from typing import Optional
 
 from brains import get_brain_for_asset_type
 from brains.base import calculate_tte
-from brains.pricing_engine import PricingEngine
 from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
 from polymarket import PolymarketClient
@@ -91,13 +90,13 @@ class SequentialTradingPipeline:
         self.max_bet_size_usd = float(self.config.max_bet_size_usd)
         self.safe_minimum = 1.0
 
-        # Wang Transform pricing (see brains/pricing_engine.py). "legacy" skips
-        # the Wang adjustment and uses the brain's raw EV, for A/B comparison.
+        # Wang Transform pricing — all of it (Wang Transform, market blending,
+        # disagreement cap) now lives in BaseBrain.evaluate() (brains/base.py),
+        # which this pipeline calls directly rather than re-deriving fair
+        # value itself. "legacy" skips all three layers for A/B comparison
+        # (see _stage_evaluate_ev).
         self.pricing_mode = str(getattr(self.config, "pricing_mode", "wang") or "wang").lower()
         self.wang_min_edge = float(getattr(self.config, "wang_min_edge", 0.05))
-        self.pricing_engine = PricingEngine(
-            base_lambda=float(getattr(self.config, "wang_base_lambda", 0.183))
-        )
 
         self.executor = ctx.executor
         self.hunter = ctx.scanner
@@ -506,28 +505,49 @@ class SequentialTradingPipeline:
             float(live_truth.get("spot_price") or 0.0) if isinstance(live_truth, dict) else float(live_truth)
         )
         brain = get_brain_for_asset_type(asset_type)
-        raw_probability = float(brain.get_raw_probability(market, live_truth))
         model_used = getattr(brain, "last_model_used", "unknown")
 
-        wang_lambda = wang_fair_value = wang_edge = None
-        confidence = 1.0
+        # Pricing (Wang Transform -> market blend -> disagreement cap) is all
+        # computed inside evaluate() — see brains/base.py. "legacy" mode asks
+        # for all three layers disabled (lambda=0, full model weight, an
+        # unreachable disagreement ratio) so it reduces to the brain's raw
+        # probability, for A/B comparison against "wang" mode.
+        if self.pricing_mode == "legacy":
+            signal = brain.evaluate(
+                market, live_truth, min_ev=self.min_ev_threshold,
+                wang_lambda=0.0, model_weight=1.0, max_disagreement_ratio=float("inf"),
+            )
+        else:
+            signal = brain.evaluate(
+                market, live_truth, min_ev=self.min_ev_threshold,
+                wang_lambda=self.config.wang_lambda,
+                model_weight=self.config.model_weight,
+                max_disagreement_ratio=self.config.max_disagreement_ratio,
+            )
+
+        raw_probability = signal.raw_probability
+        fair_value = signal.fair_value
+        confidence = signal.confidence
 
         if self.pricing_mode == "legacy":
-            fair_value = raw_probability
+            wang_lambda = wang_fair_value = wang_edge = None
         else:
-            volume = float(getattr(market, "volume", 0.0) or 0.0)
-            days_to_expiry = calculate_tte(getattr(market, "expiry_date", None))
-            edge_result = self.pricing_engine.compute_edge(
-                p_true=raw_probability,
-                market_price=poly_price,
-                volume=volume,
-                days_to_expiry=days_to_expiry,
-            )
-            wang_lambda = float(edge_result["lambda_used"])
-            wang_fair_value = float(edge_result["fair_value"])
-            wang_edge = float(edge_result["edge"])
-            confidence = float(edge_result["confidence"])
-            fair_value = wang_fair_value
+            wang_lambda = signal.wang_lambda
+            wang_fair_value = signal.wang_fair_value
+            wang_edge = signal.wang_edge
+
+            if signal.disagreement_capped:
+                self.log_func("REJECTED", asset_type, token_id, {
+                    "market_name": question,
+                    "reason": "model disagrees with market beyond max_disagreement_ratio",
+                    "raw_probability": round(raw_probability, 4),
+                    "wang_fair_value": round(wang_fair_value, 4),
+                    "blended_fair_value": round(fair_value, 4),
+                    "market_price": round(poly_price, 4),
+                    "max_disagreement_ratio": self.config.max_disagreement_ratio,
+                })
+                self.hunter.add_to_cooldown(token_id)
+                return None
 
             if abs(wang_edge) < self.wang_min_edge:
                 self.log_func("SCAN-SKIP", asset_type, token_id, {
@@ -543,15 +563,15 @@ class SequentialTradingPipeline:
         self.bridge.forecast = float(fair_value)
 
         price_yes = float(poly_price)
-        ev_yes = (float(fair_value) / float(price_yes) - 1.0) if price_yes > 0 else -1.0
-        price_no = max(1e-9, 1.0 - float(price_yes))
+        price_no = max(1e-9, 1.0 - price_yes)
         fair_no = 1.0 - float(fair_value)
-        ev_no = (fair_no / price_no - 1.0) if price_no > 0 else -1.0
+        ev_yes = signal.ev_yes
+        ev_no = signal.ev_no
         self.bridge.ev = float(ev_yes)
 
-        side = "YES" if ev_yes > ev_no else "NO"
-        final_ev = max(ev_yes, ev_no)
-        entry_price = float(price_yes if side == "YES" else price_no)
+        side = signal.side
+        final_ev = signal.expected_value
+        entry_price = float(signal.entry_price)
 
         # Kelly sizing (BudgetManager.compute_kelly_bet_size): kelly_optimal =
         # edge/odds for whichever side was actually picked — YES odds are
@@ -565,7 +585,7 @@ class SequentialTradingPipeline:
             kelly_edge = fair_no - price_no
             kelly_odds = price_yes  # == 1 - price_no
 
-        kelly_raw_fraction = max(0.0, kelly_edge / kelly_odds) if kelly_odds > 0 else 0.0
+        kelly_raw_fraction = signal.kelly_size
         kelly_bet_usd = self.budget_manager.compute_kelly_bet_size(kelly_edge, kelly_odds, confidence)
 
         # Correlation exposure (see trading/correlation.py): how correlated

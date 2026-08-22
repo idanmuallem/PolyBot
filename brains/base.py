@@ -5,9 +5,16 @@ implement _calculate_probability() with domain-specific models.
 """
 
 from abc import ABC, abstractmethod
+import logging
 import re
 from datetime import datetime, timezone
-from core.trading_config import DEFAULT_MIN_EV
+from brains.pricing_engine import wang_transform
+from core.trading_config import (
+    DEFAULT_MIN_EV,
+    DEFAULT_WANG_LAMBDA,
+    DEFAULT_MODEL_WEIGHT,
+    DEFAULT_MAX_DISAGREEMENT_RATIO,
+)
 from core.models import MarketData, TradeSignal
 
 
@@ -82,10 +89,9 @@ class BaseBrain(ABC):
     def get_raw_probability(self, market: MarketData, live_truth: float) -> float:
         """Return this brain's raw probability estimate (p_true), clamped to [0, 1].
 
-        This is the brain's unadjusted opinion — the "raw" input that
-        PricingEngine.compute_edge() Wang-adjusts into a market-consistent
-        fair value. evaluate() below still uses it directly for the legacy
-        (pre-Wang) EV/Kelly path.
+        This is the brain's unadjusted opinion — the input evaluate() below
+        risk-adjusts (Wang Transform -> market blend -> disagreement cap)
+        into a tradeable fair value.
         """
         return max(0.0, min(1.0, self._calculate_probability(market, live_truth)))
 
@@ -94,23 +100,88 @@ class BaseBrain(ABC):
         market: MarketData,
         live_truth: float,
         min_ev: float = DEFAULT_MIN_EV,
+        wang_lambda: float = DEFAULT_WANG_LAMBDA,
+        model_weight: float = DEFAULT_MODEL_WEIGHT,
+        max_disagreement_ratio: float = DEFAULT_MAX_DISAGREEMENT_RATIO,
     ) -> TradeSignal:
-        """Compute fair value, EV, Kelly size, and tradability for *market*."""
-        fair_value = self.get_raw_probability(market, live_truth)
+        """Compute fair value, EV, Kelly size, and tradability for *market*.
 
-        expected_value = (
-            (fair_value - market.initial_price) / market.initial_price
-            if market.initial_price > 0 else 0.0
+        Single source of truth for pricing (see trading/decision_pipeline.py,
+        which calls this directly rather than re-deriving fair value itself).
+        Three layers run in order, each correcting what the last couldn't:
+
+        1. Wang Transform — risk-adjusts the raw model probability. Shrinks
+           toward a no-op as raw_fair approaches 0 or 1, so on its own it
+           barely dents an already-overconfident (near-certain) model output.
+        2. Market blending — pulls the Wang-adjusted value toward the
+           market's own price by (1 - model_weight), which is what actually
+           reins in a saturated raw probability the Wang step alone can't.
+        3. Disagreement ratio cap — a safety net: if the blended fair value
+           still disagrees with the market by more than max_disagreement_ratio
+           (either direction), the signal is rejected outright rather than
+           traded on.
+        """
+        raw_fair = self.get_raw_probability(market, live_truth)
+        market_price = float(market.initial_price) if market.initial_price > 0 else 0.5
+
+        # Step 1: Wang Transform.
+        wang_fair = wang_transform(raw_fair, wang_lambda)
+
+        # Step 2: Market blending. model_weight is a caller-supplied knob
+        # (ultimately from config/env - see MODEL_WEIGHT in core/trading_config.py),
+        # so clamp defensively rather than let a bad value silently invert the
+        # blend or amplify past [0, 1].
+        if not (0.0 <= model_weight <= 1.0):
+            logging.warning(
+                "model_weight=%.4f out of [0.0, 1.0] range; clamping.", model_weight
+            )
+            model_weight = max(0.0, min(1.0, model_weight))
+        blended_fair = model_weight * wang_fair + (1.0 - model_weight) * market_price
+        fair_value = max(0.0, min(1.0, blended_fair))
+
+        # Step 3: Disagreement ratio cap (direction-agnostic: catches the
+        # fair value being either too far above or too far below the market).
+        hi = max(fair_value, market_price)
+        lo = max(1e-9, min(fair_value, market_price))
+        disagreement_capped = (hi / lo) > max_disagreement_ratio
+
+        price_yes = market_price
+        price_no = max(1e-9, 1.0 - price_yes)
+        fair_no = 1.0 - fair_value
+        ev_yes = (fair_value / price_yes - 1.0) if price_yes > 0 else -1.0
+        ev_no = (fair_no / price_no - 1.0) if price_no > 0 else -1.0
+
+        side = "YES" if ev_yes >= ev_no else "NO"
+        expected_value = ev_yes if side == "YES" else ev_no
+        entry_price = price_yes if side == "YES" else price_no
+
+        kelly_size = max(
+            0.0,
+            self._calculate_kelly(fair_value, price_yes) if side == "YES"
+            else self._calculate_kelly(fair_no, price_no),
         )
 
-        kelly_size = max(0.0, min(0.05, self._calculate_kelly(fair_value, market.initial_price)))
-        is_tradable = expected_value >= min_ev and kelly_size > 0.0
+        is_tradable = (
+            not disagreement_capped
+            and expected_value >= min_ev
+            and kelly_size > 0.0
+        )
 
         return TradeSignal(
             fair_value=fair_value,
             expected_value=expected_value,
             kelly_size=kelly_size,
             is_tradable=is_tradable,
+            raw_probability=raw_fair,
+            wang_fair_value=wang_fair,
+            wang_lambda=wang_lambda,
+            wang_edge=fair_value - market_price,
+            confidence=1.0,
+            side=side,
+            ev_yes=ev_yes,
+            ev_no=ev_no,
+            entry_price=entry_price,
+            disagreement_capped=disagreement_capped,
         )
 
     @staticmethod

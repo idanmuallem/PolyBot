@@ -6,9 +6,18 @@ from dataclasses import dataclass, fields
 from dotenv import load_dotenv
 
 
-DEFAULT_MIN_EV = 0.30
+DEFAULT_MIN_EV = 0.50
 DEFAULT_MAX_BET_SIZE_USD = 3.0
 DEFAULT_DAILY_LIMIT_USD = 15.0
+
+# Entry-side pricing (see BaseBrain.evaluate() in brains/base.py). Distinct
+# from wang_base_lambda below, which is the oracle3-calibrated hierarchical
+# prior used only by the exit-side Wang-edge-decay check in
+# trading/risk_manager.py - changing that one would silently alter open-
+# position exit behavior, so entry calibration gets its own flat constant.
+DEFAULT_WANG_LAMBDA = -0.75          # risk-averse distortion; 0.0 disables Wang entirely
+DEFAULT_MODEL_WEIGHT = 0.40          # weight on the Wang-adjusted model vs. (1 - this) on market price
+DEFAULT_MAX_DISAGREEMENT_RATIO = 1.50  # reject if fair_value/market_price (or its inverse) exceeds this
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -81,8 +90,15 @@ class TradingConfig:
     # the Wang adjustment entirely and uses the brain's raw EV, for comparing
     # the two during the transition.
     pricing_mode: str = "wang"  # "wang" or "legacy"
-    wang_base_lambda: float = 0.183
+    wang_base_lambda: float = 0.183  # exit-side only - see trading/risk_manager.py
     wang_min_edge: float = 0.05  # minimum |wang_edge| (probability points) to consider a trade
+
+    # Entry-side pricing knobs consumed by BaseBrain.evaluate() (see
+    # DEFAULT_WANG_LAMBDA / DEFAULT_MODEL_WEIGHT / DEFAULT_MAX_DISAGREEMENT_RATIO
+    # above for what each does).
+    wang_lambda: float = DEFAULT_WANG_LAMBDA
+    model_weight: float = DEFAULT_MODEL_WEIGHT
+    max_disagreement_ratio: float = DEFAULT_MAX_DISAGREEMENT_RATIO
 
     # Risk management (see trading/budget_manager.py, trading/risk_manager.py).
     kelly_fraction: float = 0.25  # quarter-Kelly — full Kelly is optimal in expectation but has extreme variance
@@ -118,7 +134,7 @@ class TradingConfig:
         load_dotenv("config/.env")
 
         cfg = cls(
-            min_ev=float(os.getenv("MIN_EV", "0.30")),
+            min_ev=float(os.getenv("MIN_EV", "0.50")),
             min_tte_minutes=int(os.getenv("MIN_TTE_MINUTES", "60")),
             max_tte_days=int(os.getenv("MAX_TTE_DAYS", "180")),
             daily_limit_usd=float(os.getenv("DAILY_LIMIT_USD", "15.0")),
@@ -140,6 +156,9 @@ class TradingConfig:
             pricing_mode=_env_first("PRICING_MODE", default="wang"),
             wang_base_lambda=float(os.getenv("WANG_BASE_LAMBDA", "0.183")),
             wang_min_edge=float(os.getenv("WANG_MIN_EDGE", "0.05")),
+            wang_lambda=float(os.getenv("WANG_LAMBDA", str(DEFAULT_WANG_LAMBDA))),
+            model_weight=float(os.getenv("MODEL_WEIGHT", str(DEFAULT_MODEL_WEIGHT))),
+            max_disagreement_ratio=float(os.getenv("MAX_DISAGREEMENT_RATIO", str(DEFAULT_MAX_DISAGREEMENT_RATIO))),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.20")),
             arbitrage_daily_limit_usd=float(os.getenv("ARBITRAGE_DAILY_LIMIT_USD", "50.0")),

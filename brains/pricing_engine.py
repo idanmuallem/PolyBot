@@ -46,6 +46,26 @@ def _clamp_prob(p: float) -> float:
     return max(_EPS, min(1.0 - _EPS, p))
 
 
+def wang_transform(p_true: float, lam: float) -> float:
+    """Flat-lambda Wang Transform: Phi(Phi^-1(p_true) + lam).
+
+    Used directly by BaseBrain.evaluate() (brains/base.py) for entry-side
+    pricing, where lam is a fixed risk-aversion constant (config.wang_lambda)
+    rather than PricingEngine's hierarchical, metadata-driven lambda below.
+    lam < 0 pulls p_true toward 0.5 (risk-averse); lam > 0 pushes it away;
+    lam == 0.0 is an exact passthrough.
+
+    The shift shrinks as p_true approaches 0 or 1 (see wang_fair_value's
+    delta_lambda) - by itself this transform cannot fully correct a raw
+    probability that's already saturated near an extreme. That's what
+    evaluate()'s market-blending step (after this one) is for.
+    """
+    if lam == 0.0:
+        return float(p_true)
+    p = _clamp_prob(p_true)
+    return float(norm.cdf(norm.ppf(p) + lam))
+
+
 class PricingEngine:
     """Wang-adjusts a brain's raw probability into a tradeable fair value.
 
