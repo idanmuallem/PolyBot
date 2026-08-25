@@ -106,6 +106,33 @@ class SequentialTradingPipeline:
         self.strategies: list[Strategy] = [EventSumStrategy(config=self.config)]
         self.strategy_scan_interval = 30.0  # don't hammer the Gamma API every loop tick
         self._last_strategy_scan = 0.0
+
+        # group_ids rejected this "day" for insufficient_budget,
+        # tte_exceeds_max, or daily_trade_limit_would_be_exceeded — none of
+        # these conditions change between scans (the per-strategy budget and
+        # trade count only reset daily; a leg's expiry date is fixed), so
+        # re-evaluating the same groups every 30s was pure waste. Cleared in
+        # _reset_daily_if_needed().
+        self._exhausted_arb_groups: set[str] = set()
+
+        # token_ids "held" this "day" via a dry-run/paper-trade fill. Neither
+        # mode submits a real order, so TradeExecutor.get_open_positions()
+        # (which always queries the live Polymarket Data API - see
+        # _stage_evaluate_ev's "already_owned_in_portfolio" check) never sees
+        # them, and without this the same EV-positive market gets re-bought
+        # every hunt cycle. Live mode's real on-chain position already
+        # covers this once the order settles; this is purely a simulated-
+        # mode backstop. Cleared in _reset_daily_if_needed().
+        self._simulated_positions: set[str] = set()
+
+        # group_ids successfully filled this "day" - this applies in EVERY
+        # mode, not just simulated ones (unlike _simulated_positions above):
+        # the arbitrage path has no "already hold this" check of its own at
+        # all, so a group gets rediscovered and re-filled every scan for as
+        # long as it stays profitable in the live Gamma API snapshot.
+        # Cleared in _reset_daily_if_needed().
+        self._filled_arb_groups: set[str] = set()
+
         self.portfolio_manager = ctx.portfolio_manager
 
         sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
@@ -219,6 +246,9 @@ class SequentialTradingPipeline:
             self.budget_manager.spent_by_strategy = {}
             self.budget_manager.trades_by_strategy = {}
             self.executor.reset_daily_count()
+            self._exhausted_arb_groups.clear()
+            self._simulated_positions.clear()
+            self._filled_arb_groups.clear()
 
     # ------------------------------------------------------------------
     # Strategy scan — constraint-based arbitrage, independent of the
@@ -283,6 +313,10 @@ class SequentialTradingPipeline:
                 continue
 
             for group_id, group_signals in self._group_signals(signals).items():
+                if group_id in self._filled_arb_groups:
+                    continue  # already hold this position, skip silently
+                if group_id in self._exhausted_arb_groups:
+                    continue
                 await self._execute_strategy_group(strategy, group_id, group_signals)
 
     def _group_has_leg_beyond_max_tte(self, signals: list, group_id: str, asset_type: str, log_func) -> bool:
@@ -339,6 +373,7 @@ class SequentialTradingPipeline:
         asset_type = signals[0].market.asset_type
 
         if self._group_has_leg_beyond_max_tte(signals, group_id, asset_type, tagged_log):
+            self._exhausted_arb_groups.add(group_id)
             return
 
         total_cost = sum(float(s.bet_amount_usd) for s in signals)
@@ -367,6 +402,7 @@ class SequentialTradingPipeline:
                 "total_cost": round(total_cost, 4),
                 "remaining_budget": round(remaining_budget, 4),
             })
+            self._exhausted_arb_groups.add(group_id)
             return
 
         arbitrage_max_daily_trades = self.executor._strategy_max_daily_trades("arbitrage")
@@ -377,6 +413,7 @@ class SequentialTradingPipeline:
                 "group_id": group_id,
                 "n_legs": len(signals),
             })
+            self._exhausted_arb_groups.add(group_id)
             return
 
         legs = []
@@ -439,6 +476,14 @@ class SequentialTradingPipeline:
             "total_cost": round(total_cost, 4),
         })
 
+        # We now hold at least part of this group's position - don't
+        # rediscover and re-buy it on a future scan (see
+        # _filled_arb_groups' definition in __init__). Gated on at least
+        # one real fill: a group where every leg got zero fills holds
+        # nothing and should stay eligible for a genuine future attempt.
+        if executed_legs > 0:
+            self._filled_arb_groups.add(group_id)
+
     async def _stage_hunt(self):
         """Run market discovery off the event loop.
 
@@ -464,13 +509,26 @@ class SequentialTradingPipeline:
         asset_type = str(getattr(market, "asset_type", "") or "")
         question = str(getattr(market, "market_name", "") or getattr(market, "question", ""))
 
+        # Every market gets one look per cooldown window. Period. Every exit
+        # path below used to call add_to_cooldown() individually and at
+        # least one (live_truth unavailable) forgot to - doing it once here,
+        # unconditionally, before any evaluation begins, replaces all of them.
+        self.hunter.add_to_cooldown(token_id)
+
+        # Dry-run/paper-trade equivalent of the real-portfolio check below -
+        # see _simulated_positions' definition in __init__. Neither mode
+        # submits a real order, so the real-portfolio check has nothing to
+        # catch; this is the session-level backstop for those modes.
+        if token_id in self._simulated_positions:
+            self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_held_simulated"})
+            return None
+
         # Prevent buying a market already in the portfolio.
         if hasattr(self.bridge, "current_portfolio") and self.bridge.current_portfolio:
             for position in self.bridge.current_portfolio:
                 pos_token = str(getattr(position, "asset_id", getattr(position, "token_id", "")))
                 if pos_token == token_id:
                     self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_owned_in_portfolio"})
-                    self.hunter.add_to_cooldown(token_id)
                     return None
 
         self.bridge.status = f"Scanning {asset_type}: {question[:60]}..."
@@ -489,7 +547,6 @@ class SequentialTradingPipeline:
                 "price_floor": PRICE_FLOOR,
                 "price_ceiling": PRICE_CEILING,
             })
-            self.hunter.add_to_cooldown(token_id)
             return None
 
         live_truth = hunter.get_live_truth(market)
@@ -542,11 +599,6 @@ class SequentialTradingPipeline:
                     "wang_edge": round(wang_edge, 4),
                     "wang_min_edge": self.wang_min_edge,
                 })
-                # Evaluated with current data and found sub-threshold - don't
-                # re-scan until cooldown expires (mirrors _reject()'s cooldown
-                # for the other sub-threshold rejection path in
-                # _stage_risk_and_budget).
-                self.hunter.add_to_cooldown(token_id)
                 return None
 
         self.bridge.forecast = float(post_prob)
@@ -741,6 +793,18 @@ class SequentialTradingPipeline:
             self._set_spend(self.spent_today)
             if not self.executor.dry_run:
                 self._set_cash(max(0.0, float(self.bridge.current_balance) - float(approved_bet)))
+
+            # Record the simulated fill so _stage_evaluate_ev's
+            # already_held_simulated check can catch it next cycle - see
+            # _simulated_positions' definition in __init__. token_id (the
+            # market's canonical YES id, which is what _stage_evaluate_ev
+            # always keys its lookup on) is always added; the NO token is
+            # added too on a NO-side trade, in case anything else keys off it.
+            self._simulated_positions.add(candidate.token_id)
+            if candidate.side == "NO" and hasattr(candidate.market, "no_market_id"):
+                no_token = str(candidate.market.no_market_id or "")
+                if no_token:
+                    self._simulated_positions.add(no_token)
 
             total_equity = self._total_equity()
 
