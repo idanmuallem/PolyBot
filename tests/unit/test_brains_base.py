@@ -89,7 +89,7 @@ def test_tradable_above_min_ev():
     with patch.object(brain, "_calculate_probability", return_value=0.80):
         signal = brain.evaluate(
             market, 95_000.0, min_ev=0.30,
-            wang_lambda=0.0, model_weight=1.0, max_disagreement_ratio=float("inf"),
+            wang_lambda=0.0, model_weight=1.0,
         )
     # EV = (0.80 - 0.50) / 0.50 = 0.60 > 0.30
     assert signal.is_tradable is True
@@ -136,7 +136,6 @@ def test_model_weight_above_one_is_clamped():
     with patch.object(brain, "_calculate_probability", return_value=0.80):
         signal = brain.evaluate(
             market, 95_000.0, wang_lambda=0.0, model_weight=1.5,
-            max_disagreement_ratio=float("inf"),
         )
     assert signal.post_prob == pytest.approx(0.80)
 
@@ -148,7 +147,6 @@ def test_model_weight_below_zero_is_clamped():
     with patch.object(brain, "_calculate_probability", return_value=0.80):
         signal = brain.evaluate(
             market, 95_000.0, wang_lambda=0.0, model_weight=-0.5,
-            max_disagreement_ratio=float("inf"),
         )
     assert signal.post_prob == pytest.approx(0.50)
 
@@ -163,7 +161,6 @@ def test_wang_transform_reduces_high_probability():
     with patch.object(brain, "_calculate_probability", return_value=0.95):
         signal = brain.evaluate(
             market, 95_000.0, wang_lambda=-0.75, model_weight=1.0,
-            max_disagreement_ratio=float("inf"),
         )
     assert signal.post_prob < 0.90
 
@@ -174,7 +171,7 @@ def test_wang_transform_penalizes_uncertainty_more():
     # shrinks toward 0/1.
     brain = HybridCryptoBrain()
     market = _make_market(price=0.50)
-    kwargs = dict(wang_lambda=-0.75, model_weight=1.0, max_disagreement_ratio=float("inf"))
+    kwargs = dict(wang_lambda=-0.75, model_weight=1.0)
 
     with patch.object(brain, "_calculate_probability", return_value=0.50):
         signal_mid = brain.evaluate(market, 95_000.0, **kwargs)
@@ -194,7 +191,6 @@ def test_wang_lambda_zero_is_passthrough():
     with patch.object(brain, "_calculate_probability", return_value=0.70):
         signal = brain.evaluate(
             market, 95_000.0, wang_lambda=0.0, model_weight=1.0,
-            max_disagreement_ratio=float("inf"),
         )
     assert signal.post_prob == pytest.approx(0.70)
 
@@ -209,7 +205,6 @@ def test_blending_pulls_fair_toward_market():
     with patch.object(brain, "_calculate_probability", return_value=0.95):
         signal = brain.evaluate(
             market, 95_000.0, wang_lambda=-0.75, model_weight=0.40,
-            max_disagreement_ratio=float("inf"),
         )
     wang_fair = wang_transform(0.95, -0.75)
     expected_blended = 0.40 * wang_fair + 0.60 * 0.50
@@ -227,7 +222,6 @@ def test_escape_hatch_reproduces_old_behavior():
     with patch.object(brain, "_calculate_probability", return_value=0.80):
         signal = brain.evaluate(
             market, 95_000.0, wang_lambda=0.0, model_weight=1.0,
-            max_disagreement_ratio=float("inf"),
         )
     assert signal.post_prob == pytest.approx(0.80)
     assert signal.post_prob == pytest.approx(signal.pre_prob)

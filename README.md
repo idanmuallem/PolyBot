@@ -28,7 +28,7 @@ PolyBot scans Polymarket's prediction markets for mispriced contracts using real
 **Key capabilities:**
 
 - Market discovery across crypto, weather, and macro asset classes
-- Domain-specific fair-value models (Black-Scholes/Heston for crypto, normal-distribution for weather/economy)
+- Domain-specific fair-value models (Black-Scholes for crypto, normal-distribution for weather/economy)
 - Kelly-criterion-based position sizing with hard budget caps
 - Dry-run, paper-trading, and live-trading modes
 - Real-time dashboard with equity curve, open positions, and EV distribution
@@ -87,8 +87,8 @@ Each wallet runs as a fully isolated unit — its own `TradingConfig`, its own l
 PolyBot/
 │
 ├── brains/                     # Fair-value pricing models
-│   ├── base.py                 # BaseBrain: entry-side Wang Transform → blend → disagreement cap, EV, Kelly sizing
-│   ├── crypto.py               # HybridCryptoBrain: Black-Scholes + Heston → raw probability
+│   ├── base.py                 # BaseBrain: entry-side Wang Transform → blend, EV, Kelly sizing
+│   ├── crypto.py               # HybridCryptoBrain: Black-Scholes → raw probability
 │   ├── weather.py              # WeatherBrain: normal distribution on temperature
 │   ├── economy.py              # EconomyBrain: normal distribution on macro indicators
 │   └── pricing_engine.py       # PricingEngine: hierarchical Wang Transform (exit-side decay check only)
@@ -167,7 +167,7 @@ A separate, model-free path runs alongside the hunters: **strategies** (`trading
 
 Each discovered market is passed to the matching `Brain`, which produces a **raw probability** the market resolves YES from the anchor value and a domain-specific statistical model:
 
-- **Crypto**: Black-Scholes for short TTE, Heston model for longer-dated contracts. Uses per-asset implied volatility (BTC 50%, ETH 70%, SOL 90%).
+- **Crypto**: Black-Scholes for every TTE (a Heston/FFT model previously handled >90-day contracts but was dropped — its output wasn't actually a CDF probability, just a normalized option value; see `HybridCryptoBrain`'s docstring). Uses per-asset implied volatility (BTC 50%, ETH 70%, SOL 90%).
 - **Weather**: Normal distribution around the forecast with a configurable standard deviation.
 - **Economy**: Normal distribution around the current macro reading with historical volatility.
 
@@ -176,7 +176,7 @@ These raw models are often overconfident — near-certain probabilities on deep 
 1. **Wang Transform** (`WANG_LAMBDA`, default `-0.75`) — a probit-space risk distortion, `Φ(Φ⁻¹(p) + λ)`, that pulls extreme probabilities back toward uncertainty. The shift shrinks as `p` approaches 0 or 1, so a genuinely near-certain outcome is barely touched while a shaky "0.95" gets meaningfully discounted.
 2. **Market blending** (`MODEL_WEIGHT`, default `0.40`) — blends the Wang-adjusted probability with the market's own price (`model_weight * wang_fair + (1 - model_weight) * market_price`), treating the market price as a second opinion the model doesn't get to override on its own.
 
-A **disagreement ratio cap** (`MAX_DISAGREEMENT_RATIO`, default `1.50`) then acts as a safety net: if the blended fair value still disagrees with the market price by more than that ratio in either direction, the signal is rejected outright rather than traded — Wang and blending together usually keep fair value within range, but the cap catches whatever slips through. Setting `WANG_LAMBDA=0.0` and `MODEL_WEIGHT=1.0` is the escape hatch — it disables both layers and reproduces the brain's raw, uncalibrated probability exactly (`PRICING_MODE=legacy` does the same at the pipeline level, for A/B comparison).
+Setting `WANG_LAMBDA=0.0` and `MODEL_WEIGHT=1.0` is the escape hatch — it disables both layers and reproduces the brain's raw, uncalibrated probability exactly (`PRICING_MODE=legacy` does the same at the pipeline level, for A/B comparison).
 
 This entry-side calibration is distinct from `PricingEngine`'s hierarchical Wang Transform (`WANG_BASE_LAMBDA`), which is used only on the **exit** side — see `trading/risk_manager.py`'s Wang-edge-decay check in Position Management below.
 
@@ -185,12 +185,11 @@ This entry-side calibration is distinct from `PricingEngine`'s hierarchical Wang
 The pipeline filters markets through several gates before executing:
 
 1. Expected value (computed off the calibrated fair value above) must exceed `MIN_EV` (default `0.50`)
-2. The calibrated fair value must not disagree with the market price by more than `MAX_DISAGREEMENT_RATIO`
-3. Time to expiry must be between `MIN_TTE_MINUTES` and `MAX_TTE_DAYS`
-4. Daily spend must be below `DAILY_LIMIT_USD`
-5. Available balance must exceed `MIN_TRADING_BALANCE`
-6. New entries are paused while the wallet is in drawdown circuit-breaker pause (see below)
-7. Position size is Kelly-criterion-scaled (`KELLY_FRACTION`, default quarter-Kelly), discounted by correlation exposure to already-open positions, and capped at `MAX_BET_SIZE_USD`
+2. Time to expiry must be between `MIN_TTE_MINUTES` and `MAX_TTE_DAYS`
+3. Daily spend must be below `DAILY_LIMIT_USD`
+4. Available balance must exceed `MIN_TRADING_BALANCE`
+5. New entries are paused while the wallet is in drawdown circuit-breaker pause (see below)
+6. Position size is Kelly-criterion-scaled (`KELLY_FRACTION`, default quarter-Kelly), discounted by correlation exposure to already-open positions, and capped at `MAX_BET_SIZE_USD`
 
 ### 4. Position Management
 
@@ -277,12 +276,11 @@ MIN_TTE_MINUTES=60
 MAX_TTE_DAYS=180
 
 # Entry-side calibration (see BaseBrain.evaluate() in brains/base.py):
-# Wang Transform -> market blending -> disagreement ratio cap, applied to
-# every brain's raw probability before EV is computed.
+# Wang Transform -> market blending, applied to every brain's raw
+# probability before EV is computed.
 PRICING_MODE=wang            # "wang" or "legacy" (legacy = brain's raw probability, no calibration)
 WANG_LAMBDA=-0.75            # risk-averse distortion; 0.0 disables the Wang step
 MODEL_WEIGHT=0.40            # weight on the Wang-adjusted model vs. (1 - this) on market price
-MAX_DISAGREEMENT_RATIO=1.50  # reject if fair_value/market_price (or its inverse) exceeds this
 
 # Exit-side pricing (see PricingEngine in brains/pricing_engine.py, used only
 # by trading/risk_manager.py's Wang-edge-decay check on open positions)
@@ -402,7 +400,6 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `PRICING_MODE` | `wang` | `wang` (calibrated fair value) or `legacy` (brain's raw probability, no calibration) |
 | `WANG_LAMBDA` | `-0.75` | Entry-side Wang Transform distortion (`BaseBrain.evaluate()`); negative = risk-averse, `0.0` disables it |
 | `MODEL_WEIGHT` | `0.40` | Entry-side blend weight on the Wang-adjusted model vs. `(1 - this)` on market price; `1.0` disables blending |
-| `MAX_DISAGREEMENT_RATIO` | `1.50` | Reject a trade if calibrated fair value disagrees with market price by more than this ratio |
 | `WANG_BASE_LAMBDA` | `0.183` | Exit-side hierarchical Wang Transform base risk-premium (`PricingEngine`, position-decay check only) |
 | `WANG_MIN_EDGE` | `0.05` | Minimum \|Wang edge\| (probability points) for the exit-side decay check |
 | `KELLY_FRACTION` | `0.25` | Fraction of full Kelly used for position sizing |

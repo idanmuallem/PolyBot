@@ -17,7 +17,6 @@ DEFAULT_DAILY_LIMIT_USD = 15.0
 # position exit behavior, so entry calibration gets its own flat constant.
 DEFAULT_WANG_LAMBDA = -0.75          # risk-averse distortion; 0.0 disables Wang entirely
 DEFAULT_MODEL_WEIGHT = 0.40          # weight on the Wang-adjusted model vs. (1 - this) on market price
-DEFAULT_MAX_DISAGREEMENT_RATIO = 1.50  # reject if fair_value/market_price (or its inverse) exceeds this
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -94,11 +93,9 @@ class TradingConfig:
     wang_min_edge: float = 0.05  # minimum |wang_edge| (probability points) to consider a trade
 
     # Entry-side pricing knobs consumed by BaseBrain.evaluate() (see
-    # DEFAULT_WANG_LAMBDA / DEFAULT_MODEL_WEIGHT / DEFAULT_MAX_DISAGREEMENT_RATIO
-    # above for what each does).
+    # DEFAULT_WANG_LAMBDA / DEFAULT_MODEL_WEIGHT above for what each does).
     wang_lambda: float = DEFAULT_WANG_LAMBDA
     model_weight: float = DEFAULT_MODEL_WEIGHT
-    max_disagreement_ratio: float = DEFAULT_MAX_DISAGREEMENT_RATIO
 
     # Risk management (see trading/budget_manager.py, trading/risk_manager.py).
     kelly_fraction: float = 0.25  # quarter-Kelly — full Kelly is optimal in expectation but has extreme variance
@@ -145,6 +142,7 @@ class TradingConfig:
             stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "-0.50")),
             min_hold_ev=float(os.getenv("MIN_HOLD_EV", "-0.10")),
             loop_delay_seconds=float(os.getenv("ENGINE_LOOP_DELAY", "2.0")),
+            max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "10")),
             dry_run=_env_bool("DRY_RUN", "True"),
             paper_trade_mode=_env_bool("PAPER_TRADE_MODE", "False"),
             paper_balance_usd=float(os.getenv("PAPER_BALANCE_USD", "1000.0")),
@@ -158,7 +156,6 @@ class TradingConfig:
             wang_min_edge=float(os.getenv("WANG_MIN_EDGE", "0.05")),
             wang_lambda=float(os.getenv("WANG_LAMBDA", str(DEFAULT_WANG_LAMBDA))),
             model_weight=float(os.getenv("MODEL_WEIGHT", str(DEFAULT_MODEL_WEIGHT))),
-            max_disagreement_ratio=float(os.getenv("MAX_DISAGREEMENT_RATIO", str(DEFAULT_MAX_DISAGREEMENT_RATIO))),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.20")),
             arbitrage_daily_limit_usd=float(os.getenv("ARBITRAGE_DAILY_LIMIT_USD", "50.0")),

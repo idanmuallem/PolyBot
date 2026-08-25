@@ -90,11 +90,10 @@ class SequentialTradingPipeline:
         self.max_bet_size_usd = float(self.config.max_bet_size_usd)
         self.safe_minimum = 1.0
 
-        # Wang Transform pricing — all of it (Wang Transform, market blending,
-        # disagreement cap) now lives in BaseBrain.evaluate() (brains/base.py),
-        # which this pipeline calls directly rather than re-deriving fair
-        # value itself. "legacy" skips all three layers for A/B comparison
-        # (see _stage_evaluate_ev).
+        # Wang Transform pricing — all of it (Wang Transform, market blending)
+        # now lives in BaseBrain.evaluate() (brains/base.py), which this
+        # pipeline calls directly rather than re-deriving fair value itself.
+        # "legacy" skips both layers for A/B comparison (see _stage_evaluate_ev).
         self.pricing_mode = str(getattr(self.config, "pricing_mode", "wang") or "wang").lower()
         self.wang_min_edge = float(getattr(self.config, "wang_min_edge", 0.05))
 
@@ -507,22 +506,20 @@ class SequentialTradingPipeline:
         brain = get_brain_for_asset_type(asset_type)
         model_used = getattr(brain, "last_model_used", "unknown")
 
-        # Pricing (Wang Transform -> market blend -> disagreement cap) is all
-        # computed inside evaluate() — see brains/base.py. "legacy" mode asks
-        # for all three layers disabled (lambda=0, full model weight, an
-        # unreachable disagreement ratio) so it reduces to the brain's raw
-        # probability, for A/B comparison against "wang" mode.
+        # Pricing (Wang Transform -> market blend) is all computed inside
+        # evaluate() — see brains/base.py. "legacy" mode asks for both layers
+        # disabled (lambda=0, full model weight) so it reduces to the brain's
+        # raw probability, for A/B comparison against "wang" mode.
         if self.pricing_mode == "legacy":
             signal = brain.evaluate(
                 market, live_truth, min_ev=self.min_ev_threshold,
-                wang_lambda=0.0, model_weight=1.0, max_disagreement_ratio=float("inf"),
+                wang_lambda=0.0, model_weight=1.0,
             )
         else:
             signal = brain.evaluate(
                 market, live_truth, min_ev=self.min_ev_threshold,
                 wang_lambda=self.config.wang_lambda,
                 model_weight=self.config.model_weight,
-                max_disagreement_ratio=self.config.max_disagreement_ratio,
             )
 
         pre_prob = signal.pre_prob
@@ -536,19 +533,6 @@ class SequentialTradingPipeline:
             wang_fair_value = signal.wang_fair_value
             wang_edge = signal.wang_edge
 
-            if signal.disagreement_capped:
-                self.log_func("REJECTED", asset_type, token_id, {
-                    "market_name": question,
-                    "reason": "model disagrees with market beyond max_disagreement_ratio",
-                    "pre_prob": round(pre_prob, 4),
-                    "wang_fair_value": round(wang_fair_value, 4),
-                    "blended_fair_value": round(post_prob, 4),
-                    "market_price": round(poly_price, 4),
-                    "max_disagreement_ratio": self.config.max_disagreement_ratio,
-                })
-                self.hunter.add_to_cooldown(token_id)
-                return None
-
             if abs(wang_edge) < self.wang_min_edge:
                 self.log_func("SCAN-SKIP", asset_type, token_id, {
                     "reason": "wang_edge below minimum",
@@ -558,6 +542,11 @@ class SequentialTradingPipeline:
                     "wang_edge": round(wang_edge, 4),
                     "wang_min_edge": self.wang_min_edge,
                 })
+                # Evaluated with current data and found sub-threshold - don't
+                # re-scan until cooldown expires (mirrors _reject()'s cooldown
+                # for the other sub-threshold rejection path in
+                # _stage_risk_and_budget).
+                self.hunter.add_to_cooldown(token_id)
                 return None
 
         self.bridge.forecast = float(post_prob)

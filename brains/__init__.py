@@ -1,4 +1,4 @@
-"""Domain-specific fair value brains: Crypto (Black-Scholes/Heston), Weather (normal), Economy (normal)."""
+"""Domain-specific fair value brains: Crypto (Black-Scholes), Weather (normal), Economy (normal)."""
 
 from .base import BaseBrain
 from .crypto import HybridCryptoBrain

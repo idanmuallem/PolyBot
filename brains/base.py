@@ -13,7 +13,6 @@ from core.trading_config import (
     DEFAULT_MIN_EV,
     DEFAULT_WANG_LAMBDA,
     DEFAULT_MODEL_WEIGHT,
-    DEFAULT_MAX_DISAGREEMENT_RATIO,
 )
 from core.models import MarketData, TradeSignal
 
@@ -90,8 +89,8 @@ class BaseBrain(ABC):
         """Return this brain's raw probability estimate (p_true), clamped to [0, 1].
 
         This is the brain's unadjusted opinion — the input evaluate() below
-        risk-adjusts (Wang Transform -> market blend -> disagreement cap)
-        into a tradeable fair value.
+        risk-adjusts (Wang Transform -> market blend) into a tradeable fair
+        value.
         """
         return max(0.0, min(1.0, self._calculate_probability(market, live_truth)))
 
@@ -102,13 +101,12 @@ class BaseBrain(ABC):
         min_ev: float = DEFAULT_MIN_EV,
         wang_lambda: float = DEFAULT_WANG_LAMBDA,
         model_weight: float = DEFAULT_MODEL_WEIGHT,
-        max_disagreement_ratio: float = DEFAULT_MAX_DISAGREEMENT_RATIO,
     ) -> TradeSignal:
         """Compute fair value, EV, Kelly size, and tradability for *market*.
 
         Single source of truth for pricing (see trading/decision_pipeline.py,
         which calls this directly rather than re-deriving fair value itself).
-        Three layers run in order, each correcting what the last couldn't:
+        Two layers run in order, each correcting what the last couldn't:
 
         1. Wang Transform — risk-adjusts the raw model probability. Shrinks
            toward a no-op as pre_prob approaches 0 or 1, so on its own it
@@ -116,10 +114,6 @@ class BaseBrain(ABC):
         2. Market blending — pulls the Wang-adjusted value toward the
            market's own price by (1 - model_weight), which is what actually
            reins in a saturated raw probability the Wang step alone can't.
-        3. Disagreement ratio cap — a safety net: if the blended post_prob
-           still disagrees with the market by more than max_disagreement_ratio
-           (either direction), the signal is rejected outright rather than
-           traded on.
         """
         pre_prob = self.get_raw_probability(market, live_truth)
         market_price = float(market.initial_price) if market.initial_price > 0 else 0.5
@@ -139,12 +133,6 @@ class BaseBrain(ABC):
         blended_fair = model_weight * wang_fair + (1.0 - model_weight) * market_price
         post_prob = max(0.0, min(1.0, blended_fair))
 
-        # Step 3: Disagreement ratio cap (direction-agnostic: catches
-        # post_prob being either too far above or too far below the market).
-        hi = max(post_prob, market_price)
-        lo = max(1e-9, min(post_prob, market_price))
-        disagreement_capped = (hi / lo) > max_disagreement_ratio
-
         price_yes = market_price
         price_no = max(1e-9, 1.0 - price_yes)
         fair_no = 1.0 - post_prob
@@ -161,11 +149,7 @@ class BaseBrain(ABC):
             else self._calculate_kelly(fair_no, price_no),
         )
 
-        is_tradable = (
-            not disagreement_capped
-            and expected_value >= min_ev
-            and kelly_size > 0.0
-        )
+        is_tradable = expected_value >= min_ev and kelly_size > 0.0
 
         return TradeSignal(
             post_prob=post_prob,
@@ -181,7 +165,6 @@ class BaseBrain(ABC):
             ev_yes=ev_yes,
             ev_no=ev_no,
             entry_price=entry_price,
-            disagreement_capped=disagreement_capped,
         )
 
     @staticmethod
