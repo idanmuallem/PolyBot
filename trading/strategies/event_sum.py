@@ -34,6 +34,7 @@ from typing import Any, Dict, List
 
 from core.models import MarketData
 from core.trading_config import TradingConfig
+from hunters.crypto import CryptoHunter
 
 from .base import Strategy, StrategySignal
 
@@ -89,10 +90,42 @@ class EventSumStrategy(Strategy):
         """*markets* is a list of raw Polymarket Gamma API event payloads
         (each with a nested "markets" list — one entry per outcome)."""
         signals: List[StrategySignal] = []
-        for event in markets or []:
+        for event in self._ordered_events(markets):
             if isinstance(event, dict):
                 signals.extend(self._scan_event(event))
         return signals
+
+    def _ordered_events(self, markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Crypto-first scan order (Phase 4): crypto event groups are
+        higher-volume/more liquid than the general catalog, so they're
+        scanned — and so spend the shared arbitrage budget — before
+        everything else. The pipeline processes signals in the order scan()
+        returns them, group by group, against a single finite budget, so
+        putting crypto events first here is sufficient to give them budget
+        priority without any change downstream.
+
+        config.arbitrage_crypto_first=False restores the original
+        single-pass order, for A/B comparison during dry-run.
+        """
+        markets = list(markets or [])
+        if not bool(getattr(self.config, "arbitrage_crypto_first", True)):
+            return markets
+
+        crypto_events = [e for e in markets if isinstance(e, dict) and self._is_crypto_event(e)]
+        other_events = [e for e in markets if not (isinstance(e, dict) and self._is_crypto_event(e))]
+        return crypto_events + other_events
+
+    @staticmethod
+    def _is_crypto_event(event: Dict[str, Any]) -> bool:
+        """True if the event's title/slug matches a crypto keyword.
+
+        Uses CryptoHunter.get_search_aliases() as the single source of
+        truth for the keyword list, rather than duplicating it here.
+        """
+        haystack = " ".join(
+            str(event.get(field) or "") for field in ("title", "slug")
+        ).lower()
+        return any(alias in haystack for alias in CryptoHunter.get_search_aliases())
 
     def _scan_event(self, event: Dict[str, Any]) -> List[StrategySignal]:
         legs = self._extract_legs(event)

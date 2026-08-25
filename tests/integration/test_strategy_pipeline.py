@@ -1,5 +1,6 @@
 """Integration: strategy signals flow through the same executor as
 model-driven trades, tagged with strategy_type for separate tracking."""
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -13,22 +14,33 @@ from trading.executor import TradeExecutor
 from trading.risk_manager import PortfolioManager
 
 
-def _underpriced_event(event_id="evt1", n=3, price=0.30):
-    return {
-        "id": event_id,
-        "title": "Test Multi-Outcome Event",
-        "markets": [
-            {
-                "closed": False,
-                "clobTokenIds": [f"tok{i}", f"tok{i}_no"],
-                "lastTradePrice": price,
-                "question": f"Outcome {i}?",
-                "groupItemTitle": f"Outcome {i}",
-                "volume": 100_000.0,
-            }
-            for i in range(n)
-        ],
-    }
+def _underpriced_event(event_id="evt1", n=3, price=0.30, expiry_days=None, title="Test Multi-Outcome Event"):
+    """expiry_days: None (no expiry field), a single int (applied to every
+    leg), or a list of per-leg day offsets (len must equal n)."""
+    if expiry_days is not None and not isinstance(expiry_days, list):
+        expiry_days = [expiry_days] * n
+
+    def _end_date_iso(i):
+        if expiry_days is None:
+            return None
+        return (datetime.now(timezone.utc) + timedelta(days=expiry_days[i])).isoformat()
+
+    markets = []
+    for i in range(n):
+        market = {
+            "closed": False,
+            "clobTokenIds": [f"{event_id}_tok{i}", f"{event_id}_tok{i}_no"],
+            "lastTradePrice": price,
+            "question": f"Outcome {i}?",
+            "groupItemTitle": f"Outcome {i}",
+            "volume": 100_000.0,
+        }
+        end_date_iso = _end_date_iso(i)
+        if end_date_iso is not None:
+            market["endDateIso"] = end_date_iso
+        markets.append(market)
+
+    return {"id": event_id, "title": title, "markets": markets}
 
 
 def _make_pipeline(balance=100.0, config=None):
@@ -144,7 +156,7 @@ async def test_insufficient_cash_rejects_whole_group():
 
     assert not [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
     assert any(
-        c["level"] == "REJECTED" and c["payload"].get("reason") == "insufficient_cash_or_budget_for_all_legs"
+        c["level"] == "REJECTED" and c["payload"].get("reason") == "insufficient_cash"
         for c in log_calls
     )
     assert pipeline.budget_manager.total_spent_today == 0.0
@@ -155,7 +167,8 @@ async def test_daily_trade_limit_rejects_whole_group():
     config = TradingConfig(
         dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=1500.0, max_bet_size_usd=3.0,
-        max_daily_trades=2, min_trading_balance=1.0,  # fewer than the 3 legs
+        max_daily_trades=2, arbitrage_max_daily_trades=2,
+        min_trading_balance=1.0,  # fewer than the 3 legs
     )
     pipeline, bridge, log_calls = _make_pipeline(balance=1000.0, config=config)
 
@@ -167,6 +180,100 @@ async def test_daily_trade_limit_rejects_whole_group():
         c["level"] == "REJECTED" and c["payload"].get("reason") == "daily_trade_limit_would_be_exceeded"
         for c in log_calls
     )
+
+
+# ── Phase 2: TTE filter — skip groups with an over-long leg ──────────────────
+
+@pytest.mark.asyncio
+async def test_tte_filter_skips_group_with_long_dated_leg():
+    config = TradingConfig(
+        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        daily_limit_usd=15.0, max_bet_size_usd=3.0,
+        max_daily_trades=10, min_trading_balance=1.0,
+        max_tte_days=90,
+    )
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0, config=config)
+    # 2 legs at 10 days out, 1 leg at 365 days out — one over-long leg voids
+    # the whole group.
+    event = _underpriced_event(n=3, expiry_days=[10, 10, 365])
+
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[event]):
+        await pipeline._stage_strategy_scan()
+
+    assert not [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert any(
+        c["level"] == "FILTERED" and c["payload"].get("reason") == "tte_exceeds_max"
+        for c in log_calls
+    )
+    assert pipeline.budget_manager.total_spent_today == 0.0
+
+
+@pytest.mark.asyncio
+async def test_tte_filter_allows_group_within_max_tte():
+    config = TradingConfig(
+        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        daily_limit_usd=15.0, max_bet_size_usd=3.0,
+        max_daily_trades=10, min_trading_balance=1.0,
+        max_tte_days=90,
+    )
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0, config=config)
+    # All 3 legs well within the 90-day ceiling.
+    event = _underpriced_event(n=3, expiry_days=30)
+
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[event]):
+        await pipeline._stage_strategy_scan()
+
+    assert not [c for c in log_calls if c["level"] == "FILTERED" and c["payload"].get("reason") == "tte_exceeds_max"]
+    leg_entries = [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert len(leg_entries) == 3
+
+
+# ── Phase 4: crypto-first arbitrage priority ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_crypto_events_execute_before_general_events():
+    config = TradingConfig(
+        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        daily_limit_usd=15.0, max_bet_size_usd=3.0,
+        max_daily_trades=10, min_trading_balance=1.0,
+        arbitrage_crypto_first=True,
+    )
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0, config=config)
+
+    general_event = _underpriced_event(event_id="general_evt", n=2, title="Who wins the election?")
+    crypto_event = _underpriced_event(event_id="crypto_evt", n=2, title="Will Bitcoin hit $100k?")
+
+    # Scanner returns the general event first — crypto-first ordering must
+    # still execute the crypto group before it.
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[general_event, crypto_event]):
+        await pipeline._stage_strategy_scan()
+
+    group_entries = [c for c in log_calls if c["level"] == "STRATEGY-GROUP"]
+    executed_order = [c["payload"]["group_id"] for c in group_entries]
+
+    assert executed_order == ["event_sum:crypto_evt", "event_sum:general_evt"]
+
+
+@pytest.mark.asyncio
+async def test_crypto_first_disabled_preserves_scanner_order():
+    config = TradingConfig(
+        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        daily_limit_usd=15.0, max_bet_size_usd=3.0,
+        max_daily_trades=10, min_trading_balance=1.0,
+        arbitrage_crypto_first=False,
+    )
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0, config=config)
+
+    general_event = _underpriced_event(event_id="general_evt", n=2, title="Who wins the election?")
+    crypto_event = _underpriced_event(event_id="crypto_evt", n=2, title="Will Bitcoin hit $100k?")
+
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[general_event, crypto_event]):
+        await pipeline._stage_strategy_scan()
+
+    group_entries = [c for c in log_calls if c["level"] == "STRATEGY-GROUP"]
+    executed_order = [c["payload"]["group_id"] for c in group_entries]
+
+    assert executed_order == ["event_sum:general_evt", "event_sum:crypto_evt"]
 
 
 # ── Scan-interval throttling ───────────────────────────────────────────────────

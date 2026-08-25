@@ -16,7 +16,6 @@ from typing import Optional
 
 from brains import get_brain_for_asset_type
 from brains.base import calculate_tte
-from brains.pricing_engine import PricingEngine
 from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
 from polymarket import PolymarketClient
@@ -50,8 +49,8 @@ class CandidateTrade:
     token_id: str
     asset_type: str
     question: str
-    fair_value: float
-    raw_probability: float
+    post_prob: float
+    pre_prob: float
     kelly_size: float       # raw Kelly criterion fraction (edge/odds), before confidence/kelly_fraction scaling
     kelly_bet_usd: float    # final dollar bet size — confidence- and kelly_fraction-scaled, clamped to max_bet_size_usd
     model_used: str
@@ -91,13 +90,12 @@ class SequentialTradingPipeline:
         self.max_bet_size_usd = float(self.config.max_bet_size_usd)
         self.safe_minimum = 1.0
 
-        # Wang Transform pricing (see brains/pricing_engine.py). "legacy" skips
-        # the Wang adjustment and uses the brain's raw EV, for A/B comparison.
+        # Wang Transform pricing — all of it (Wang Transform, market blending)
+        # now lives in BaseBrain.evaluate() (brains/base.py), which this
+        # pipeline calls directly rather than re-deriving fair value itself.
+        # "legacy" skips both layers for A/B comparison (see _stage_evaluate_ev).
         self.pricing_mode = str(getattr(self.config, "pricing_mode", "wang") or "wang").lower()
         self.wang_min_edge = float(getattr(self.config, "wang_min_edge", 0.05))
-        self.pricing_engine = PricingEngine(
-            base_lambda=float(getattr(self.config, "wang_base_lambda", 0.183))
-        )
 
         self.executor = ctx.executor
         self.hunter = ctx.scanner
@@ -108,6 +106,33 @@ class SequentialTradingPipeline:
         self.strategies: list[Strategy] = [EventSumStrategy(config=self.config)]
         self.strategy_scan_interval = 30.0  # don't hammer the Gamma API every loop tick
         self._last_strategy_scan = 0.0
+
+        # group_ids rejected this "day" for insufficient_budget,
+        # tte_exceeds_max, or daily_trade_limit_would_be_exceeded — none of
+        # these conditions change between scans (the per-strategy budget and
+        # trade count only reset daily; a leg's expiry date is fixed), so
+        # re-evaluating the same groups every 30s was pure waste. Cleared in
+        # _reset_daily_if_needed().
+        self._exhausted_arb_groups: set[str] = set()
+
+        # token_ids "held" this "day" via a dry-run/paper-trade fill. Neither
+        # mode submits a real order, so TradeExecutor.get_open_positions()
+        # (which always queries the live Polymarket Data API - see
+        # _stage_evaluate_ev's "already_owned_in_portfolio" check) never sees
+        # them, and without this the same EV-positive market gets re-bought
+        # every hunt cycle. Live mode's real on-chain position already
+        # covers this once the order settles; this is purely a simulated-
+        # mode backstop. Cleared in _reset_daily_if_needed().
+        self._simulated_positions: set[str] = set()
+
+        # group_ids successfully filled this "day" - this applies in EVERY
+        # mode, not just simulated ones (unlike _simulated_positions above):
+        # the arbitrage path has no "already hold this" check of its own at
+        # all, so a group gets rediscovered and re-filled every scan for as
+        # long as it stays profitable in the live Gamma API snapshot.
+        # Cleared in _reset_daily_if_needed().
+        self._filled_arb_groups: set[str] = set()
+
         self.portfolio_manager = ctx.portfolio_manager
 
         sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
@@ -198,7 +223,7 @@ class SequentialTradingPipeline:
         strategy-driven performance, from the trade history alone."""
         return {
             "pricing_mode": candidate.pricing_mode,
-            "raw_probability": round(candidate.raw_probability, 4),
+            "pre_prob": round(candidate.pre_prob, 4),
             "wang_lambda": round(candidate.wang_lambda, 4) if candidate.wang_lambda is not None else None,
             "wang_fair_value": round(candidate.wang_fair_value, 4) if candidate.wang_fair_value is not None else None,
             "wang_edge": round(candidate.wang_edge, 4) if candidate.wang_edge is not None else None,
@@ -218,6 +243,12 @@ class SequentialTradingPipeline:
             self._set_spend(0.0)
             self.bridge.start_of_day_equity = 0.0
             self.budget_manager.total_spent_today = 0.0
+            self.budget_manager.spent_by_strategy = {}
+            self.budget_manager.trades_by_strategy = {}
+            self.executor.reset_daily_count()
+            self._exhausted_arb_groups.clear()
+            self._simulated_positions.clear()
+            self._filled_arb_groups.clear()
 
     # ------------------------------------------------------------------
     # Strategy scan — constraint-based arbitrage, independent of the
@@ -282,20 +313,58 @@ class SequentialTradingPipeline:
                 continue
 
             for group_id, group_signals in self._group_signals(signals).items():
-                self._execute_strategy_group(strategy, group_id, group_signals)
+                if group_id in self._filled_arb_groups:
+                    continue  # already hold this position, skip silently
+                if group_id in self._exhausted_arb_groups:
+                    continue
+                await self._execute_strategy_group(strategy, group_id, group_signals)
 
-    def _execute_strategy_group(self, strategy: Strategy, group_id: str, signals: list):
+    def _group_has_leg_beyond_max_tte(self, signals: list, group_id: str, asset_type: str, log_func) -> bool:
+        """TTE filter: skip the whole arbitrage group if any single leg's
+        resolution date is farther out than config.max_tte_days.
+
+        You can't do partial arbitrage with missing legs, so one over-long
+        leg voids the whole group — that capital would otherwise sit locked
+        for months waiting on just that one outcome to resolve.
+        """
+        max_tte_days = float(self.config.max_tte_days)
+        for signal in signals:
+            days_to_expiry = calculate_tte(getattr(signal.market, "expiry_date", None))
+            if days_to_expiry > max_tte_days:
+                log_func("FILTERED", asset_type, group_id, {
+                    "reason": "tte_exceeds_max",
+                    "group_id": group_id,
+                    "leg_token_id": signal.market.market_id,
+                    "leg_expiry": str(getattr(signal.market, "expiry_date", None)),
+                    "days_to_expiry": round(days_to_expiry, 2),
+                    "max_tte_days": max_tte_days,
+                })
+                return True
+        return False
+
+    @staticmethod
+    def _leg_token_id(signal) -> str:
+        return (
+            signal.market.market_id if signal.side == "YES"
+            else str(getattr(signal.market, "no_market_id", None) or signal.market.market_id)
+        )
+
+    async def _execute_strategy_group(self, strategy: Strategy, group_id: str, signals: list):
         """Execute every leg of one strategy opportunity (e.g. every outcome
         of one event_sum arb) through the same TradeExecutor used by
-        model-driven trades, via the lower-level execute_trade() rather than
-        evaluate_and_execute(): the strategy already vetted the trade's
-        profitability itself (its own min_edge, not config.min_ev), and its
-        leg prices are expected to sit outside the single-market
+        model-driven trades, via TradeExecutor.execute_arbitrage_group()
+        rather than evaluate_and_execute(): the strategy already vetted the
+        trade's profitability itself (its own min_edge, not config.min_ev),
+        and its leg prices are expected to sit outside the single-market
         PRICE_FLOOR/PRICE_CEILING band by design.
 
-        Best-effort, not atomic: if a leg's order fails, the rest still
-        attempt to fill (same as oracle3's contrib strategy) — real
-        atomicity would require a settlement layer this pipeline doesn't have.
+        Each leg is placed as a limit order and given up to
+        config.arbitrage_order_timeout_seconds to fill (see
+        TradeExecutor.execute_arbitrage_group). Best-effort, not atomic: if
+        every leg gets at least one fill the group is kept (surplus fills
+        beyond the smallest leg become bonus directional exposure); if any
+        leg gets zero fills, the rest are cancelled — real atomicity would
+        require a settlement layer this pipeline doesn't have.
         """
         if not signals:
             return
@@ -303,50 +372,78 @@ class SequentialTradingPipeline:
         tagged_log = self._tag_log_func(strategy.strategy_type)
         asset_type = signals[0].market.asset_type
 
+        if self._group_has_leg_beyond_max_tte(signals, group_id, asset_type, tagged_log):
+            self._exhausted_arb_groups.add(group_id)
+            return
+
         total_cost = sum(float(s.bet_amount_usd) for s in signals)
         cash_balance = float(self.bridge.current_balance)
-        remaining_budget = float(self.budget_manager.get_remaining_budget())
+        remaining_budget = float(self.budget_manager.get_remaining_budget("arbitrage"))
 
-        if total_cost > cash_balance or total_cost > remaining_budget:
+        # Distinct reject reasons (Point 5): "can't afford it" (wallet cash)
+        # vs "budget exhausted" (this strategy's own daily allocation) are
+        # different failure modes worth telling apart in the log/analytics
+        # layer, so they're no longer folded into one generic reason.
+        if total_cost > cash_balance:
             tagged_log("REJECTED", asset_type, group_id, {
-                "reason": "insufficient_cash_or_budget_for_all_legs",
+                "reason": "insufficient_cash",
                 "group_id": group_id,
                 "n_legs": len(signals),
                 "total_cost": round(total_cost, 4),
                 "cash_balance": round(cash_balance, 4),
-                "remaining_budget": round(remaining_budget, 4),
             })
             return
 
-        if self.executor.trade_count_today + len(signals) > self.config.max_daily_trades:
+        if total_cost > remaining_budget:
+            tagged_log("REJECTED", asset_type, group_id, {
+                "reason": "insufficient_budget",
+                "group_id": group_id,
+                "n_legs": len(signals),
+                "total_cost": round(total_cost, 4),
+                "remaining_budget": round(remaining_budget, 4),
+            })
+            self._exhausted_arb_groups.add(group_id)
+            return
+
+        arbitrage_max_daily_trades = self.executor._strategy_max_daily_trades("arbitrage")
+        arbitrage_trades_today = self.executor.trades_by_strategy.get("arbitrage", 0)
+        if arbitrage_trades_today + len(signals) > arbitrage_max_daily_trades:
             tagged_log("REJECTED", asset_type, group_id, {
                 "reason": "daily_trade_limit_would_be_exceeded",
                 "group_id": group_id,
                 "n_legs": len(signals),
             })
+            self._exhausted_arb_groups.add(group_id)
             return
 
-        executed_legs = 0
+        legs = []
         for signal in signals:
             shares = math.floor((signal.bet_amount_usd / signal.price) * 100.0) / 100.0
             if shares <= 0:
                 continue
+            legs.append({
+                "token_id": self._leg_token_id(signal),
+                "price": signal.price,
+                "shares": shares,
+                "side": signal.side,
+                "bet_amount_usd": signal.bet_amount_usd,
+                "asset_type": signal.market.asset_type,
+                "no_token_id": getattr(signal.market, "no_market_id", None),
+                "group_id": group_id,
+            })
 
-            token_id = (
-                signal.market.market_id if signal.side == "YES"
-                else str(getattr(signal.market, "no_market_id", None) or signal.market.market_id)
-            )
+        result = await self.executor.execute_arbitrage_group(
+            legs=legs,
+            timeout_seconds=float(getattr(self.config, "arbitrage_order_timeout_seconds", 60.0)),
+            log_func=tagged_log,
+            strategy_tag="arbitrage",
+        )
 
-            executed = self.executor.execute_trade(
-                token_id=signal.market.market_id,
-                current_poly_price=signal.price,
-                shares=shares,
-                bet_amount=signal.bet_amount_usd,
-                asset_type=signal.market.asset_type,
-                side=signal.side,
-                no_token_id=getattr(signal.market, "no_market_id", None),
-                log_func=tagged_log,
-            )
+        executed_legs = 0
+        for signal in signals:
+            token_id = self._leg_token_id(signal)
+            filled_shares = float(result["fills"].get(token_id, 0.0))
+            executed = filled_shares > 0.0
 
             tagged_log("STRATEGY-LEG", signal.market.asset_type, token_id, {
                 "group_id": group_id,
@@ -355,15 +452,15 @@ class SequentialTradingPipeline:
                 "edge": round(signal.edge, 4),
                 "price": round(signal.price, 4),
                 "bet_usd": round(signal.bet_amount_usd, 2),
-                "shares": shares,
+                "shares": filled_shares,
                 "side": signal.side,
                 "executed": bool(executed),
             })
 
             if executed:
                 executed_legs += 1
-                self.executor.trade_count_today += 1
-                self.budget_manager.record_trade(float(signal.bet_amount_usd))
+                spent_usd = filled_shares * float(signal.price)
+                self.budget_manager.record_trade(spent_usd, strategy_tag="arbitrage")
                 self.spent_today = float(self.budget_manager.total_spent_today)
                 self._set_spend(self.spent_today)
 
@@ -372,12 +469,36 @@ class SequentialTradingPipeline:
             "strategy_type": strategy.strategy_type,
             "n_legs": len(signals),
             "executed_legs": executed_legs,
+            "success": result["success"],
+            "arb_sets": result["arb_sets"],
+            "surplus": result["surplus"],
             "edge": round(signals[0].edge, 4),
             "total_cost": round(total_cost, 4),
         })
 
-    def _stage_hunt(self):
-        market, hunter = self.hunter.get_active_markets(self.log_func)
+        # We now hold at least part of this group's position - don't
+        # rediscover and re-buy it on a future scan (see
+        # _filled_arb_groups' definition in __init__). Gated on at least
+        # one real fill: a group where every leg got zero fills holds
+        # nothing and should stay eligible for a genuine future attempt.
+        if executed_legs > 0:
+            self._filled_arb_groups.add(group_id)
+
+    async def _stage_hunt(self):
+        """Run market discovery off the event loop.
+
+        get_active_markets() does up to 30 synchronous HTTP round-trips
+        (see PolymarketScannerHunter.get_active_markets / CryptoHunter.hunt)
+        — calling it directly would block this coroutine's single-threaded
+        event loop for the whole scan, starving every other stage (including
+        the arbitrage strategy scan) until it returns. asyncio.to_thread
+        runs it on a worker thread instead, so the loop stays free.
+        """
+        t0 = time.monotonic()
+        market, hunter = await asyncio.to_thread(self.hunter.get_active_markets, self.log_func)
+        elapsed = time.monotonic() - t0
+        self.log_func("HUNT-TIMING", "Pipeline", "", {"elapsed_s": round(elapsed, 1)})
+
         if not market or not hunter:
             self.bridge.status = "No markets found. Waiting..."
             return None
@@ -388,13 +509,26 @@ class SequentialTradingPipeline:
         asset_type = str(getattr(market, "asset_type", "") or "")
         question = str(getattr(market, "market_name", "") or getattr(market, "question", ""))
 
+        # Every market gets one look per cooldown window. Period. Every exit
+        # path below used to call add_to_cooldown() individually and at
+        # least one (live_truth unavailable) forgot to - doing it once here,
+        # unconditionally, before any evaluation begins, replaces all of them.
+        self.hunter.add_to_cooldown(token_id)
+
+        # Dry-run/paper-trade equivalent of the real-portfolio check below -
+        # see _simulated_positions' definition in __init__. Neither mode
+        # submits a real order, so the real-portfolio check has nothing to
+        # catch; this is the session-level backstop for those modes.
+        if token_id in self._simulated_positions:
+            self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_held_simulated"})
+            return None
+
         # Prevent buying a market already in the portfolio.
         if hasattr(self.bridge, "current_portfolio") and self.bridge.current_portfolio:
             for position in self.bridge.current_portfolio:
                 pos_token = str(getattr(position, "asset_id", getattr(position, "token_id", "")))
                 if pos_token == token_id:
                     self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_owned_in_portfolio"})
-                    self.hunter.add_to_cooldown(token_id)
                     return None
 
         self.bridge.status = f"Scanning {asset_type}: {question[:60]}..."
@@ -413,7 +547,6 @@ class SequentialTradingPipeline:
                 "price_floor": PRICE_FLOOR,
                 "price_ceiling": PRICE_CEILING,
             })
-            self.hunter.add_to_cooldown(token_id)
             return None
 
         live_truth = hunter.get_live_truth(market)
@@ -428,33 +561,39 @@ class SequentialTradingPipeline:
             float(live_truth.get("spot_price") or 0.0) if isinstance(live_truth, dict) else float(live_truth)
         )
         brain = get_brain_for_asset_type(asset_type)
-        raw_probability = float(brain.get_raw_probability(market, live_truth))
         model_used = getattr(brain, "last_model_used", "unknown")
 
-        wang_lambda = wang_fair_value = wang_edge = None
-        confidence = 1.0
+        # Pricing (Wang Transform -> market blend) is all computed inside
+        # evaluate() — see brains/base.py. "legacy" mode asks for both layers
+        # disabled (lambda=0, full model weight) so it reduces to the brain's
+        # raw probability, for A/B comparison against "wang" mode.
+        if self.pricing_mode == "legacy":
+            signal = brain.evaluate(
+                market, live_truth, min_ev=self.min_ev_threshold,
+                wang_lambda=0.0, model_weight=1.0,
+            )
+        else:
+            signal = brain.evaluate(
+                market, live_truth, min_ev=self.min_ev_threshold,
+                wang_lambda=self.config.wang_lambda,
+                model_weight=self.config.model_weight,
+            )
+
+        pre_prob = signal.pre_prob
+        post_prob = signal.post_prob
+        confidence = signal.confidence
 
         if self.pricing_mode == "legacy":
-            fair_value = raw_probability
+            wang_lambda = wang_fair_value = wang_edge = None
         else:
-            volume = float(getattr(market, "volume", 0.0) or 0.0)
-            days_to_expiry = calculate_tte(getattr(market, "expiry_date", None))
-            edge_result = self.pricing_engine.compute_edge(
-                p_true=raw_probability,
-                market_price=poly_price,
-                volume=volume,
-                days_to_expiry=days_to_expiry,
-            )
-            wang_lambda = float(edge_result["lambda_used"])
-            wang_fair_value = float(edge_result["fair_value"])
-            wang_edge = float(edge_result["edge"])
-            confidence = float(edge_result["confidence"])
-            fair_value = wang_fair_value
+            wang_lambda = signal.wang_lambda
+            wang_fair_value = signal.wang_fair_value
+            wang_edge = signal.wang_edge
 
             if abs(wang_edge) < self.wang_min_edge:
                 self.log_func("SCAN-SKIP", asset_type, token_id, {
                     "reason": "wang_edge below minimum",
-                    "raw_probability": round(raw_probability, 4),
+                    "pre_prob": round(pre_prob, 4),
                     "wang_lambda": round(wang_lambda, 4),
                     "wang_fair_value": round(wang_fair_value, 4),
                     "wang_edge": round(wang_edge, 4),
@@ -462,18 +601,18 @@ class SequentialTradingPipeline:
                 })
                 return None
 
-        self.bridge.forecast = float(fair_value)
+        self.bridge.forecast = float(post_prob)
 
         price_yes = float(poly_price)
-        ev_yes = (float(fair_value) / float(price_yes) - 1.0) if price_yes > 0 else -1.0
-        price_no = max(1e-9, 1.0 - float(price_yes))
-        fair_no = 1.0 - float(fair_value)
-        ev_no = (fair_no / price_no - 1.0) if price_no > 0 else -1.0
+        price_no = max(1e-9, 1.0 - price_yes)
+        fair_no = 1.0 - float(post_prob)
+        ev_yes = signal.ev_yes
+        ev_no = signal.ev_no
         self.bridge.ev = float(ev_yes)
 
-        side = "YES" if ev_yes > ev_no else "NO"
-        final_ev = max(ev_yes, ev_no)
-        entry_price = float(price_yes if side == "YES" else price_no)
+        side = signal.side
+        final_ev = signal.expected_value
+        entry_price = float(signal.entry_price)
 
         # Kelly sizing (BudgetManager.compute_kelly_bet_size): kelly_optimal =
         # edge/odds for whichever side was actually picked — YES odds are
@@ -481,13 +620,13 @@ class SequentialTradingPipeline:
         # model confidence and kelly_fraction (quarter-Kelly by default),
         # then clamped to max_bet_size_usd as a hard ceiling.
         if side == "YES":
-            kelly_edge = float(fair_value) - price_yes
+            kelly_edge = float(post_prob) - price_yes
             kelly_odds = 1.0 - price_yes
         else:
             kelly_edge = fair_no - price_no
             kelly_odds = price_yes  # == 1 - price_no
 
-        kelly_raw_fraction = max(0.0, kelly_edge / kelly_odds) if kelly_odds > 0 else 0.0
+        kelly_raw_fraction = signal.kelly_size
         kelly_bet_usd = self.budget_manager.compute_kelly_bet_size(kelly_edge, kelly_odds, confidence)
 
         # Correlation exposure (see trading/correlation.py): how correlated
@@ -496,8 +635,8 @@ class SequentialTradingPipeline:
         correlation_exposure = self.portfolio_manager.correlation_exposure_for(asset_type)
 
         diag = (
-            f"[EV-MATH] mode={self.pricing_mode} raw_p={raw_probability:.3f} "
-            f"YES(P: {price_yes:.3f}, FV: {float(fair_value):.3f}, EV: {ev_yes:.2f}) | "
+            f"[EV-MATH] mode={self.pricing_mode} raw_p={pre_prob:.3f} "
+            f"YES(P: {price_yes:.3f}, FV: {float(post_prob):.3f}, EV: {ev_yes:.2f}) | "
             f"NO(P: {price_no:.3f}, FV: {fair_no:.3f}, EV: {ev_no:.2f}) | PICK: {side}"
         )
         if wang_edge is not None:
@@ -510,8 +649,8 @@ class SequentialTradingPipeline:
             token_id=token_id,
             asset_type=asset_type,
             question=question,
-            fair_value=float(fair_value),
-            raw_probability=raw_probability,
+            post_prob=float(post_prob),
+            pre_prob=pre_prob,
             kelly_size=float(kelly_raw_fraction),
             kelly_bet_usd=float(kelly_bet_usd),
             model_used=model_used,
@@ -574,13 +713,15 @@ class SequentialTradingPipeline:
         target_bet = candidate.kelly_bet_usd
         desired_bet = min(target_bet, self.max_bet_size_usd)
 
-        budget_bet, budget_ok = self.budget_manager.cap_to_remaining_budget(desired_bet)
+        budget_bet, budget_ok = self.budget_manager.cap_to_remaining_budget(desired_bet, strategy_tag="crypto")
         if not budget_ok:
             return self._reject("REJECTED", candidate, {
                 "market_name": candidate.question,
                 "reason": "daily_limit_reached",
                 "kelly_size": round(candidate.kelly_size, 4),
                 "kelly_bet_usd": round(candidate.kelly_bet_usd, 4),
+                "strategy_daily_limit_usd": round(float(self.budget_manager._strategy_limit("crypto")), 4),
+                "strategy_spent_today": round(float(self.budget_manager.spent_by_strategy.get("crypto", 0.0)), 4),
                 "daily_limit_usd": round(float(self.budget_manager.daily_limit_usd), 4),
                 "spent_today": round(float(self.budget_manager.total_spent_today), 4),
             })
@@ -637,27 +778,40 @@ class SequentialTradingPipeline:
     def _stage_execute(self, candidate: CandidateTrade, approved_bet: float, risk_context: dict):
         executed = self.executor.evaluate_and_execute(
             market=candidate.market,
-            fair_value=float(candidate.fair_value),
+            fair_value=float(candidate.post_prob),
             ev=float(candidate.final_ev),
             current_poly_price=float(candidate.price_yes),
             bet_amount_usd=float(approved_bet),
             side=candidate.side,
             log_func=self.log_func,
+            strategy_tag="crypto",
         )
 
         if executed:
-            self.budget_manager.record_trade(float(approved_bet))
+            self.budget_manager.record_trade(float(approved_bet), strategy_tag="crypto")
             self.spent_today = float(self.budget_manager.total_spent_today)
             self._set_spend(self.spent_today)
             if not self.executor.dry_run:
                 self._set_cash(max(0.0, float(self.bridge.current_balance) - float(approved_bet)))
+
+            # Record the simulated fill so _stage_evaluate_ev's
+            # already_held_simulated check can catch it next cycle - see
+            # _simulated_positions' definition in __init__. token_id (the
+            # market's canonical YES id, which is what _stage_evaluate_ev
+            # always keys its lookup on) is always added; the NO token is
+            # added too on a NO-side trade, in case anything else keys off it.
+            self._simulated_positions.add(candidate.token_id)
+            if candidate.side == "NO" and hasattr(candidate.market, "no_market_id"):
+                no_token = str(candidate.market.no_market_id or "")
+                if no_token:
+                    self._simulated_positions.add(no_token)
 
             total_equity = self._total_equity()
 
             self.log_func("TRACK", candidate.asset_type, candidate.token_id, {
                 "market_name": candidate.question,
                 "model_used": candidate.model_used,
-                "fair": round(float(candidate.fair_value), 4),
+                "post_prob": round(float(candidate.post_prob), 4),
                 "ev": round(float(candidate.final_ev), 4),
                 "ev_yes": round(float(candidate.ev_yes), 4),
                 "ev_no": round(float(candidate.ev_no), 4),
@@ -696,7 +850,7 @@ class SequentialTradingPipeline:
 
             await self._stage_strategy_scan()
 
-            stage1 = self._stage_hunt()
+            stage1 = await self._stage_hunt()
             if not stage1:
                 continue
 

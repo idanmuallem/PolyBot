@@ -28,7 +28,8 @@ def _strategy(**kwargs):
     kwargs.setdefault("min_edge", 0.02)
     kwargs.setdefault("trade_size_usd", 1.0)
     kwargs.setdefault("fee_rate", 0.005)
-    return EventSumStrategy(config=TradingConfig(), **kwargs)
+    kwargs.setdefault("config", TradingConfig())
+    return EventSumStrategy(**kwargs)
 
 
 # ── Arbitrage condition met (underpriced) ────────────────────────────────────
@@ -244,3 +245,61 @@ async def test_empty_markets_list_returns_empty():
     strategy = _strategy()
     assert await strategy.scan([]) == []
     assert await strategy.scan([_event(markets=[])]) == []
+
+
+# ── Phase 4: crypto-first scan order ──────────────────────────────────────────
+
+def _crypto_first_events():
+    # Two crypto events (matched via title keyword "bitcoin"/slug "eth-"),
+    # interleaved with two general events, all equally underpriced.
+    general_a = _event(event_id="gen_a", title="Who wins the election?",
+                        markets=[_market("gA1", 0.30), _market("gA2", 0.30)])
+    crypto_a = _event(event_id="crypto_a", title="Will Bitcoin hit $100k?",
+                       markets=[_market("cA1", 0.30), _market("cA2", 0.30)])
+    general_b = _event(event_id="gen_b", title="Next Fed rate decision",
+                        markets=[_market("gB1", 0.30), _market("gB2", 0.30)])
+    crypto_b = _event(event_id="crypto_b", title="Ethereum event",
+                       markets=[_market("cB1", 0.30), _market("cB2", 0.30)])
+    return [general_a, crypto_a, general_b, crypto_b]
+
+
+@pytest.mark.asyncio
+async def test_crypto_first_true_scans_crypto_events_before_general():
+    strategy = _strategy(config=TradingConfig(arbitrage_crypto_first=True))
+
+    signals = await strategy.scan(_crypto_first_events())
+
+    group_order = list(dict.fromkeys(s.group_id for s in signals))
+    assert group_order == [
+        "event_sum:crypto_a", "event_sum:crypto_b",
+        "event_sum:gen_a", "event_sum:gen_b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_crypto_first_false_preserves_original_scan_order():
+    strategy = _strategy(config=TradingConfig(arbitrage_crypto_first=False))
+
+    signals = await strategy.scan(_crypto_first_events())
+
+    group_order = list(dict.fromkeys(s.group_id for s in signals))
+    assert group_order == [
+        "event_sum:gen_a", "event_sum:crypto_a",
+        "event_sum:gen_b", "event_sum:crypto_b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_crypto_match_checks_slug_too():
+    strategy = _strategy(config=TradingConfig(arbitrage_crypto_first=True))
+    general = _event(event_id="gen", title="Some general event",
+                      markets=[_market("g1", 0.30), _market("g2", 0.30)])
+    crypto_by_slug = {
+        "id": "crypto_slug", "title": "Ambiguous title",
+        "slug": "solana-price-eoy", "markets": [_market("s1", 0.30), _market("s2", 0.30)],
+    }
+
+    signals = await strategy.scan([general, crypto_by_slug])
+
+    group_order = list(dict.fromkeys(s.group_id for s in signals))
+    assert group_order == ["event_sum:crypto_slug", "event_sum:gen"]

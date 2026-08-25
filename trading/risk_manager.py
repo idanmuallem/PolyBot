@@ -86,7 +86,7 @@ class PortfolioManager:
                     )
                     for (payload_raw,) in cursor.fetchall():
                         payload = _parse_payload(payload_raw)
-                        for key in ("fair_value", "fair"):
+                        for key in ("fair_value", "post_prob"):
                             if payload.get(key) is not None:
                                 try:
                                     return float(payload[key])
@@ -110,7 +110,7 @@ class PortfolioManager:
         market_id = str(self._position_field(position, "market_id", "") or "")
         for key in (token_id, market_id):
             snapshot = getattr(self.bridge, "opportunity_map", {}).get(key, {}) if key else {}
-            for payload_key in ("fair_value", "fair"):
+            for payload_key in ("fair_value", "post_prob"):
                 val = snapshot.get(payload_key) if isinstance(snapshot, dict) else None
                 if val is not None:
                     try:
@@ -155,7 +155,7 @@ class PortfolioManager:
         return None
 
     def _resolve_position_field(self, position, payload_key: str, direct_key: Optional[str] = None, caster=float):
-        """Generic 3-tier lookup shared by the raw_probability/asset_type/
+        """Generic 3-tier lookup shared by the pre_prob/asset_type/
         entry-wang_edge resolvers below: direct attribute -> bridge
         opportunity_map (fast path, populated by ui/data_manager.log_event)
         -> trade-history DB (slow path, works even across process restarts).
@@ -188,7 +188,7 @@ class PortfolioManager:
         Phase 3) — needed to re-derive the Wang edge without re-running the
         brain/hunter for a position that's already open.
         """
-        return self._resolve_position_field(position, "raw_probability")
+        return self._resolve_position_field(position, "pre_prob")
 
     def _resolve_position_asset_type(self, position):
         """Look up this position's asset_type (e.g. "Crypto::BTCUSDT") —
@@ -216,8 +216,8 @@ class PortfolioManager:
         driver of edge decay over a short hold is the market price moving
         toward or away from fair value, which this still captures directly.
         """
-        raw_probability = self._resolve_position_raw_probability(position)
-        if raw_probability is None:
+        pre_prob = self._resolve_position_raw_probability(position)
+        if pre_prob is None:
             return None
 
         current_price = float(self._position_field(position, "current_price", 0.0) or 0.0)
@@ -228,7 +228,7 @@ class PortfolioManager:
         # (TradeExecutor.get_open_positions() reads it per-token), so only
         # the probability needs translating into "probability my side wins".
         side = str(self._position_field(position, "side", "YES") or "YES").upper()
-        p_true_for_side = raw_probability if side != "NO" else (1.0 - raw_probability)
+        p_true_for_side = pre_prob if side != "NO" else (1.0 - pre_prob)
 
         return self.pricing_engine.compute_edge(p_true=p_true_for_side, market_price=current_price)
 
@@ -236,7 +236,7 @@ class PortfolioManager:
         """Given an already-recomputed Wang edge result (see
         _recompute_position_wang_edge), return it if the edge has collapsed
         below wang_min_edge/2, else None. A position with no recorded
-        raw_probability is left alone — falls through to the existing
+        pre_prob is left alone — falls through to the existing
         P&L-based exits.
         """
         if wang_result is None:
@@ -319,8 +319,8 @@ class PortfolioManager:
 
             for position in open_positions:
                 try:
-                    fair_value = self._resolve_position_fair_value(position)
-                    if fair_value is None:
+                    post_prob = self._resolve_position_fair_value(position)
+                    if post_prob is None:
                         continue
 
                     size = float(
@@ -343,7 +343,7 @@ class PortfolioManager:
                     if current_price <= 0.001:
                         continue
 
-                    live_ev = (max(0.001, min(0.999, float(fair_value))) / float(current_price)) - 1.0
+                    live_ev = (max(0.001, min(0.999, float(post_prob))) / float(current_price)) - 1.0
 
                     if float(new_candidate_ev) >= float(live_ev) + float(min_improvement):
                         asset = str(self._position_field(position, "token_id", "UNKNOWN") or "UNKNOWN")
@@ -433,7 +433,7 @@ class PortfolioManager:
 
         self.bridge.position_analytics[token_id] = {
             "asset_type": self._resolve_position_asset_type(position),
-            "raw_probability": self._resolve_position_raw_probability(position),
+            "pre_prob": self._resolve_position_raw_probability(position),
             "entry_wang_edge": entry_edge,
             "current_wang_edge": current_edge,
             "current_wang_fair_value": wang_result["fair_value"] if wang_result else None,

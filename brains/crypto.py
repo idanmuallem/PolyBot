@@ -6,7 +6,6 @@ Uses a Black-Scholes style CDF approach with annualized volatility.
 import math
 from typing import Optional, Union
 
-import numpy as np
 from scipy.stats import norm
 from core.models import MarketData
 
@@ -18,8 +17,22 @@ class HybridCryptoBrain(BaseBrain):
 
     Model switcher by TTE:
     - TTE < 1 day: short-term technical/trend model
-    - 1 <= TTE < 30 days: Black-Scholes style model
-    - TTE >= 30 days: Heston characteristic function with FFT pricing
+    - TTE >= 1 day: Black-Scholes style model
+
+    A Heston/Carr-Madan FFT model previously handled TTE >= 90 days, but it
+    was dropped: even after fixing its numerical degeneracy (it was
+    returning near-zero probabilities on real markets - see git history for
+    the full investigation), its output (a normalized vanilla-call value,
+    C(K)/S0) is not the same quantity as P(S_T > K) - it's systematically
+    and substantially different from the Black-Scholes CDF probability on
+    real inputs (e.g. 0.117 vs 0.374 on the same BTC market), which means
+    Wang Transform + market-blending downstream were being calibrated
+    against a wrong input. Black-Scholes is used for every TTE now; nothing
+    in this codebase's usage (binary yes/no strikes, not path-dependent
+    payoffs) actually needs vol-of-vol/mean-reversion modeling badly enough
+    to justify reintroducing that risk without first computing an actual
+    digital/CDF probability from the characteristic function (the Π2
+    formula from Heston 1993), not a normalized call price.
     """
 
     # Default volatilities (annualized) by proxy- these are representative
@@ -133,12 +146,9 @@ class HybridCryptoBrain(BaseBrain):
             if tte_days < 1.0:
                 self.last_model_used = "short_term"
                 fair_value = self._price_short_term(live_truth, market.strike_price)
-            elif tte_days < 30.0:
+            else:
                 self.last_model_used = "standard_bs"
                 fair_value = self._price_standard_bs(live_truth, market.strike_price, tte_days, volatility)
-            else:
-                self.last_model_used = "heston_fft"
-                fair_value = self._price_heston_fft(live_truth, market.strike_price, tte_days, volatility)
         except Exception:
             self.last_model_used = "black_scholes_fallback"
             fair_value = self._price_black_scholes(market, live_truth)
@@ -173,78 +183,6 @@ class HybridCryptoBrain(BaseBrain):
         volatility: float,
     ) -> float:
         return self._calculate_prob(current_price, strike_price, time_to_expiry_days, volatility)
-
-    def _price_heston_fft(
-        self,
-        current_price: float,
-        strike_price: float,
-        time_to_expiry_days: float,
-        volatility: float,
-    ) -> float:
-        """Approximate Heston pricing via Carr-Madan style FFT call valuation.
-
-        Returns call probability proxy by normalizing call value with spot.
-        Falls back to Black-Scholes if numerical issues occur.
-        """
-        if current_price <= 0 or strike_price <= 0 or time_to_expiry_days <= 0:
-            return 1.0 if current_price > strike_price else 0.0
-
-        try:
-            t = max(1e-6, time_to_expiry_days / 365.0)
-            s0 = float(current_price)
-            k = float(strike_price)
-
-            # Heston params (stable defaults)
-            kappa = 2.0
-            theta = max(1e-6, volatility * volatility)
-            sigma_v = 0.6
-            rho = -0.5
-            v0 = theta
-            r = 0.0
-
-            alpha = 1.5
-            n = 1024
-            eta = 0.25
-            lambd = 2.0 * math.pi / (n * eta)
-            b = 0.5 * n * lambd
-
-            u = np.arange(n) * eta
-            iu = 1j * u
-
-            def heston_cf(phi):
-                d = np.sqrt((rho * sigma_v * iu - kappa) ** 2 + sigma_v * sigma_v * (iu + phi * phi))
-                g = (kappa - rho * sigma_v * iu - d) / (kappa - rho * sigma_v * iu + d)
-                exp_dt = np.exp(-d * t)
-                c = r * iu * t + (kappa * theta / (sigma_v * sigma_v)) * (
-                    (kappa - rho * sigma_v * iu - d) * t - 2.0 * np.log((1.0 - g * exp_dt) / (1.0 - g))
-                )
-                d_term = ((kappa - rho * sigma_v * iu - d) / (sigma_v * sigma_v)) * ((1.0 - exp_dt) / (1.0 - g * exp_dt))
-                return np.exp(c + d_term * v0 + iu * np.log(s0))
-
-            numerator = np.exp(-r * t) * heston_cf(u - (alpha + 1.0) * 1j)
-            denominator = alpha * alpha + alpha - u * u + 1j * (2.0 * alpha + 1.0) * u
-            psi = numerator / denominator
-
-            # Simpson weights
-            weights = np.ones(n)
-            weights[0] = 1.0
-            weights[1::2] = 4.0
-            weights[2::2] = 2.0
-            weights[-1] = 1.0
-            weights = weights / 3.0
-
-            fft_input = np.exp(1j * b * u) * psi * eta * weights
-            fft_values = np.fft.fft(fft_input).real
-
-            k_grid = -b + np.arange(n) * lambd
-            strikes = np.exp(k_grid)
-            calls = np.exp(-alpha * k_grid) / math.pi * fft_values
-
-            call_interp = np.interp(k, strikes, calls)
-            prob_proxy = max(0.0, min(1.0, call_interp / max(s0, 1e-9)))
-            return float(prob_proxy)
-        except Exception:
-            return self._price_standard_bs(current_price, strike_price, time_to_expiry_days, volatility)
 
     @staticmethod
     def _calculate_prob(

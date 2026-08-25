@@ -6,6 +6,7 @@ from freezegun import freeze_time
 
 from brains.base import calculate_tte, BaseBrain
 from brains.crypto import HybridCryptoBrain
+from brains.pricing_engine import wang_transform
 from core.models import MarketData
 
 
@@ -80,36 +81,159 @@ def test_kelly_zero_at_unit_price():
 # ── BaseBrain.evaluate ─────────────────────────────────────────────────────────
 
 def test_tradable_above_min_ev():
+    # wang_lambda=0.0, model_weight=1.0 isolate the EV/Kelly/min_ev gate
+    # from the Wang/blend calibration layers (covered separately in
+    # test_pricing_engine.py) so post_prob == the raw probability here.
     brain = HybridCryptoBrain()
     market = _make_market(price=0.50)
     with patch.object(brain, "_calculate_probability", return_value=0.80):
-        signal = brain.evaluate(market, 95_000.0, min_ev=0.30)
+        signal = brain.evaluate(
+            market, 95_000.0, min_ev=0.30,
+            wang_lambda=0.0, model_weight=1.0,
+        )
     # EV = (0.80 - 0.50) / 0.50 = 0.60 > 0.30
     assert signal.is_tradable is True
     assert signal.kelly_size > 0
-    assert signal.fair_value == pytest.approx(0.80)
+    assert signal.post_prob == pytest.approx(0.80)
 
 
 def test_not_tradable_below_min_ev():
     brain = HybridCryptoBrain()
     market = _make_market(price=0.50)
     with patch.object(brain, "_calculate_probability", return_value=0.55):
-        signal = brain.evaluate(market, 95_000.0, min_ev=0.30)
+        signal = brain.evaluate(market, 95_000.0, min_ev=0.30, wang_lambda=0.0, model_weight=1.0)
     # EV = (0.55 - 0.50) / 0.50 = 0.10 < 0.30
     assert signal.is_tradable is False
 
 
-def test_fair_value_clamped_to_unit_interval():
+def test_raw_probability_clamped_to_unit_interval():
+    # get_raw_probability() clamps the brain's raw output before Wang/blend/
+    # cap ever see it - post_prob itself is no longer a raw passthrough
+    # (see brains/pricing_engine.py's wang_transform + market-blending in
+    # evaluate()), so the clamp is verified on pre_prob directly.
     brain = HybridCryptoBrain()
     market = _make_market(price=0.50)
     with patch.object(brain, "_calculate_probability", return_value=1.5):
         signal = brain.evaluate(market, 95_000.0)
-    assert signal.fair_value == 1.0
+    assert signal.pre_prob == 1.0
 
 
-def test_fair_value_clamped_below_zero():
+def test_raw_probability_clamped_below_zero():
     brain = HybridCryptoBrain()
     market = _make_market(price=0.50)
     with patch.object(brain, "_calculate_probability", return_value=-0.3):
         signal = brain.evaluate(market, 95_000.0)
-    assert signal.fair_value == 0.0
+    assert signal.pre_prob == 0.0
+
+
+# ── model_weight validation ─────────────────────────────────────────────────
+
+def test_model_weight_above_one_is_clamped():
+    # model_weight=1.5 should clamp to 1.0 (trust model only) rather than
+    # overshoot past the Wang-adjusted value.
+    brain = HybridCryptoBrain()
+    market = _make_market(price=0.50)
+    with patch.object(brain, "_calculate_probability", return_value=0.80):
+        signal = brain.evaluate(
+            market, 95_000.0, wang_lambda=0.0, model_weight=1.5,
+        )
+    assert signal.post_prob == pytest.approx(0.80)
+
+
+def test_model_weight_below_zero_is_clamped():
+    # model_weight=-0.5 should clamp to 0.0 (trust market only).
+    brain = HybridCryptoBrain()
+    market = _make_market(price=0.50)
+    with patch.object(brain, "_calculate_probability", return_value=0.80):
+        signal = brain.evaluate(
+            market, 95_000.0, wang_lambda=0.0, model_weight=-0.5,
+        )
+    assert signal.post_prob == pytest.approx(0.50)
+
+
+# ── Wang Transform + market blending, applied through evaluate() ───────────
+
+def test_wang_transform_reduces_high_probability():
+    # Raw 0.95 with lambda=-0.75 shaves off overconfidence on deep-ITM
+    # markets. model_weight=1.0 isolates the Wang step from blending.
+    brain = HybridCryptoBrain()
+    market = _make_market(price=0.50)
+    with patch.object(brain, "_calculate_probability", return_value=0.95):
+        signal = brain.evaluate(
+            market, 95_000.0, wang_lambda=-0.75, model_weight=1.0,
+        )
+    assert signal.post_prob < 0.90
+
+
+def test_wang_transform_penalizes_uncertainty_more():
+    # Near-coinflip probabilities move more, proportionally, than
+    # already-extreme ones - the Wang shift is largest near p=0.5 and
+    # shrinks toward 0/1.
+    brain = HybridCryptoBrain()
+    market = _make_market(price=0.50)
+    kwargs = dict(wang_lambda=-0.75, model_weight=1.0)
+
+    with patch.object(brain, "_calculate_probability", return_value=0.50):
+        signal_mid = brain.evaluate(market, 95_000.0, **kwargs)
+    with patch.object(brain, "_calculate_probability", return_value=0.90):
+        signal_high = brain.evaluate(market, 95_000.0, **kwargs)
+
+    drop_mid = 0.50 - signal_mid.post_prob
+    drop_high = 0.90 - signal_high.post_prob
+    assert (drop_mid / 0.50) > (drop_high / 0.90)
+
+
+def test_wang_lambda_zero_is_passthrough():
+    # lambda=0.0 disables the Wang step entirely; with model_weight=1.0
+    # (no blending either), post_prob should equal the raw probability.
+    brain = HybridCryptoBrain()
+    market = _make_market(price=0.50)
+    with patch.object(brain, "_calculate_probability", return_value=0.70):
+        signal = brain.evaluate(
+            market, 95_000.0, wang_lambda=0.0, model_weight=1.0,
+        )
+    assert signal.post_prob == pytest.approx(0.70)
+
+
+def test_blending_pulls_fair_toward_market():
+    # wang_fair (raw=0.95, lambda=-0.75) sits well above the market price
+    # of 0.50. With model_weight=0.40, the blended post_prob should land
+    # strictly between wang_fair and the market price, closer to the
+    # market (60% weight) than to the model (40% weight).
+    brain = HybridCryptoBrain()
+    market = _make_market(price=0.50)
+    with patch.object(brain, "_calculate_probability", return_value=0.95):
+        signal = brain.evaluate(
+            market, 95_000.0, wang_lambda=-0.75, model_weight=0.40,
+        )
+    wang_fair = wang_transform(0.95, -0.75)
+    expected_blended = 0.40 * wang_fair + 0.60 * 0.50
+    assert signal.post_prob == pytest.approx(expected_blended)
+    assert 0.50 < signal.post_prob < wang_fair
+    assert abs(signal.post_prob - 0.50) < abs(signal.post_prob - wang_fair)
+
+
+def test_escape_hatch_reproduces_old_behavior():
+    # wang_lambda=0.0 + model_weight=1.0 disables both calibration layers,
+    # reproducing pre-calibration behavior exactly: post_prob == raw
+    # probability, regardless of market price.
+    brain = HybridCryptoBrain()
+    market = _make_market(price=0.50)
+    with patch.object(brain, "_calculate_probability", return_value=0.80):
+        signal = brain.evaluate(
+            market, 95_000.0, wang_lambda=0.0, model_weight=1.0,
+        )
+    assert signal.post_prob == pytest.approx(0.80)
+    assert signal.post_prob == pytest.approx(signal.pre_prob)
+
+
+def test_raw_fair_value_preserved():
+    # signal.pre_prob always holds the brain's unadjusted model output,
+    # even when Wang + blending move post_prob far away from it.
+    brain = HybridCryptoBrain()
+    market = _make_market(price=0.50)
+    with patch.object(brain, "_calculate_probability", return_value=0.95):
+        signal = brain.evaluate(market, 95_000.0, wang_lambda=-0.75, model_weight=0.40)
+
+    assert signal.pre_prob == pytest.approx(0.95)
+    assert signal.post_prob != pytest.approx(0.95)

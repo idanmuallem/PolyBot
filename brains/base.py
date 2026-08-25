@@ -5,9 +5,15 @@ implement _calculate_probability() with domain-specific models.
 """
 
 from abc import ABC, abstractmethod
+import logging
 import re
 from datetime import datetime, timezone
-from core.trading_config import DEFAULT_MIN_EV
+from brains.pricing_engine import wang_transform
+from core.trading_config import (
+    DEFAULT_MIN_EV,
+    DEFAULT_WANG_LAMBDA,
+    DEFAULT_MODEL_WEIGHT,
+)
 from core.models import MarketData, TradeSignal
 
 
@@ -82,10 +88,9 @@ class BaseBrain(ABC):
     def get_raw_probability(self, market: MarketData, live_truth: float) -> float:
         """Return this brain's raw probability estimate (p_true), clamped to [0, 1].
 
-        This is the brain's unadjusted opinion — the "raw" input that
-        PricingEngine.compute_edge() Wang-adjusts into a market-consistent
-        fair value. evaluate() below still uses it directly for the legacy
-        (pre-Wang) EV/Kelly path.
+        This is the brain's unadjusted opinion — the input evaluate() below
+        risk-adjusts (Wang Transform -> market blend) into a tradeable fair
+        value.
         """
         return max(0.0, min(1.0, self._calculate_probability(market, live_truth)))
 
@@ -94,23 +99,72 @@ class BaseBrain(ABC):
         market: MarketData,
         live_truth: float,
         min_ev: float = DEFAULT_MIN_EV,
+        wang_lambda: float = DEFAULT_WANG_LAMBDA,
+        model_weight: float = DEFAULT_MODEL_WEIGHT,
     ) -> TradeSignal:
-        """Compute fair value, EV, Kelly size, and tradability for *market*."""
-        fair_value = self.get_raw_probability(market, live_truth)
+        """Compute fair value, EV, Kelly size, and tradability for *market*.
 
-        expected_value = (
-            (fair_value - market.initial_price) / market.initial_price
-            if market.initial_price > 0 else 0.0
+        Single source of truth for pricing (see trading/decision_pipeline.py,
+        which calls this directly rather than re-deriving fair value itself).
+        Two layers run in order, each correcting what the last couldn't:
+
+        1. Wang Transform — risk-adjusts the raw model probability. Shrinks
+           toward a no-op as pre_prob approaches 0 or 1, so on its own it
+           barely dents an already-overconfident (near-certain) model output.
+        2. Market blending — pulls the Wang-adjusted value toward the
+           market's own price by (1 - model_weight), which is what actually
+           reins in a saturated raw probability the Wang step alone can't.
+        """
+        pre_prob = self.get_raw_probability(market, live_truth)
+        market_price = float(market.initial_price) if market.initial_price > 0 else 0.5
+
+        # Step 1: Wang Transform.
+        wang_fair = wang_transform(pre_prob, wang_lambda)
+
+        # Step 2: Market blending. model_weight is a caller-supplied knob
+        # (ultimately from config/env - see MODEL_WEIGHT in core/trading_config.py),
+        # so clamp defensively rather than let a bad value silently invert the
+        # blend or amplify past [0, 1].
+        if not (0.0 <= model_weight <= 1.0):
+            logging.warning(
+                "model_weight=%.4f out of [0.0, 1.0] range; clamping.", model_weight
+            )
+            model_weight = max(0.0, min(1.0, model_weight))
+        blended_fair = model_weight * wang_fair + (1.0 - model_weight) * market_price
+        post_prob = max(0.0, min(1.0, blended_fair))
+
+        price_yes = market_price
+        price_no = max(1e-9, 1.0 - price_yes)
+        fair_no = 1.0 - post_prob
+        ev_yes = (post_prob / price_yes - 1.0) if price_yes > 0 else -1.0
+        ev_no = (fair_no / price_no - 1.0) if price_no > 0 else -1.0
+
+        side = "YES" if ev_yes >= ev_no else "NO"
+        expected_value = ev_yes if side == "YES" else ev_no
+        entry_price = price_yes if side == "YES" else price_no
+
+        kelly_size = max(
+            0.0,
+            self._calculate_kelly(post_prob, price_yes) if side == "YES"
+            else self._calculate_kelly(fair_no, price_no),
         )
 
-        kelly_size = max(0.0, min(0.05, self._calculate_kelly(fair_value, market.initial_price)))
         is_tradable = expected_value >= min_ev and kelly_size > 0.0
 
         return TradeSignal(
-            fair_value=fair_value,
+            post_prob=post_prob,
             expected_value=expected_value,
             kelly_size=kelly_size,
             is_tradable=is_tradable,
+            pre_prob=pre_prob,
+            wang_fair_value=wang_fair,
+            wang_lambda=wang_lambda,
+            wang_edge=post_prob - market_price,
+            confidence=1.0,
+            side=side,
+            ev_yes=ev_yes,
+            ev_no=ev_no,
+            entry_price=entry_price,
         )
 
     @staticmethod

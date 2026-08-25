@@ -9,11 +9,26 @@ class BudgetManager:
         self.max_bet_size_usd = float(config.max_bet_size_usd)
         self.kelly_fraction = float(getattr(config, "kelly_fraction", 0.25))
 
+        # Per-strategy daily limits (see core/trading_config.py) — arbitrage
+        # and crypto (model-driven) both draw from the same wallet balance,
+        # but each gets its own budget allocation so one can't starve the
+        # other. Unrecognized strategy tags fall back to the global
+        # daily_limit_usd ceiling.
+        self.strategy_limits: dict[str, float] = {
+            "arbitrage": float(getattr(config, "arbitrage_daily_limit_usd", self.daily_limit_usd)),
+            "crypto": float(getattr(config, "crypto_daily_limit_usd", self.daily_limit_usd)),
+        }
+
         self.base_balance = float(initial_balance)
+        self.spent_by_strategy: dict[str, float] = {}
+        self.trades_by_strategy: dict[str, int] = {}
         self.total_spent_today = 0.0
 
         self.watch_only = self.base_balance < self.min_trading_balance
         self._sync_bridge()
+
+    def _strategy_limit(self, strategy_tag: str) -> float:
+        return float(self.strategy_limits.get(strategy_tag, self.daily_limit_usd))
 
     def _sync_bridge(self):
         self.bridge.daily_spend = self.total_spent_today
@@ -22,11 +37,12 @@ class BudgetManager:
         self.bridge.current_balance = current_balance
         self.bridge.cash = current_balance
 
-    def get_remaining_budget(self) -> float:
-        return self.daily_limit_usd - self.total_spent_today
+    def get_remaining_budget(self, strategy_tag: str = "crypto") -> float:
+        spent = self.spent_by_strategy.get(strategy_tag, 0.0)
+        return self._strategy_limit(strategy_tag) - spent
 
-    def check_and_cap_bet(self, kelly_fraction: float):
-        remaining = self.get_remaining_budget()
+    def check_and_cap_bet(self, kelly_fraction: float, strategy_tag: str = "crypto"):
+        remaining = self.get_remaining_budget(strategy_tag)
         desired_bet = float(kelly_fraction) * self.bankroll_usd
         actual_bet = min(desired_bet, remaining)
         if actual_bet <= 0:
@@ -61,14 +77,17 @@ class BudgetManager:
         bet_usd = kelly_scaled * self.bankroll_usd
         return max(0.0, min(bet_usd, self.max_bet_size_usd))
 
-    def cap_to_remaining_budget(self, desired_bet_usd: float):
-        """Cap an already-sized dollar bet to what's left of today's budget."""
-        remaining = self.get_remaining_budget()
+    def cap_to_remaining_budget(self, desired_bet_usd: float, strategy_tag: str = "crypto"):
+        """Cap an already-sized dollar bet to what's left of this strategy's
+        budget for today."""
+        remaining = self.get_remaining_budget(strategy_tag)
         actual_bet = min(float(desired_bet_usd), remaining)
         if actual_bet <= 0:
             return 0.0, False
         return actual_bet, True
 
-    def record_trade(self, amount_usd: float):
-        self.total_spent_today += float(amount_usd)
+    def record_trade(self, amount_usd: float, strategy_tag: str = "crypto"):
+        self.spent_by_strategy[strategy_tag] = self.spent_by_strategy.get(strategy_tag, 0.0) + float(amount_usd)
+        self.trades_by_strategy[strategy_tag] = self.trades_by_strategy.get(strategy_tag, 0) + 1
+        self.total_spent_today = sum(self.spent_by_strategy.values())
         self._sync_bridge()

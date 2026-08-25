@@ -28,7 +28,7 @@ PolyBot scans Polymarket's prediction markets for mispriced contracts using real
 **Key capabilities:**
 
 - Market discovery across crypto, weather, and macro asset classes
-- Domain-specific fair-value models (Black-Scholes/Heston for crypto, normal-distribution for weather/economy)
+- Domain-specific fair-value models (Black-Scholes for crypto, normal-distribution for weather/economy)
 - Kelly-criterion-based position sizing with hard budget caps
 - Dry-run, paper-trading, and live-trading modes
 - Real-time dashboard with equity curve, open positions, and EV distribution
@@ -87,11 +87,11 @@ Each wallet runs as a fully isolated unit — its own `TradingConfig`, its own l
 PolyBot/
 │
 ├── brains/                     # Fair-value pricing models
-│   ├── base.py                 # BaseBrain: EV calc, Kelly sizing, tradability
-│   ├── crypto.py               # HybridCryptoBrain: Black-Scholes + Heston → raw probability
+│   ├── base.py                 # BaseBrain: entry-side Wang Transform → blend, EV, Kelly sizing
+│   ├── crypto.py               # HybridCryptoBrain: Black-Scholes → raw probability
 │   ├── weather.py              # WeatherBrain: normal distribution on temperature
 │   ├── economy.py              # EconomyBrain: normal distribution on macro indicators
-│   └── pricing_engine.py       # PricingEngine: Wang Transform (raw probability → fair value/edge)
+│   └── pricing_engine.py       # PricingEngine: hierarchical Wang Transform (exit-side decay check only)
 │
 ├── core/                       # Shared infrastructure
 │   ├── models.py               # MarketData, TradeSignal, Position dataclasses
@@ -163,21 +163,28 @@ Each hunter queries the Polymarket Gamma API for open markets matching its asset
 
 A separate, model-free path runs alongside the hunters: **strategies** (`trading/strategies/`) scan for arithmetic mispricings directly in market prices — no anchor value or brain involved. `EventSumStrategy` looks for multi-outcome events whose YES prices don't sum to $1.00.
 
-### 2. Fair-Value Pricing (Brains + PricingEngine)
+### 2. Fair-Value Pricing (Brains + Entry-Side Calibration)
 
 Each discovered market is passed to the matching `Brain`, which produces a **raw probability** the market resolves YES from the anchor value and a domain-specific statistical model:
 
-- **Crypto**: Black-Scholes for short TTE, Heston model for longer-dated contracts. Uses per-asset implied volatility (BTC 50%, ETH 70%, SOL 90%).
+- **Crypto**: Black-Scholes for every TTE (a Heston/FFT model previously handled >90-day contracts but was dropped — its output wasn't actually a CDF probability, just a normalized option value; see `HybridCryptoBrain`'s docstring). Uses per-asset implied volatility (BTC 50%, ETH 70%, SOL 90%).
 - **Weather**: Normal distribution around the forecast with a configurable standard deviation.
 - **Economy**: Normal distribution around the current macro reading with historical volatility.
 
-That raw probability is then passed through `PricingEngine` (`pricing_mode=wang`, the default), which applies a Wang Transform risk-premium adjustment to produce a market-consistent **fair value** and the resulting **edge** against the live market price. Setting `PRICING_MODE=legacy` skips the Wang adjustment and uses the brain's raw probability directly, for A/B comparison.
+These raw models are often overconfident — near-certain probabilities on deep in-the-money markets that don't survive contact with the live market price. `BaseBrain.evaluate()` (`brains/base.py`) runs every raw probability through two calibration layers, in order, before computing EV:
+
+1. **Wang Transform** (`WANG_LAMBDA`, default `-0.75`) — a probit-space risk distortion, `Φ(Φ⁻¹(p) + λ)`, that pulls extreme probabilities back toward uncertainty. The shift shrinks as `p` approaches 0 or 1, so a genuinely near-certain outcome is barely touched while a shaky "0.95" gets meaningfully discounted.
+2. **Market blending** (`MODEL_WEIGHT`, default `0.40`) — blends the Wang-adjusted probability with the market's own price (`model_weight * wang_fair + (1 - model_weight) * market_price`), treating the market price as a second opinion the model doesn't get to override on its own.
+
+Setting `WANG_LAMBDA=0.0` and `MODEL_WEIGHT=1.0` is the escape hatch — it disables both layers and reproduces the brain's raw, uncalibrated probability exactly (`PRICING_MODE=legacy` does the same at the pipeline level, for A/B comparison).
+
+This entry-side calibration is distinct from `PricingEngine`'s hierarchical Wang Transform (`WANG_BASE_LAMBDA`), which is used only on the **exit** side — see `trading/risk_manager.py`'s Wang-edge-decay check in Position Management below.
 
 ### 3. Trade Decision
 
 The pipeline filters markets through several gates before executing:
 
-1. Wang edge must exceed `WANG_MIN_EDGE` (default 0.05 probability points; `MIN_EV` under legacy pricing)
+1. Expected value (computed off the calibrated fair value above) must exceed `MIN_EV` (default `0.50`)
 2. Time to expiry must be between `MIN_TTE_MINUTES` and `MAX_TTE_DAYS`
 3. Daily spend must be below `DAILY_LIMIT_USD`
 4. Available balance must exceed `MIN_TRADING_BALANCE`
@@ -268,8 +275,15 @@ MIN_HOLD_EV=-0.10
 MIN_TTE_MINUTES=60
 MAX_TTE_DAYS=180
 
-# Wang Transform pricing (see brains/pricing_engine.py)
-PRICING_MODE=wang            # "wang" or "legacy"
+# Entry-side calibration (see BaseBrain.evaluate() in brains/base.py):
+# Wang Transform -> market blending, applied to every brain's raw
+# probability before EV is computed.
+PRICING_MODE=wang            # "wang" or "legacy" (legacy = brain's raw probability, no calibration)
+WANG_LAMBDA=-0.75            # risk-averse distortion; 0.0 disables the Wang step
+MODEL_WEIGHT=0.40            # weight on the Wang-adjusted model vs. (1 - this) on market price
+
+# Exit-side pricing (see PricingEngine in brains/pricing_engine.py, used only
+# by trading/risk_manager.py's Wang-edge-decay check on open positions)
 WANG_BASE_LAMBDA=0.183
 WANG_MIN_EDGE=0.05
 
@@ -370,7 +384,7 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `DRY_RUN` | `True` | Disable order submission |
 | `PAPER_TRADE_MODE` | `False` | Simulate trades with virtual balance |
 | `PAPER_BALANCE_USD` | `1000.0` | Starting virtual balance for paper trading |
-| `MIN_EV` | `0.30` | Minimum expected value to enter a trade |
+| `MIN_EV` | `0.50` | Minimum expected value (off the calibrated fair value) to enter a trade |
 | `MIN_TTE_MINUTES` | `60` | Minimum time-to-expiry in minutes |
 | `MAX_TTE_DAYS` | `180` | Maximum time-to-expiry in days |
 | `DAILY_LIMIT_USD` | `5.0` | Maximum USD to spend per day |
@@ -383,10 +397,18 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `ENGINE_LOOP_DELAY` | `2.0` | Seconds between scan cycles |
 | `TRADES_DB_PATH` | `/app/trades.db` | SQLite database path (single-wallet mode) |
 | `WALLET_CONFIG_PATH` | — | Path to a wallet `config.json`; if set, overrides `.env`-based config for that wallet |
-| `PRICING_MODE` | `wang` | `wang` (Wang Transform fair value) or `legacy` (brain's raw probability, no adjustment) |
-| `WANG_BASE_LAMBDA` | `0.183` | Base risk-premium parameter for the Wang Transform |
-| `WANG_MIN_EDGE` | `0.05` | Minimum \|Wang edge\| (probability points) to consider a trade |
+| `PRICING_MODE` | `wang` | `wang` (calibrated fair value) or `legacy` (brain's raw probability, no calibration) |
+| `WANG_LAMBDA` | `-0.75` | Entry-side Wang Transform distortion (`BaseBrain.evaluate()`); negative = risk-averse, `0.0` disables it |
+| `MODEL_WEIGHT` | `0.40` | Entry-side blend weight on the Wang-adjusted model vs. `(1 - this)` on market price; `1.0` disables blending |
+| `WANG_BASE_LAMBDA` | `0.183` | Exit-side hierarchical Wang Transform base risk-premium (`PricingEngine`, position-decay check only) |
+| `WANG_MIN_EDGE` | `0.05` | Minimum \|Wang edge\| (probability points) for the exit-side decay check |
 | `KELLY_FRACTION` | `0.25` | Fraction of full Kelly used for position sizing |
 | `MAX_DRAWDOWN_PCT` | `0.20` | Equity drop from peak that pauses new entries (exits still run) |
+| `ARBITRAGE_DAILY_LIMIT_USD` | `50.0` | Daily USD budget reserved for the arbitrage strategy path — independent of `CRYPTO_DAILY_LIMIT_USD`, so one path can't starve the other's spend on the shared wallet balance |
+| `ARBITRAGE_MAX_DAILY_TRADES` | `50` | Daily trade-count cap for the arbitrage strategy path |
+| `CRYPTO_DAILY_LIMIT_USD` | `50.0` | Daily USD budget reserved for the crypto/model-driven strategy path |
+| `CRYPTO_MAX_DAILY_TRADES` | `50` | Daily trade-count cap for the crypto/model-driven strategy path |
+| `ARBITRAGE_ORDER_TIMEOUT_SECONDS` | `60` | Seconds to wait for each arbitrage leg's limit order to fill before cancelling the whole group |
+| `ARBITRAGE_CRYPTO_FIRST` | `True` | Scan crypto event groups before general ones, so crypto gets first claim on the arbitrage budget |
 | `OPENWEATHER_API_KEY` | — | Required for WeatherHunter |
 | `FRED_API_KEY` | — | Required for EconomyHunter |

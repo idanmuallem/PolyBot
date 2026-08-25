@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from freezegun import freeze_time
 
+from brains.pricing_engine import wang_transform
 from core.bridge import DataBridge
 from core.models import MarketData
 from core.trading_config import TradingConfig
@@ -195,7 +196,12 @@ def test_stage_execute_records_budget_on_success():
 
 # ── Wang pricing mode (PricingEngine wiring) ─────────────────────────────────
 
-def _wang_pipeline(balance=100.0, wang_base_lambda=0.183, wang_min_edge=0.05, min_ev=0.30):
+def _wang_pipeline(balance=100.0, wang_base_lambda=0.183, wang_min_edge=0.0, min_ev=0.30):
+    # wang_min_edge defaults to 0.0 here: market blending (BaseBrain.evaluate())
+    # shrinks edges relative to the old hierarchical-only Wang math, so most of
+    # these tests (which check metadata propagation, not the min-edge gate
+    # itself) pass an edge floor low enough not to incidentally trip it.
+    # test_wang_mode_skips_market_below_min_edge exercises the gate directly.
     config = TradingConfig(
         dry_run=True, min_ev=min_ev, bankroll_usd=1000.0,
         daily_limit_usd=15.0, max_bet_size_usd=3.0,
@@ -217,26 +223,38 @@ def test_wang_mode_populates_pricing_fields():
 
     assert candidate is not None
     assert candidate.pricing_mode == "wang"
-    assert candidate.raw_probability == pytest.approx(0.70)
-    # fair_value is the Wang-adjusted value, not the raw brain probability.
-    assert candidate.fair_value != pytest.approx(0.70)
-    assert candidate.wang_fair_value == pytest.approx(candidate.fair_value)
+    assert candidate.pre_prob == pytest.approx(0.70)
+    # post_prob is Wang-adjusted then market-blended, not the raw probability.
+    assert candidate.post_prob != pytest.approx(0.70)
+
+    expected_wang_fair = wang_transform(0.70, pipeline.config.wang_lambda)
+    assert candidate.wang_fair_value == pytest.approx(expected_wang_fair)
+    # post_prob (post market-blend) is distinct from wang_fair_value
+    # (Wang-only, pre-blend) now that blending sits between the two.
+    expected_blended = (
+        pipeline.config.model_weight * expected_wang_fair
+        + (1.0 - pipeline.config.model_weight) * 0.30
+    )
+    assert candidate.post_prob == pytest.approx(expected_blended)
+
     assert candidate.wang_lambda is not None
-    assert candidate.wang_edge == pytest.approx(candidate.fair_value - 0.30)
-    # EV is computed off the Wang fair value, not the raw probability.
-    assert candidate.final_ev == pytest.approx(candidate.fair_value / 0.30 - 1.0, rel=0.01)
+    assert candidate.wang_edge == pytest.approx(candidate.post_prob - 0.30)
+    # EV is computed off the final (Wang + blended) post_prob, not the raw probability.
+    assert candidate.final_ev == pytest.approx(candidate.post_prob / 0.30 - 1.0, rel=0.01)
 
 
 @freeze_time("2026-06-02T00:00:00+00:00")
 def test_wang_mode_skips_market_below_min_edge():
     pipeline, bridge, log_calls = _wang_pipeline(wang_min_edge=0.05)
-    # Price set so wang_fair_value == market_price -> wang_edge == 0.0.
-    fv = pipeline.pricing_engine.wang_fair_value(0.50, volume=500_000.0, days_to_expiry=10.0)
-    market = _market(price=fv["fair_value"], expiry_days=10)
+    # Market price set exactly to the Wang-only fair value: blending a value
+    # with itself is a no-op, so the final post_prob == market_price and
+    # wang_edge == 0.0 exactly.
+    wang_fair = wang_transform(0.70, pipeline.config.wang_lambda)
+    market = _market(price=wang_fair, expiry_days=10)
     mock_hunter = MagicMock()
     mock_hunter.get_live_truth.return_value = 97_000.0
 
-    with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.50):
+    with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.70):
         candidate = pipeline._stage_evaluate_ev(market, mock_hunter)
 
     assert candidate is None
@@ -255,8 +273,8 @@ def test_legacy_mode_leaves_wang_fields_none():
 
     assert candidate is not None
     assert candidate.pricing_mode == "legacy"
-    assert candidate.raw_probability == pytest.approx(0.70)
-    assert candidate.fair_value == pytest.approx(0.70)  # unchanged by any Wang adjustment
+    assert candidate.pre_prob == pytest.approx(0.70)
+    assert candidate.post_prob == pytest.approx(0.70)  # unchanged by any Wang adjustment
     assert candidate.wang_lambda is None
     assert candidate.wang_fair_value is None
     assert candidate.wang_edge is None
@@ -272,7 +290,10 @@ def test_wang_mode_track_log_includes_pricing_fields():
     captured = []
     pipeline.log_func = lambda level, *a, **kw: captured.append((level, a, kw))
 
-    with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.70):
+    # raw=0.85 (rather than a coinflip-adjacent value): market blending
+    # (BaseBrain.evaluate()) dampens edges enough that this needs to clear
+    # min_ev=0.30 at price=0.30, the most favorable price PRICE_FLOOR allows.
+    with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.85):
         candidate = pipeline._stage_evaluate_ev(market, mock_hunter)
     assert candidate is not None
 
@@ -283,10 +304,10 @@ def test_wang_mode_track_log_includes_pricing_fields():
     track_calls = [c for c in captured if c[0] == "TRACK"]
     assert track_calls, "No TRACK entry found"
     payload = track_calls[0][1][2]
-    for key in ("raw_probability", "wang_lambda", "wang_fair_value", "wang_edge", "pricing_mode"):
+    for key in ("pre_prob", "wang_lambda", "wang_fair_value", "wang_edge", "pricing_mode"):
         assert key in payload, f"TRACK payload missing key: {key!r}"
     assert payload["pricing_mode"] == "wang"
-    assert payload["raw_probability"] == pytest.approx(0.70)
+    assert payload["pre_prob"] == pytest.approx(0.85)
 
 
 # ── Phase 7: strategy_type / kelly_fraction_used / correlation_exposure ──────
@@ -311,7 +332,7 @@ def test_candidate_kelly_fraction_used_matches_config():
         dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=15.0, max_bet_size_usd=3.0,
         max_daily_trades=10, min_trading_balance=1.0,
-        pricing_mode="wang", kelly_fraction=0.10,
+        pricing_mode="wang", kelly_fraction=0.10, wang_min_edge=0.0,
     )
     pipeline, bridge, _ = _make_pipeline(config=config)
     market = _market(price=0.30, expiry_days=10)
@@ -370,7 +391,9 @@ def test_analytics_fields_present_in_track_log():
     captured = []
     pipeline.log_func = lambda level, *a, **kw: captured.append((level, a, kw))
 
-    with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.70):
+    # raw=0.85: see test_wang_mode_track_log_includes_pricing_fields for why
+    # 0.70 no longer clears min_ev at PRICE_FLOOR once market blending applies.
+    with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.85):
         candidate = pipeline._stage_evaluate_ev(market, mock_hunter)
     assert candidate is not None
 

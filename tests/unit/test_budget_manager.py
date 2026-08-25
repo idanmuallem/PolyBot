@@ -14,6 +14,12 @@ def _make_manager(
     config = TradingConfig(
         bankroll_usd=bankroll,
         daily_limit_usd=daily_limit,
+        # Per-strategy limits default to $50 each (core/trading_config.py);
+        # pin both to daily_limit here so pre-existing tests below — which
+        # exercise the default strategy_tag="crypto" and were written before
+        # per-strategy budgets existed — see the same ceiling as before.
+        crypto_daily_limit_usd=daily_limit,
+        arbitrage_daily_limit_usd=daily_limit,
         min_trading_balance=min_balance,
         max_bet_size_usd=max_bet_size_usd,
         kelly_fraction=kelly_fraction,
@@ -33,7 +39,7 @@ def test_under_daily_limit():
 
 def test_at_daily_limit_returns_zero():
     mgr, _ = _make_manager()
-    mgr.total_spent_today = 15.0
+    mgr.spent_by_strategy["crypto"] = 15.0
     bet, ok = mgr.check_and_cap_bet(0.001)
     assert ok is False
     assert bet == 0.0
@@ -41,7 +47,7 @@ def test_at_daily_limit_returns_zero():
 
 def test_caps_at_remaining_budget():
     mgr, _ = _make_manager()
-    mgr.total_spent_today = 12.0  # $3.0 remaining
+    mgr.spent_by_strategy["crypto"] = 12.0  # $3.0 remaining
     # 0.01 * 1000 = $10.0 desired, but only $3.0 left
     bet, ok = mgr.check_and_cap_bet(0.01)
     assert ok is True
@@ -159,7 +165,7 @@ def test_cap_to_remaining_budget_under_limit():
 
 def test_cap_to_remaining_budget_caps_at_remaining():
     mgr, _ = _make_manager()
-    mgr.total_spent_today = 12.0  # $3 remaining
+    mgr.spent_by_strategy["crypto"] = 12.0  # $3 remaining
     bet, ok = mgr.cap_to_remaining_budget(10.0)
     assert ok is True
     assert bet == 3.0
@@ -167,7 +173,60 @@ def test_cap_to_remaining_budget_caps_at_remaining():
 
 def test_cap_to_remaining_budget_zero_at_limit():
     mgr, _ = _make_manager()
-    mgr.total_spent_today = 15.0
+    mgr.spent_by_strategy["crypto"] = 15.0
     bet, ok = mgr.cap_to_remaining_budget(1.0)
     assert ok is False
     assert bet == 0.0
+
+
+# ── Per-strategy budget isolation (Phase 1) ───────────────────────────────────
+
+def test_strategy_budgets_are_independent():
+    mgr, _ = _make_manager(daily_limit=15.0)
+    mgr.record_trade(10.0, strategy_tag="arbitrage")
+
+    # Spending on arbitrage doesn't touch crypto's own $15 allocation.
+    assert mgr.get_remaining_budget("crypto") == 15.0
+    assert mgr.get_remaining_budget("arbitrage") == 5.0
+
+
+def test_strategy_limit_caps_bet():
+    mgr, _ = _make_manager(daily_limit=15.0)
+    mgr.spent_by_strategy["arbitrage"] = 15.0  # arbitrage strategy at its limit
+
+    bet, ok = mgr.check_and_cap_bet(0.001, strategy_tag="arbitrage")
+    assert ok is False
+    assert bet == 0.0
+
+    # crypto's own allocation is untouched.
+    bet, ok = mgr.check_and_cap_bet(0.001, strategy_tag="crypto")
+    assert ok is True
+    assert bet == 1.0
+
+
+def test_total_spent_is_sum_of_strategies():
+    mgr, _ = _make_manager()
+    mgr.record_trade(2.5, strategy_tag="crypto")
+    mgr.record_trade(4.0, strategy_tag="arbitrage")
+
+    assert mgr.total_spent_today == pytest.approx(6.5)
+    assert mgr.total_spent_today == pytest.approx(
+        sum(mgr.spent_by_strategy.values())
+    )
+
+
+def test_daily_reset_clears_all_strategies():
+    mgr, bridge = _make_manager()
+    mgr.record_trade(2.5, strategy_tag="crypto")
+    mgr.record_trade(4.0, strategy_tag="arbitrage")
+    assert mgr.total_spent_today > 0.0
+
+    # Mirrors what SequentialTradingPipeline._reset_daily_if_needed() does.
+    mgr.total_spent_today = 0.0
+    mgr.spent_by_strategy = {}
+    mgr.trades_by_strategy = {}
+
+    assert mgr.spent_by_strategy == {}
+    assert mgr.trades_by_strategy == {}
+    assert mgr.get_remaining_budget("crypto") == 15.0
+    assert mgr.get_remaining_budget("arbitrage") == 15.0

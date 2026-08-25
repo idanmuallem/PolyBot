@@ -3,7 +3,7 @@ import math
 import pytest
 from scipy.stats import norm
 
-from brains.pricing_engine import PricingEngine, _clamp_prob
+from brains.pricing_engine import PricingEngine, _clamp_prob, wang_transform
 
 
 # ── wang_fair_value: known values ───────────────────────────────────────────
@@ -196,3 +196,24 @@ def test_compute_edge_confidence_lower_without_metadata():
     with_meta = engine.compute_edge(0.5, 0.3, volume=5000.0, days_to_expiry=10.0)
     without_meta = engine.compute_edge(0.5, 0.3)
     assert with_meta["confidence"] >= without_meta["confidence"]
+
+
+# ── wang_transform (flat-lambda, used directly by BaseBrain.evaluate()) ──────
+
+def test_wang_transform_reduces_high_probability():
+    # Raw 0.95 with lambda=-0.75 shaves off overconfidence on deep-ITM markets.
+    fair = wang_transform(0.95, -0.75)
+    assert fair < 0.90
+
+
+def test_wang_transform_penalizes_uncertainty_more():
+    # Near-coinflip probabilities move more, proportionally, than
+    # already-extreme ones - the transform's shift is largest near p=0.5
+    # and shrinks toward 0/1 (see delta_lambda above).
+    drop_mid = 0.50 - wang_transform(0.50, -0.75)
+    drop_high = 0.90 - wang_transform(0.90, -0.75)
+    assert (drop_mid / 0.50) > (drop_high / 0.90)
+
+
+def test_wang_lambda_zero_is_passthrough():
+    assert wang_transform(0.70, 0.0) == 0.70

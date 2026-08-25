@@ -68,7 +68,7 @@ def test_selects_short_term_under_1_day():
 
 
 @freeze_time("2026-06-02T00:00:00+00:00")
-def test_selects_standard_bs_1_to_30_days():
+def test_selects_standard_bs_1_to_90_days():
     brain = HybridCryptoBrain()
     expiry = (datetime(2026, 6, 2, tzinfo=timezone.utc) + timedelta(days=10)).isoformat()
     market = _make_market(expiry=expiry)
@@ -77,24 +77,26 @@ def test_selects_standard_bs_1_to_30_days():
 
 
 @freeze_time("2026-06-02T00:00:00+00:00")
-def test_selects_heston_above_30_days():
+def test_selects_standard_bs_at_60_days():
+    # 60 days used to route to Heston (old 30-day cutoff); Heston was
+    # dropped entirely (its output wasn't actually a probability - see
+    # HybridCryptoBrain's docstring), so every TTE >= 1 day now stays on BS.
     brain = HybridCryptoBrain()
     expiry = (datetime(2026, 6, 2, tzinfo=timezone.utc) + timedelta(days=60)).isoformat()
     market = _make_market(expiry=expiry)
     brain._calculate_probability(market, 95_000.0)
-    assert brain.last_model_used == "heston_fft"
+    assert brain.last_model_used == "standard_bs"
 
 
-def test_heston_handles_zero_current_price():
+@freeze_time("2026-06-02T00:00:00+00:00")
+def test_selects_standard_bs_above_90_days():
+    # 120 days used to route to Heston (old 90-day cutoff, before Heston
+    # was dropped entirely). Long-dated markets stay on Black-Scholes too.
     brain = HybridCryptoBrain()
-    result = brain._price_heston_fft(0, 100_000, 60, 0.5)
-    assert 0.0 <= result <= 1.0
-
-
-def test_heston_handles_zero_strike():
-    brain = HybridCryptoBrain()
-    result = brain._price_heston_fft(100_000, 0, 60, 0.5)
-    assert 0.0 <= result <= 1.0
+    expiry = (datetime(2026, 6, 2, tzinfo=timezone.utc) + timedelta(days=120)).isoformat()
+    market = _make_market(expiry=expiry)
+    brain._calculate_probability(market, 95_000.0)
+    assert brain.last_model_used == "standard_bs"
 
 
 # ── Inversion keywords ───────────────────────────────────────────────────────
