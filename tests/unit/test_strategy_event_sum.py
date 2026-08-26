@@ -247,6 +247,54 @@ async def test_empty_markets_list_returns_empty():
     assert await strategy.scan([_event(markets=[])]) == []
 
 
+# ── condition_id / slug propagation (paper-trading Bug 2 fix) ────────────────
+# EventSumStrategy builds its own MarketData directly from the raw Gamma API
+# event payload (unlike CryptoHunter/WeatherHunter/EconomyHunter, which all
+# go through BasePolymarketHunter._scan_polymarket()) — it must independently
+# carry condition_id/slug through, or every arbitrage leg silently fails to
+# reach the paper engine (PaperAdapter.execute_buy() requires one of the two).
+
+@pytest.mark.asyncio
+async def test_leg_market_carries_condition_id_and_slug():
+    market = _market("tokA", 0.30)
+    market["conditionId"] = "0xcond-a"
+    market["slug"] = "outcome-a-slug"
+    event = _event(markets=[market, _market("tokB", 0.30)])
+    strategy = _strategy()
+
+    signals = await strategy.scan([event])
+
+    leg_a = next(s for s in signals if s.market.market_id == "tokA")
+    assert leg_a.market.condition_id == "0xcond-a"
+    assert leg_a.market.slug == "outcome-a-slug"
+
+
+@pytest.mark.asyncio
+async def test_leg_market_falls_back_to_event_level_slug():
+    # Per-market "slug" absent -> falls back to the event's own slug, same
+    # pattern as hunters/base.py's _scan_polymarket().
+    market = _market("tokA", 0.30)
+    event = _event(event_id="evt-fallback", markets=[market, _market("tokB", 0.30)])
+    event["slug"] = "event-level-slug"
+    strategy = _strategy()
+
+    signals = await strategy.scan([event])
+
+    leg_a = next(s for s in signals if s.market.market_id == "tokA")
+    assert leg_a.market.slug == "event-level-slug"
+
+
+@pytest.mark.asyncio
+async def test_leg_market_condition_id_and_slug_none_when_absent_from_payload():
+    event = _event(markets=[_market("tokA", 0.30), _market("tokB", 0.30)])
+    strategy = _strategy()
+
+    signals = await strategy.scan([event])
+
+    assert all(s.market.condition_id is None for s in signals)
+    assert all(s.market.slug is None for s in signals)
+
+
 # ── Phase 4: crypto-first scan order ──────────────────────────────────────────
 
 def _crypto_first_events():

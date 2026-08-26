@@ -355,6 +355,12 @@ def render_paper_equity_curve(snapshots: list[dict]):
         },
         "yAxis": {
             "type": "value",
+            # Zoom to where the data actually moves instead of always
+            # anchoring at $0 — a $1000 paper balance fluctuating by a few
+            # percent is invisible on a 0-1000+ axis. Note this means the
+            # Cash/Positions stacked area no longer sits flush on the axis
+            # line (expected trade-off for a readable range).
+            "scale": True,
             "axisLabel": {"color": "#94a3b8", "formatter": "${value}"},
             "splitLine": {"lineStyle": {"color": "#1e293b"}},
         },

@@ -847,7 +847,24 @@ class SequentialTradingPipeline:
                     paper = getattr(self.executor, "paper", None)
                     if paper is not None:
                         try:
-                            await asyncio.to_thread(paper.resolve_closed_markets)
+                            # NOT asyncio.to_thread: pm_trader.Engine opens its
+                            # sqlite3 connection (check_same_thread defaults to
+                            # True, and the installed package exposes no way to
+                            # override it) in whatever thread first constructs
+                            # PaperAdapter — the polybot-engine thread that also
+                            # runs this loop. to_thread hands the call to a
+                            # ThreadPoolExecutor worker thread instead, which
+                            # sqlite3 then refuses ("SQLite objects created in a
+                            # thread can only be used in that same thread"),
+                            # failing resolve_all() on every call. Calling it
+                            # directly keeps it on the connection's owning
+                            # thread; the resulting blocking network calls
+                            # (resolve_all() checks each open position's market
+                            # via the Gamma API) are accepted here the same way
+                            # _get_order_filled_shares()/_cancel_order() accept
+                            # blocking calls elsewhere in this sequential loop —
+                            # this only runs once per 15 minutes.
+                            paper.resolve_closed_markets()
                         except Exception as e:
                             self.log_func("PAPER-ERROR", "Engine", "resolve_all", {"error": str(e)})
 

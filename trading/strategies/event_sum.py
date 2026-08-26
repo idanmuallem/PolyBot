@@ -218,6 +218,8 @@ class EventSumStrategy(Strategy):
                     market.get("endDateIso") or market.get("endDate") or event.get("endDate")
                 ),
                 no_market_id=no_market_id,
+                condition_id=market.get("conditionId") or market.get("condition_id"),
+                slug=market.get("slug") or event.get("slug"),
             )
             legs.append((market_data, price))
 

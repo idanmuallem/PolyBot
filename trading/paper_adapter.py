@@ -25,6 +25,11 @@ except ImportError:
     PaperEngine = None
     PAPER_ENGINE_AVAILABLE = False
 
+# Rate-limit the "no slug/condition_id" skip warning per token_id so a
+# market missing these fields (a genuine edge case, not the common case)
+# doesn't flood the logs every time the pipeline re-evaluates it.
+_SKIP_WARNING_INTERVAL_SECONDS = 3600.0  # once per hour, per token
+
 
 class PaperAdapter:
     """Adapter between PolyBot execution and the pm_trader paper engine.
@@ -37,6 +42,7 @@ class PaperAdapter:
         self.engine: Optional[object] = None
         self._token_map: Dict[str, Tuple[str, str]] = {}  # token_id → (slug, outcome)
         self._token_map_path: Optional[Path] = None
+        self._skip_warned_at: Dict[str, float] = {}  # token_id → last "skipping paper fill" warning time
 
         # Positions cache — Engine.get_portfolio() makes one live HTTP call
         # per open position, and get_positions() can be called many times
@@ -127,7 +133,11 @@ class PaperAdapter:
         # Resolve the slug or condition_id for the Engine
         slug_or_id = slug or condition_id
         if not slug_or_id:
-            logger.warning(f"[PAPER] No slug or condition_id for token {token_id} — skipping paper fill")
+            now = time.time()
+            last_warned = self._skip_warned_at.get(token_id, 0.0)
+            if now - last_warned >= _SKIP_WARNING_INTERVAL_SECONDS:
+                self._skip_warned_at[token_id] = now
+                logger.warning(f"[PAPER] No slug or condition_id for token {token_id} — skipping paper fill")
             return False
 
         outcome = side.lower()  # "YES" → "yes", "NO" → "no"

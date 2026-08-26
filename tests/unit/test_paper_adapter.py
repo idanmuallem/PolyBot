@@ -53,6 +53,35 @@ class TestPaperAdapterBuySell:
         result = adapter.execute_sell("unknown_token", 5.0)
         assert result is False
 
+    def test_skip_warning_rate_limited_per_token(self, tmp_path, caplog):
+        """A market perpetually missing slug/condition_id (e.g. re-evaluated
+        every loop tick) must not flood the logs with one WARNING per call —
+        rate-limited to once per _SKIP_WARNING_INTERVAL_SECONDS per token."""
+        import logging
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=1000.0)
+
+        with caplog.at_level(logging.WARNING, logger="trading.paper_adapter"):
+            for _ in range(5):
+                result = adapter.execute_buy(
+                    slug=None, condition_id=None,
+                    token_id="tok_missing", side="YES", amount_usd=10.0,
+                )
+                assert result is False
+
+        skip_warnings = [r for r in caplog.records if "skipping paper fill" in r.message]
+        assert len(skip_warnings) == 1
+
+    def test_skip_warning_not_rate_limited_across_different_tokens(self, tmp_path, caplog):
+        import logging
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=1000.0)
+
+        with caplog.at_level(logging.WARNING, logger="trading.paper_adapter"):
+            adapter.execute_buy(slug=None, condition_id=None, token_id="tokA", side="YES", amount_usd=10.0)
+            adapter.execute_buy(slug=None, condition_id=None, token_id="tokB", side="YES", amount_usd=10.0)
+
+        skip_warnings = [r for r in caplog.records if "skipping paper fill" in r.message]
+        assert len(skip_warnings) == 2
+
     def test_token_map_populated_on_buy(self, tmp_path):
         adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=10000.0)
         # Mock the engine.buy to avoid real API calls
