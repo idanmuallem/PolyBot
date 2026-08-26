@@ -58,6 +58,22 @@ def test_take_profit_triggered():
     assert "TAKE-PROFIT" in log_levels
 
 
+def test_take_profit_logs_initial_price_for_per_share_pnl():
+    """The dashboard's Avg $/share (Closed) stat needs both entry
+    (initial_price) and exit (price) in the logged payload."""
+    pm, bridge, executor = _make_pm()
+    pos = _pos(pnl_ratio=0.25, token_id="take_tok", price=0.50)  # initial_price=0.40 (fixture default)
+    executor.get_open_positions.side_effect = [[pos], []]
+    executor.sell_position.return_value = True
+
+    payloads = []
+    pm.manage_portfolio(lambda level, asset_type, token_id, payload: payloads.append((level, payload)))
+
+    tp_payload = next(p for level, p in payloads if level == "TAKE-PROFIT")
+    assert tp_payload["initial_price"] == pytest.approx(0.40)
+    assert tp_payload["price"] == pytest.approx(0.50)
+
+
 def test_stop_loss_triggered():
     pm, bridge, executor = _make_pm()
     pos = _pos(pnl_ratio=-0.60, token_id="stop_tok")

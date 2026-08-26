@@ -306,6 +306,12 @@ class PortfolioManager:
         token_id = str(self._position_field(position, "token_id", "") or "")
         shares = float(self._position_field(position, "shares", 0.0) or 0.0)
         current_price = float(self._position_field(position, "current_price", 0.0) or 0.0)
+        # Entry price — needed (alongside the exit "price" above) so the
+        # dashboard's "Avg $/share (Closed)" stat can compute a genuine
+        # per-share delta (price - initial_price) rather than needing to
+        # reverse-engineer it from pnl_ratio, which isn't logged by every
+        # exit reason.
+        initial_price = float(self._position_field(position, "initial_price", 0.0) or 0.0)
         position_value = float(self._position_field(position, "value", shares * current_price) or 0.0)
 
         sold = self.executor.sell_position(token_id, shares, current_price, log_func)
@@ -315,6 +321,7 @@ class PortfolioManager:
             "threshold": threshold,
             "shares": shares,
             "price": current_price,
+            "initial_price": initial_price,
             "sold": sold,
             **extra,
         })

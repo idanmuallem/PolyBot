@@ -325,6 +325,41 @@ def get_trade_stats(db_path: str) -> dict:
     }
 
 
+def get_closed_trade_deltas(db_path: str) -> list:
+    """Per-share $ P&L (exit price - entry price) for every closed position,
+    across every exit reason PortfolioManager._exit_position() logs
+    (TAKE-PROFIT, STOP-LOSS, WANG-EDGE-DECAY, EV-CONVERGENCE) — not just the
+    take-profit/stop-loss subset get_trade_stats() uses for win/loss counts.
+
+    Needs both "price" (exit) and "initial_price" (entry) in the payload;
+    rows logged before initial_price was added to that payload won't have
+    it and are silently skipped, same as any other missing/malformed field.
+    """
+    try:
+        with _open_db(db_path) as conn:
+            rows = conn.execute(
+                "SELECT payload FROM hunt_history WHERE level IN "
+                "('TAKE-PROFIT','STOP-LOSS','WANG-EDGE-DECAY','EV-CONVERGENCE')"
+            ).fetchall()
+    except Exception:
+        return []
+
+    deltas = []
+    for (payload_raw,) in rows:
+        payload = _parse_payload_value(payload_raw)
+        if not isinstance(payload, dict):
+            continue
+        price = payload.get("price")
+        initial_price = payload.get("initial_price")
+        if price is None or initial_price is None:
+            continue
+        try:
+            deltas.append(float(price) - float(initial_price))
+        except (TypeError, ValueError):
+            continue
+    return deltas
+
+
 def get_equity_curve(db_path: str) -> pd.DataFrame:
     try:
         with _open_db(db_path) as conn:

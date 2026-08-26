@@ -345,20 +345,56 @@ def _render_portfolio_view() -> None:
 # Balance view
 # ---------------------------------------------------------------------------
 
+def _avg(values: list) -> float:
+    return round(sum(values) / len(values), 2) if values else 0.0
+
+
 def _render_balance_stats_row() -> None:
+    # Deliberately read cash/holdings from bridge state (refreshed every
+    # pipeline tick by sync_live_account_state()/_refresh_portfolio()) rather
+    # than calling executor.get_balance()/get_open_positions() directly here.
+    # Those route into PaperAdapter -> pm_trader.Engine, whose sqlite3
+    # connection is thread-affine to the polybot-engine background thread —
+    # calling it from Streamlit's own thread would hit the exact cross-thread
+    # crash fixed for resolve_closed_markets() (see trading/decision_pipeline.py).
+    is_paper_mode = not getattr(bridge, "live_trading", False)
+    cash = float(getattr(bridge, "current_balance", 0.0) or 0.0)
+    holdings = float(getattr(bridge, "open_position_value", 0.0) or 0.0)
+    balance = cash + holdings
+
+    # Total Deposits: paper mode has a stable, known constant (the account
+    # is never topped up mid-run) — use it directly rather than
+    # bridge.starting_balance, which is derived from the *most recent*
+    # balance snapshot on every process restart (see restore_runtime_state()
+    # in ui/data_manager.py), not the true original deposit. Live mode has
+    # no such constant to fall back on, so bridge.starting_balance is the
+    # best available approximation there — but it carries that same
+    # restart-drift caveat, AND doesn't account for multiple real-world
+    # deposits/withdrawals over an account's lifetime (no deposit ledger
+    # exists to track those). Both are known limitations, not fixed here.
+    if is_paper_mode:
+        total_deposits = float(wallet_ctx.config.paper_balance_usd)
+    else:
+        total_deposits = float(getattr(bridge, "starting_balance", 0.0) or 0.0)
+
     stats = data_manager.get_trade_stats(wallet_ctx.db_path)
+    closed_deltas = data_manager.get_closed_trade_deltas(wallet_ctx.db_path)
+    open_deltas = [
+        float(getattr(p, "current_price", 0.0) or 0.0) - float(getattr(p, "initial_price", 0.0) or 0.0)
+        for p in (getattr(bridge, "current_portfolio", None) or [])
+    ]
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Win Rate",     f"{float(stats.get('win_rate', 0.0)):.2f}%")
-    c2.metric("Total Trades", f"{int(stats.get('total_trades', 0))}")
-    c3.metric("Avg Win",      f"${float(stats.get('avg_win', 0.0)):,.2f}")
-    c4.metric("Avg Loss",     f"${float(stats.get('avg_loss', 0.0)):,.2f}")
+    c1.metric("Cash",           f"${cash:,.2f}")
+    c2.metric("Total Deposits", f"${total_deposits:,.2f}")
+    c3.metric("Holdings",       f"${holdings:,.2f}")
+    c4.metric("Balance",        f"${balance:,.2f}")
 
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("YES Trades",    f"{int(stats.get('total_yes_trades', 0))}")
-    c6.metric("YES Win Rate",  f"{float(stats.get('yes_win_rate', 0.0)):.2f}%")
-    c7.metric("NO Trades",     f"{int(stats.get('total_no_trades', 0))}")
-    c8.metric("NO Win Rate",   f"{float(stats.get('no_win_rate', 0.0)):.2f}%")
+    c5.metric("Total Trades",             f"{int(stats.get('total_trades', 0))}")
+    c6.metric("Avg $/share (Closed)",     f"${_avg(closed_deltas):,.2f}")
+    c7.metric("Avg $/share (Open)",       f"${_avg(open_deltas):,.2f}")
+    c8.metric("Avg $/share (Combined)",   f"${_avg(closed_deltas + open_deltas):,.2f}")
 
 
 def _render_balance_view() -> None:

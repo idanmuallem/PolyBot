@@ -147,6 +147,55 @@ def test_get_trade_stats_counts_sides(db):
     assert stats["total_no_trades"] == 1
 
 
+# ── get_closed_trade_deltas ───────────────────────────────────────────────────
+
+def test_get_closed_trade_deltas_empty_db(db):
+    assert dm.get_closed_trade_deltas(db_path=db) == []
+
+
+def test_get_closed_trade_deltas_computes_price_minus_initial_price(db):
+    bridge = DataBridge()
+    dm.log_event(bridge, "TAKE-PROFIT", "Crypto::BTC", "tok1",
+                 {"price": 0.65, "initial_price": 0.50, "shares": 10}, db_path=db)
+    dm.log_event(bridge, "STOP-LOSS", "Crypto::ETH", "tok2",
+                 {"price": 0.30, "initial_price": 0.45, "shares": 5}, db_path=db)
+
+    deltas = sorted(dm.get_closed_trade_deltas(db_path=db))
+
+    assert deltas == pytest.approx([-0.15, 0.15])
+
+
+def test_get_closed_trade_deltas_includes_all_exit_reasons(db):
+    bridge = DataBridge()
+    for level in ("TAKE-PROFIT", "STOP-LOSS", "WANG-EDGE-DECAY", "EV-CONVERGENCE"):
+        dm.log_event(bridge, level, "Crypto::BTC", "tok1",
+                     {"price": 0.55, "initial_price": 0.50}, db_path=db)
+
+    deltas = dm.get_closed_trade_deltas(db_path=db)
+
+    assert len(deltas) == 4
+    assert all(d == pytest.approx(0.05) for d in deltas)
+
+
+def test_get_closed_trade_deltas_ignores_non_exit_levels(db):
+    bridge = DataBridge()
+    dm.log_event(bridge, "DRY-RUN", "Crypto::BTC", "tok1",
+                 {"price": 0.55, "initial_price": 0.50}, db_path=db)
+    dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok1",
+                 {"price": 0.55, "initial_price": 0.50}, db_path=db)
+
+    assert dm.get_closed_trade_deltas(db_path=db) == []
+
+
+def test_get_closed_trade_deltas_skips_rows_missing_initial_price(db):
+    """Rows logged before initial_price was added to the exit payload."""
+    bridge = DataBridge()
+    dm.log_event(bridge, "TAKE-PROFIT", "Crypto::BTC", "tok1",
+                 {"price": 0.65, "shares": 10}, db_path=db)  # no initial_price
+
+    assert dm.get_closed_trade_deltas(db_path=db) == []
+
+
 # ── process_logs_for_display: Phase 7 analytics columns ──────────────────────
 
 def test_display_table_surfaces_wang_and_strategy_columns(db):
