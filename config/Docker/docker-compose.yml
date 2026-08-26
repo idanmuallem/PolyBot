@@ -1,14 +1,17 @@
 services:
   polybot:
-    build: .
+    build:
+      context: ../..                 # repo root — this file lives in config/Docker/
+      dockerfile: config/Docker/Dockerfile
     container_name: polybot
     ports:
       - "8501:8501"
     env_file:
-      - config/.env
+      - ../.env                      # config/.env, relative to config/Docker/
     environment:
       STREAMLIT_SERVER_FILE_WATCHER_TYPE: poll
     volumes:
-      - ./:/app
-      - ./trades.db:/app/trades.db
+      - ../..:/app
+      - ../../trades.db:/app/trades.db
+      - ../../paper_trading:/app/paper_trading
     restart: unless-stopped

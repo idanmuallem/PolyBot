@@ -51,8 +51,11 @@ class PaperAdapter:
             return
 
         if data_dir is None:
-            # Co-locate with trades.db
-            data_dir = os.getenv("TRADES_DB_PATH", "trades.db")
+            # Co-locate with trades.db. Default matches ui/dashboard.py's
+            # TRADES_DB_PATH default (/app/trades.db) so this resolves to
+            # /app/paper_trading regardless of process CWD — the deploy
+            # volume mount targets that exact path (see deploy.yml).
+            data_dir = os.getenv("TRADES_DB_PATH", "/app/trades.db")
             data_dir = str(Path(data_dir).parent / "paper_trading")
 
         if initial_balance is None:

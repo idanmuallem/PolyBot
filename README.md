@@ -357,7 +357,10 @@ The project ships with a Dockerfile and a GitHub Actions workflow for one-comman
 docker compose -f config/Docker/docker-compose.yml up --build
 ```
 
-Mounts `config/.env` for credentials and persists `trades.db` via a volume.
+Mounts `config/.env` for credentials and persists `trades.db` via a volume. Paper
+trading state (the `pm_trader` engine's own SQLite DB plus the token→slug
+mapping — see `trading/paper_adapter.py`) lives in `./paper_trading/` and is
+persisted the same way, so paper positions/balance survive a container restart.
 
 ### GitHub Actions (CI/CD)
 
@@ -367,6 +370,14 @@ Pushing to `main` triggers `.github/workflows/deploy.yml`:
 2. Pushes to Amazon ECR (`eu-north-1`)
 3. Starts the EC2 instance if stopped
 4. Deploys via AWS SSM (`docker compose pull && up -d`)
+
+The deploy step stops/removes the old container and prunes the Docker filesystem
+before starting the new one, so anything not explicitly volume-mounted is wiped
+on every push. Two host paths are mounted into the container to survive that:
+`/home/ec2-user/trades.db` → `/app/trades.db` and `/home/ec2-user/paper_trading`
+→ `/app/paper_trading` (the latter holds the paper engine's positions/balance
+and the token→slug map — losing it silently resets the paper equity curve and
+orphans open paper positions on every deploy).
 
 Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 
@@ -395,7 +406,7 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `STOP_LOSS_PCT` | `-0.50` | Close position at -50% PnL |
 | `MIN_HOLD_EV` | `-0.10` | Close position if re-evaluated EV drops below this |
 | `ENGINE_LOOP_DELAY` | `2.0` | Seconds between scan cycles |
-| `TRADES_DB_PATH` | `/app/trades.db` | SQLite database path (single-wallet mode) |
+| `TRADES_DB_PATH` | `/app/trades.db` | SQLite database path (single-wallet mode). Also derives the paper trading data directory as `<parent of this path>/paper_trading` (e.g. `/app/paper_trading`) — must line up with whatever host directory is volume-mounted to that container path, or paper positions/balance/token map won't survive a redeploy |
 | `WALLET_CONFIG_PATH` | — | Path to a wallet `config.json`; if set, overrides `.env`-based config for that wallet |
 | `PRICING_MODE` | `wang` | `wang` (calibrated fair value) or `legacy` (brain's raw probability, no calibration) |
 | `WANG_LAMBDA` | `-0.75` | Entry-side Wang Transform distortion (`BaseBrain.evaluate()`); negative = risk-averse, `0.0` disables it |

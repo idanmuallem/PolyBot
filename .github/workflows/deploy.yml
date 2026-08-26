@@ -73,5 +73,7 @@ jobs:
             "docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest",
             "touch /home/ec2-user/trades.db",
             "chmod 666 /home/ec2-user/trades.db",
-            "docker run -d --name polybot --restart always -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+            "mkdir -p /home/ec2-user/paper_trading",
+            "chmod 777 /home/ec2-user/paper_trading",
+            "docker run -d --name polybot --restart always -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db -v /home/ec2-user/paper_trading:/app/paper_trading --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
           ]'

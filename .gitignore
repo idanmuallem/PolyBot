@@ -1,5 +1,6 @@
 ﻿.env
 trades.db
+paper_trading/
 __pycache__/
 .venv/
 *.pyc
