@@ -520,16 +520,27 @@ class TradeExecutor:
         self, legs: List[Dict[str, Any]], log_func: Callable,
         asset_type: str, group_id: Optional[str], strategy_tag: str,
     ) -> Dict[str, Any]:
-        """Dry-run/paper simulation: every leg fills completely, same as
-        execute_trade()'s existing dry-run/no-client behavior — no real
-        orders are placed, but the group structure is still logged clearly.
+        """Dry-run/paper simulation: attempt every leg through execute_trade()
+        (which routes to the paper engine, walking its real order book), and
+        only record a leg as filled if that attempt genuinely succeeded.
+
+        Previously this recorded every leg's *requested* shares as filled
+        unconditionally, ignoring execute_trade()'s return value entirely —
+        so a leg whose paper buy failed outright (missing slug/condition_id,
+        no liquidity, insufficient cash, ...) was reported as a full fill
+        anyway. That fabricated fill data fed everything downstream
+        (arb_sets, surplus, and the group-level profitability
+        re-verification in decision_pipeline.py's _execute_strategy_group),
+        making it impossible to tell a genuine complementary-set fill from
+        one that never actually happened in the paper engine's own ledger.
         """
         fills: Dict[str, float] = {}
+        unfilled: List[str] = []
         for leg in legs:
             token_id = str(leg["token_id"])
             shares = float(leg["shares"])
             price = float(leg["price"])
-            self.execute_trade(
+            executed = self.execute_trade(
                 token_id=token_id,
                 current_poly_price=price,
                 shares=shares,
@@ -541,22 +552,38 @@ class TradeExecutor:
                 condition_id=leg.get("condition_id"),
                 slug=leg.get("slug"),
             )
-            fills[token_id] = shares
-            self._record_strategy_trade(strategy_tag)
+            if executed:
+                fills[token_id] = shares
+                self._record_strategy_trade(strategy_tag)
+            else:
+                unfilled.append(token_id)
 
-        arb_sets = min(fills.values()) if fills else 0.0
-        surplus = {tid: round(s - arb_sets, 4) for tid, s in fills.items() if s > arb_sets}
+        # A genuine complementary-set arbitrage needs every leg — if even
+        # one leg is entirely unfilled, there is no guaranteed structure at
+        # all (mirrors _execute_live_arbitrage_group's identical rule for
+        # the live-order-book path): min() over only the legs present in
+        # `fills` would otherwise treat the legs that DID fill as a
+        # "complete" matched set even though the outcome that never filled
+        # could still be the one that wins, leaving pure directional risk
+        # on whatever did fill.
+        if unfilled:
+            arb_sets = 0.0
+            surplus = {}
+        else:
+            arb_sets = min(fills.values()) if fills else 0.0
+            surplus = {tid: round(s - arb_sets, 4) for tid, s in fills.items() if s > arb_sets}
 
         log_func("ARBITRAGE-FILL", asset_type, group_id or "group", {
-            "reason": "dry_run_full_fill_simulated",
+            "reason": "dry_run_fill_simulated",
             "group_id": group_id,
             "n_legs": len(legs),
             "fills": fills,
+            "unfilled": unfilled,
             "arb_sets": arb_sets,
             "surplus": surplus,
         })
 
-        return {"success": True, "arb_sets": arb_sets, "fills": fills, "unfilled": [], "surplus": surplus}
+        return {"success": not unfilled, "arb_sets": arb_sets, "fills": fills, "unfilled": unfilled, "surplus": surplus}
 
     async def _execute_live_arbitrage_group(
         self, legs: List[Dict[str, Any]], timeout_seconds: float, log_func: Callable,

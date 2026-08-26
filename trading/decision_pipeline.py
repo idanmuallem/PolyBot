@@ -22,6 +22,19 @@ from polymarket import PolymarketClient
 from trading.strategies import EventSumStrategy, Strategy
 
 
+# Minimum guaranteed edge (as a fraction of the guaranteed payout) an
+# arbitrage group's REAL fills must clear after real costs before the
+# group is kept, in _execute_strategy_group(). Deliberately hardcoded, not
+# a config value: this is a correctness floor for what "genuinely
+# profitable" means, not a tunable risk knob like MIN_EV (which is a
+# single-market probabilistic-EV threshold — reusing it here, at its
+# ~0.35 default, would make real arbitrage opportunities — typically a
+# low single-digit percent edge — effectively never fire). 2% matches
+# EventSumStrategy's own scan-time min_edge default, so the execution-time
+# floor doesn't contradict the strategy's own notion of "worth trying."
+_MIN_ARBITRAGE_MARGIN = 0.02
+
+
 def sync_live_account_state(bridge, executor, portfolio_manager, log_func):
     """Refresh live positions and collateral balance into bridge state.
 
@@ -385,10 +398,28 @@ class SequentialTradingPipeline:
         Each leg is placed as a limit order and given up to
         config.arbitrage_order_timeout_seconds to fill (see
         TradeExecutor.execute_arbitrage_group). Best-effort, not atomic: if
-        every leg gets at least one fill the group is kept (surplus fills
-        beyond the smallest leg become bonus directional exposure); if any
-        leg gets zero fills, the rest are cancelled — real atomicity would
-        require a settlement layer this pipeline doesn't have.
+        every leg gets at least one fill the group is kept; if any leg gets
+        zero fills, the rest are cancelled — real atomicity would require a
+        settlement layer this pipeline doesn't have.
+
+        Whatever comes back is then re-verified against REAL fill data
+        before anything is kept, since neither of the above guarantees a
+        genuinely profitable complementary set:
+        - Group-level profit check: real per-share cost
+          (bet_amount_usd / shares actually filled) vs the guaranteed $1
+          payout, required to clear _MIN_ARBITRAGE_MARGIN. If it doesn't,
+          everything bought is sold back — the strategy's own scan-time
+          edge is a stale pre-execution estimate, not a guarantee.
+        - Surplus trim: every leg is sized as a fixed DOLLAR amount, not a
+          fixed SHARE count, so thin books on illiquid legs routinely fill
+          unevenly for the same spend. Shares beyond arb_sets (the
+          smallest leg's fill) aren't part of the guaranteed structure and
+          are sold back immediately, even when the matched portion is
+          genuinely profitable.
+        - Incomplete-group unwind: if even one leg never fills at all,
+          arb_sets is 0 (no complementary set exists without every leg) and
+          whatever DID fill on the other legs is sold back in full rather
+          than held as naked, uncompensated directional exposure.
         """
         if not signals:
             return
@@ -492,10 +523,106 @@ class SequentialTradingPipeline:
             strategy_tag="arbitrage",
         )
 
+        fills: dict = dict(result.get("fills") or {})
+        arb_sets = float(result.get("arb_sets", 0.0) or 0.0)
+
+        # Group-level guaranteed-profit re-verification against REAL fills.
+        # EventSumStrategy's own scan-time edge check (sum of lastTradePrice
+        # snapshots vs a flat fee estimate) is a stale, pre-execution
+        # estimate — it never re-confirms against what was actually filled,
+        # and every leg is sized as a FIXED DOLLAR AMOUNT
+        # (signal.bet_amount_usd), not a fixed share count, so on the thin
+        # order books typical of these long-shot outcome markets, the same
+        # dollar spend buys unequal share counts per leg. bet_amount_usd/
+        # filled_shares is the REAL, fee-and-slippage-inclusive cost per
+        # share (no separate estimate needed — it's what was actually
+        # spent for what was actually received), so this checks the thing
+        # that actually determines whether the trade is locked-in
+        # profitable, not a theoretical proxy for it.
+        if arb_sets > 0:
+            per_leg_unit_cost: dict = {}
+            for signal in signals:
+                tid = self._leg_token_id(signal)
+                filled = fills.get(tid, 0.0)
+                if filled > 0:
+                    per_leg_unit_cost[tid] = float(signal.bet_amount_usd) / filled
+
+            guaranteed_payout = arb_sets * 1.0
+            guaranteed_cost = sum(unit_cost * arb_sets for unit_cost in per_leg_unit_cost.values())
+            net_edge = guaranteed_payout - guaranteed_cost
+
+            if net_edge < guaranteed_payout * _MIN_ARBITRAGE_MARGIN:
+                # Real fills don't clear a genuine margin after real costs.
+                # Keeping this would just be naked directional risk on
+                # whichever illiquid long-shot outcomes happened to fill —
+                # not arbitrage. Unwind everything bought instead of
+                # holding it.
+                for signal in signals:
+                    tid = self._leg_token_id(signal)
+                    filled = fills.get(tid, 0.0)
+                    if filled > 0:
+                        self.executor.sell_position(tid, filled, signal.price, tagged_log)
+                        self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
+                self.spent_today = float(self.budget_manager.total_spent_today)
+                self._set_spend(self.spent_today)
+
+                tagged_log("REJECTED", asset_type, group_id, {
+                    "reason": "not_profitable_after_real_fills",
+                    "group_id": group_id,
+                    "n_legs": len(signals),
+                    "arb_sets": arb_sets,
+                    "guaranteed_cost": round(guaranteed_cost, 4),
+                    "guaranteed_payout": round(guaranteed_payout, 4),
+                    "net_edge": round(net_edge, 4),
+                    "required_margin": _MIN_ARBITRAGE_MARGIN,
+                })
+                self._exhausted_arb_groups.add(group_id)
+                return
+
+        # Trim every leg down to arb_sets (the guaranteed matched set).
+        # Anything beyond it is naked, one-sided exposure — not part of the
+        # guaranteed structure (see TradeExecutor.execute_arbitrage_group's
+        # docstring) — sold back immediately rather than kept as an
+        # unintended directional bet. This single rule covers two distinct
+        # cases the same way:
+        #   - arb_sets > 0 and the group passed the profitability check
+        #     above: trims real surplus from a leg whose illiquid book
+        #     happened to fill more for the same fixed dollar spend.
+        #   - arb_sets == 0 because at least one leg in the group never
+        #     filled at all: every OTHER leg's fill (excess over 0) gets
+        #     sold back in full. A complementary-set arb needs every leg —
+        #     if one outcome never got bought, whatever filled on the
+        #     others is pure directional risk on markets that resolve
+        #     however they resolve, not a guaranteed structure, regardless
+        #     of how "good" those individual fills looked.
+        unwound_incomplete_group = False
+        for signal in signals:
+            tid = self._leg_token_id(signal)
+            filled = fills.get(tid, 0.0)
+            excess = round(filled - arb_sets, 4)
+            if excess > 0:
+                self.executor.sell_position(tid, excess, signal.price, tagged_log)
+                if arb_sets <= 0:
+                    unwound_incomplete_group = True
+                    self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
+                fills[tid] = arb_sets
+
+        if unwound_incomplete_group:
+            self.spent_today = float(self.budget_manager.total_spent_today)
+            self._set_spend(self.spent_today)
+            tagged_log("REJECTED", asset_type, group_id, {
+                "reason": "group_incomplete_unwound_partial_fills",
+                "group_id": group_id,
+                "n_legs": len(signals),
+                "unfilled": result.get("unfilled", []),
+            })
+            self._exhausted_arb_groups.add(group_id)
+            return
+
         executed_legs = 0
         for signal in signals:
             token_id = self._leg_token_id(signal)
-            filled_shares = float(result["fills"].get(token_id, 0.0))
+            filled_shares = float(fills.get(token_id, 0.0))
             executed = filled_shares > 0.0
 
             tagged_log("STRATEGY-LEG", signal.market.asset_type, token_id, {
@@ -512,8 +639,7 @@ class SequentialTradingPipeline:
 
             if executed:
                 executed_legs += 1
-                spent_usd = filled_shares * float(signal.price)
-                self.budget_manager.record_trade(spent_usd, strategy_tag="arbitrage")
+                self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
                 self.spent_today = float(self.budget_manager.total_spent_today)
                 self._set_spend(self.spent_today)
 
@@ -523,8 +649,8 @@ class SequentialTradingPipeline:
             "n_legs": len(signals),
             "executed_legs": executed_legs,
             "success": result["success"],
-            "arb_sets": result["arb_sets"],
-            "surplus": result["surplus"],
+            "arb_sets": arb_sets,
+            "surplus": {},  # any real surplus was trimmed above
             "edge": round(signals[0].edge, 4),
             "total_cost": round(total_cost, 4),
         })

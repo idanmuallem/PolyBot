@@ -2,17 +2,19 @@
 model-driven trades, tagged with strategy_type for separate tracking."""
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from core.bridge import DataBridge
+from core.models import MarketData
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
 from polymarket import PolymarketClient, PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
 from trading.risk_manager import PortfolioManager
+from trading.strategies.base import StrategySignal
 
 
 def _underpriced_event(event_id="evt1", n=3, price=0.30, expiry_days=None, title="Test Multi-Outcome Event"):
@@ -69,6 +71,17 @@ def _make_pipeline(balance=100.0, config=None):
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
         ctx.executor = TradeExecutor(config=ctx.config)
+        # These tests exercise arbitrage-group execution mechanics (budget
+        # gating, TTE filtering, scan ordering, ...) with MarketData
+        # fixtures that don't carry a slug/condition_id — not real
+        # paper-engine fidelity. A real PaperAdapter (constructed
+        # unconditionally by TradeExecutor.__init__ whenever pm_trader is
+        # importable) would now honestly report those buys as failed (see
+        # trading/executor.py's dry-run branches and
+        # _simulate_full_fill_arbitrage_group's fill accounting), which
+        # isn't what these tests are about. See tests/unit/test_executor.py's
+        # _make_executor() for the same rationale.
+        ctx.executor.paper = None
         ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
@@ -375,3 +388,149 @@ async def test_no_strategies_registered_is_a_noop():
         await pipeline._stage_strategy_scan()
 
     mock_fetch.assert_not_called()
+
+
+# ── Group-level guaranteed-profit re-verification against real fills ─────────
+#
+# EventSumStrategy.scan() only checks profitability once, against a stale
+# lastTradePrice snapshot with a flat fee estimate — never re-verified
+# against what was actually filled. These tests exercise
+# _execute_strategy_group() directly, with TradeExecutor.execute_arbitrage_group
+# mocked to return a crafted (fills, arb_sets, unfilled) result, so the
+# post-fill verification/unwind logic can be tested independently of
+# whatever a real (or simulated) order book happens to return.
+
+_FAKE_ARBITRAGE_STRATEGY = SimpleNamespace(strategy_type="arbitrage")
+
+
+def _signal(token_id, price, bet_amount_usd=1.0, group_id="event_sum:evt1", edge=0.10):
+    market = MarketData(
+        market_id=token_id,
+        asset_type="Arbitrage::EventSum",
+        strike_price=0.0,
+        question=f"Outcome {token_id}?",
+        market_name=f"Test Event - {token_id}",
+        initial_price=price,
+        volume=100_000.0,
+        no_market_id=f"{token_id}_no",
+    )
+    return StrategySignal(
+        market=market, side="YES", price=price, bet_amount_usd=bet_amount_usd,
+        strategy_type="arbitrage", reasoning="test", group_id=group_id, edge=edge,
+    )
+
+
+async def _run_group(pipeline, signals, arb_result):
+    """Run _execute_strategy_group with execute_arbitrage_group's result
+    controlled directly, and sell_position spied on (but still a real call
+    through to the dry-run/no-paper-adapter path, so it returns True)."""
+    group_id = signals[0].group_id
+    with patch.object(pipeline.executor, "execute_arbitrage_group", new=AsyncMock(return_value=arb_result)), \
+         patch.object(pipeline.executor, "sell_position", wraps=pipeline.executor.sell_position) as mock_sell:
+        await pipeline._execute_strategy_group(_FAKE_ARBITRAGE_STRATEGY, group_id, signals)
+    return mock_sell
+
+
+@pytest.mark.asyncio
+async def test_arbitrage_rejects_group_not_profitable_after_real_fills():
+    """Theoretical scan-time edge (2 legs at $0.49 = $0.98, ~2% before
+    fees) can still lose money once real fills are worse than requested —
+    here each $1 leg only received 1.8 shares (real cost ~$0.556/share)
+    instead of the ~2.04 shares $1/$0.49 implies, for a real -$0.20 net."""
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    signals = [_signal("tokA", 0.49), _signal("tokB", 0.49)]
+
+    arb_result = {
+        "success": True, "arb_sets": 1.8,
+        "fills": {"tokA": 1.8, "tokB": 1.8},
+        "unfilled": [], "surplus": {},
+    }
+    mock_sell = await _run_group(pipeline, signals, arb_result)
+
+    assert mock_sell.call_count == 2
+    sold_shares = {call.args[0]: call.args[1] for call in mock_sell.call_args_list}
+    assert sold_shares == {"tokA": 1.8, "tokB": 1.8}
+
+    assert not [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert any(
+        c["level"] == "REJECTED" and c["payload"].get("reason") == "not_profitable_after_real_fills"
+        for c in log_calls
+    )
+    assert "event_sum:evt1" not in pipeline._filled_arb_groups
+    assert "event_sum:evt1" in pipeline._exhausted_arb_groups
+
+
+@pytest.mark.asyncio
+async def test_arbitrage_executes_when_genuinely_profitable_after_real_fills():
+    """2 legs at $0.40 (healthy edge), real fills matching what was
+    requested (2.5 shares/$1 each) — should execute, not unwind."""
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    signals = [_signal("tokA", 0.40), _signal("tokB", 0.40)]
+
+    arb_result = {
+        "success": True, "arb_sets": 2.5,
+        "fills": {"tokA": 2.5, "tokB": 2.5},
+        "unfilled": [], "surplus": {},
+    }
+    mock_sell = await _run_group(pipeline, signals, arb_result)
+
+    mock_sell.assert_not_called()
+    leg_entries = [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert len(leg_entries) == 2
+    assert all(c["payload"]["executed"] for c in leg_entries)
+    assert not [c for c in log_calls if c["level"] == "REJECTED"]
+    assert "event_sum:evt1" in pipeline._filled_arb_groups
+
+
+@pytest.mark.asyncio
+async def test_arbitrage_trims_surplus_when_fills_are_unequal_but_profitable():
+    """2 legs at $0.30/$0.35 (healthy edge), but real fills come back
+    unequal (5.0 vs 2.5 shares for the same $1 spend, as thin books on
+    illiquid long-shot outcomes would produce) — the matched 2.5-share set
+    is genuinely profitable, so it executes, but the 2.5-share surplus on
+    the overfilled leg is naked exposure and must be sold back, not kept."""
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    signals = [_signal("tokA", 0.30), _signal("tokB", 0.35)]
+
+    arb_result = {
+        "success": True, "arb_sets": 2.5,
+        "fills": {"tokA": 5.0, "tokB": 2.5},
+        "unfilled": [], "surplus": {"tokA": 2.5},
+    }
+    mock_sell = await _run_group(pipeline, signals, arb_result)
+
+    mock_sell.assert_called_once()
+    assert mock_sell.call_args.args[0] == "tokA"
+    assert mock_sell.call_args.args[1] == 2.5
+    leg_entries = {c["token_id"]: c for c in log_calls if c["level"] == "STRATEGY-LEG"}
+    assert leg_entries["tokA"]["payload"]["shares"] == 2.5  # trimmed, not the raw 5.0 fill
+    assert leg_entries["tokB"]["payload"]["shares"] == 2.5
+    assert "event_sum:evt1" in pipeline._filled_arb_groups
+
+
+@pytest.mark.asyncio
+async def test_arbitrage_unwinds_when_group_incomplete():
+    """2 legs, only one fills at all (the other unfilled) — arb_sets is 0
+    (no complementary set exists without every leg), so the leg that DID
+    fill must be sold back entirely, not held as a naked one-sided bet."""
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    signals = [_signal("tokA", 0.30), _signal("tokB", 0.35)]
+
+    arb_result = {
+        "success": False, "arb_sets": 0.0,
+        "fills": {"tokA": 3.0},
+        "unfilled": ["tokB"], "surplus": {},
+    }
+    mock_sell = await _run_group(pipeline, signals, arb_result)
+
+    mock_sell.assert_called_once()
+    assert mock_sell.call_args.args[0] == "tokA"
+    assert mock_sell.call_args.args[1] == 3.0
+
+    assert not [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert any(
+        c["level"] == "REJECTED" and c["payload"].get("reason") == "group_incomplete_unwound_partial_fills"
+        for c in log_calls
+    )
+    assert "event_sum:evt1" not in pipeline._filled_arb_groups
+    assert "event_sum:evt1" in pipeline._exhausted_arb_groups
