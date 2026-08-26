@@ -266,7 +266,7 @@ def get_trade_stats(db_path: str) -> dict:
     try:
         with _open_db(db_path) as conn:
             df = pd.read_sql_query(
-                "SELECT level, payload FROM hunt_history WHERE level IN ('LIVE-TRADE','DRY-RUN','PAPER-TRADE','AUTO-TRADE','TAKE-PROFIT','STOP-LOSS')",
+                "SELECT level, payload FROM hunt_history WHERE level IN ('LIVE-TRADE','DRY-RUN','PAPER-TRADE','TAKE-PROFIT','STOP-LOSS')",
                 conn,
             )
     except Exception:
@@ -275,7 +275,12 @@ def get_trade_stats(db_path: str) -> dict:
     if df.empty:
         return _empty
 
-    EXEC_LEVELS = {"LIVE-TRADE", "DRY-RUN", "PAPER-TRADE", "AUTO-TRADE"}
+    # One row per genuine execution. AUTO-TRADE is deliberately excluded:
+    # evaluate_and_execute() logs AUTO-TRADE immediately before calling
+    # execute_trade(), which logs exactly one of these three for the same
+    # trade — counting both double-counted every real trade (see
+    # trading/executor.py: evaluate_and_execute() then execute_trade()).
+    EXEC_LEVELS = {"LIVE-TRADE", "DRY-RUN", "PAPER-TRADE"}
     total_trades = yes_trades = no_trades = 0
     yes_wins = no_wins = yes_losses = no_losses = 0
     realized_win: list = []

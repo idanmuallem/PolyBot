@@ -430,11 +430,19 @@ def _render_dashboard_snapshot(view_name: str):
     now_ts = time.time()
     last_sync = float(getattr(bridge, "last_balance_sync_at", 0.0) or 0.0)
     if (now_ts - last_sync) >= 15.0:
-        # Non-blocking: returns cached value and kicks off background refresh.
-        live_balance, live_balance_ok = _fetch_live_balance()
-        if live_balance > 0.0:
-            bridge.current_balance = float(live_balance)
-            bridge.balance_connection_error = not live_balance_ok
+        if bridge.live_trading:
+            # Non-blocking: returns cached value and kicks off background refresh.
+            live_balance, live_balance_ok = _fetch_live_balance()
+            if live_balance > 0.0:
+                bridge.current_balance = float(live_balance)
+                bridge.balance_connection_error = not live_balance_ok
+        # else: dry-run/paper mode. Don't touch bridge.current_balance here —
+        # the paper pipeline keeps it in sync with the paper engine's actual
+        # cash via _set_cash() in decision_pipeline.py. Overwriting it with
+        # the real wallet balance was causing the Cash figure to flicker
+        # between the two. Also skip the live-balance fetch entirely: it's
+        # never used while in dry-run, so there's no reason to keep hitting
+        # the real Polymarket API for it every 15s.
         bridge.last_balance_sync_at = now_ts
 
     current_token = str(getattr(bridge, "current_token_id", ""))

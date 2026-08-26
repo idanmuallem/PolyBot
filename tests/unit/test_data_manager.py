@@ -147,6 +147,21 @@ def test_get_trade_stats_counts_sides(db):
     assert stats["total_no_trades"] == 1
 
 
+def test_get_trade_stats_does_not_double_count_auto_trade(db):
+    """evaluate_and_execute() logs AUTO-TRADE immediately before calling
+    execute_trade(), which logs exactly one of DRY-RUN/PAPER-TRADE/LIVE-TRADE
+    for the same trade. AUTO-TRADE must not also be counted, or every real
+    trade is counted twice."""
+    bridge = DataBridge()
+    dm.log_event(bridge, "AUTO-TRADE", "Crypto::BTC", "tok_yes",
+                 {"side": "YES", "price": 0.5, "shares": 2}, db_path=db)
+    dm.log_event(bridge, "DRY-RUN", "Crypto::BTC", "tok_yes",
+                 {"side": "YES", "price": 0.5, "shares": 2}, db_path=db)
+
+    stats = dm.get_trade_stats(db_path=db)
+    assert stats["total_trades"] == 1
+
+
 # ── get_closed_trade_deltas ───────────────────────────────────────────────────
 
 def test_get_closed_trade_deltas_empty_db(db):
