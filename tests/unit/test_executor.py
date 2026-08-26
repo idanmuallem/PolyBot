@@ -125,6 +125,28 @@ def test_daily_limit_blocks_trade():
     assert "RISK" in log_calls
 
 
+def test_global_daily_limit_blocks_trade_even_under_strategy_allowance():
+    """Belt-and-suspenders: a generous per-strategy crypto_max_daily_trades
+    must not let trades continue past the account-wide max_daily_trades
+    ceiling."""
+    executor = _make_executor(max_daily_trades=2, crypto_max_daily_trades=200)
+    executor.trade_count_today = 2  # at the global ceiling, strategy bucket untouched
+    market = _valid_market()
+
+    log_calls = []
+    result = executor.evaluate_and_execute(
+        market=market,
+        fair_value=0.75,
+        ev=0.50,
+        current_poly_price=0.50,
+        bet_amount_usd=2.0,
+        side="YES",
+        log_func=lambda level, *a, **kw: log_calls.append(level),
+    )
+    assert result is False
+    assert "RISK" in log_calls
+
+
 # ── Price bounds ──────────────────────────────────────────────────────────────
 
 def test_price_below_floor_rejected():

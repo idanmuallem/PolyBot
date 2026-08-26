@@ -35,7 +35,7 @@ class DataBridge:
         self.current_portfolio = []
         self.open_position_value = 0.0
         self.open_positions_value = 0.0
-        self.total_pnl = 0.0
+        self.unrealized_pnl = 0.0
         self.event_count = 0
         self.level_counts = defaultdict(int)
         self.ev_samples = []

@@ -1,6 +1,7 @@
 """Integration: strategy signals flow through the same executor as
 model-driven trades, tagged with strategy_type for separate tracking."""
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -160,6 +161,58 @@ async def test_insufficient_cash_rejects_whole_group():
         for c in log_calls
     )
     assert pipeline.budget_manager.total_spent_today == 0.0
+
+
+@pytest.mark.asyncio
+async def test_already_held_group_is_skipped_not_rebought():
+    """Restart-safety: _filled_arb_groups (in-memory) resets on every
+    process restart, but real holdings — reflected in bridge.current_portfolio
+    — persist across restarts. A group with a leg already in the portfolio
+    must be skipped even on a "fresh" pipeline instance that has never seen
+    this group_id before, or a redeploy re-buys everything it already
+    holds (the confirmed root cause of a runaway-trade-rate incident)."""
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    event = _underpriced_event(n=3)
+
+    # Simulate "already holding" one leg of this group, as if positions
+    # persisted across a restart that wiped _filled_arb_groups.
+    held = SimpleNamespace(asset_id="evt1_tok0")
+    bridge.current_portfolio = [held]
+
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[event]):
+        await pipeline._stage_strategy_scan()
+
+    assert not [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert any(
+        c["level"] == "SCAN-SKIP" and c["payload"].get("reason") == "already_owned_in_portfolio"
+        for c in log_calls
+    )
+    assert pipeline.budget_manager.total_spent_today == 0.0
+    assert "event_sum:evt1" in pipeline._filled_arb_groups
+
+
+@pytest.mark.asyncio
+async def test_global_daily_trade_limit_rejects_group_even_within_strategy_allowance():
+    """Belt-and-suspenders: a generous per-strategy arbitrage_max_daily_trades
+    must not let a single group blow past the account-wide max_daily_trades
+    ceiling."""
+    config = TradingConfig(
+        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        daily_limit_usd=1500.0, max_bet_size_usd=3.0,
+        max_daily_trades=2,               # global ceiling: only 2 trades/day
+        arbitrage_max_daily_trades=200,   # strategy's own bucket allows way more
+        min_trading_balance=1.0,
+    )
+    pipeline, bridge, log_calls = _make_pipeline(balance=1000.0, config=config)
+
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[_underpriced_event(n=3)]):
+        await pipeline._stage_strategy_scan()
+
+    assert not [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert any(
+        c["level"] == "REJECTED" and c["payload"].get("reason") == "global_daily_trade_limit_would_be_exceeded"
+        for c in log_calls
+    )
 
 
 @pytest.mark.asyncio

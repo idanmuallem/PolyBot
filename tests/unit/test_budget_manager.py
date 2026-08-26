@@ -7,17 +7,19 @@ from trading.budget_manager import BudgetManager
 
 def _make_manager(
     initial_balance=100.0, daily_limit=15.0, min_balance=5.0, bankroll=1000.0,
-    max_bet_size_usd=3.0, kelly_fraction=0.25,
+    max_bet_size_usd=3.0, kelly_fraction=0.25, global_limit=None,
 ):
     bridge = DataBridge()
     bridge.current_balance = initial_balance
     config = TradingConfig(
         bankroll_usd=bankroll,
-        daily_limit_usd=daily_limit,
-        # Per-strategy limits default to $50 each (core/trading_config.py);
-        # pin both to daily_limit here so pre-existing tests below — which
-        # exercise the default strategy_tag="crypto" and were written before
+        # global_limit defaults to daily_limit (pinned equal to the
+        # per-strategy limits below) so pre-existing tests — which exercise
+        # the default strategy_tag="crypto" and were written before
         # per-strategy budgets existed — see the same ceiling as before.
+        # Pass global_limit explicitly to test the global cap as a distinct,
+        # tighter (or looser) ceiling than any one strategy's own bucket.
+        daily_limit_usd=global_limit if global_limit is not None else daily_limit,
         crypto_daily_limit_usd=daily_limit,
         arbitrage_daily_limit_usd=daily_limit,
         min_trading_balance=min_balance,
@@ -182,12 +184,35 @@ def test_cap_to_remaining_budget_zero_at_limit():
 # ── Per-strategy budget isolation (Phase 1) ───────────────────────────────────
 
 def test_strategy_budgets_are_independent():
-    mgr, _ = _make_manager(daily_limit=15.0)
+    # global_limit generous enough that it isn't the binding constraint —
+    # this test is about per-strategy buckets not stepping on each other's
+    # own allocation; the global cap itself is covered separately below.
+    mgr, _ = _make_manager(daily_limit=15.0, global_limit=100.0)
     mgr.record_trade(10.0, strategy_tag="arbitrage")
 
     # Spending on arbitrage doesn't touch crypto's own $15 allocation.
     assert mgr.get_remaining_budget("crypto") == 15.0
     assert mgr.get_remaining_budget("arbitrage") == 5.0
+
+
+def test_global_daily_limit_caps_every_strategy_regardless_of_own_allocation():
+    """Belt-and-suspenders: per-strategy limits (crypto_daily_limit_usd +
+    arbitrage_daily_limit_usd) can be configured to sum higher than the
+    account-wide daily_limit_usd — TradingConfig only warns about that, it
+    never clamps it — so get_remaining_budget() must cap every strategy's
+    remaining budget by what's actually left of the global ceiling too."""
+    mgr, _ = _make_manager(daily_limit=15.0, global_limit=15.0)
+    mgr.record_trade(10.0, strategy_tag="arbitrage")
+
+    # arbitrage's own $15 allocation has $5 left, same as the global
+    # ceiling's $5 left ($15 global - $10 spent) — both give the same
+    # answer here, so this alone doesn't prove the global cap is applied.
+    assert mgr.get_remaining_budget("arbitrage") == 5.0
+
+    # crypto's own $15 allocation is untouched, but only $5 of the $15
+    # global ceiling remains — crypto must be capped to that $5, not its
+    # own unspent $15 allocation.
+    assert mgr.get_remaining_budget("crypto") == 5.0
 
 
 def test_strategy_limit_caps_bet():

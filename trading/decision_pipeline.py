@@ -349,6 +349,30 @@ class SequentialTradingPipeline:
             else str(getattr(signal.market, "no_market_id", None) or signal.market.market_id)
         )
 
+    def _group_already_held(self, signals: list) -> bool:
+        """True if any leg of this group is already an open position.
+
+        _filled_arb_groups (the primary re-buy guard) is in-memory and
+        resets to empty on every process restart, while the positions it's
+        meant to prevent re-buying persist across restarts (paper positions
+        on disk, live positions on-chain). Without this check, a redeploy
+        wipes the guard but not the holdings, and the very next strategy
+        scan re-discovers and re-buys every still-profitable arbitrage group
+        it already holds — this is the confirmed root cause of a rapid-fire
+        trade/holdings burst observed after redeploys. Checking the actual
+        current portfolio (refreshed every loop tick, before this runs) is
+        restart-proof because it reflects real holdings, not session state.
+        """
+        held_tokens = {
+            str(getattr(position, "asset_id", getattr(position, "token_id", "")))
+            for position in (getattr(self.bridge, "current_portfolio", None) or [])
+        }
+        for signal in signals:
+            token_id = self._leg_token_id(signal)
+            if token_id in held_tokens or token_id in self._simulated_positions:
+                return True
+        return False
+
     async def _execute_strategy_group(self, strategy: Strategy, group_id: str, signals: list):
         """Execute every leg of one strategy opportunity (e.g. every outcome
         of one event_sum arb) through the same TradeExecutor used by
@@ -371,6 +395,11 @@ class SequentialTradingPipeline:
 
         tagged_log = self._tag_log_func(strategy.strategy_type)
         asset_type = signals[0].market.asset_type
+
+        if self._group_already_held(signals):
+            tagged_log("SCAN-SKIP", asset_type, group_id, {"reason": "already_owned_in_portfolio"})
+            self._filled_arb_groups.add(group_id)
+            return
 
         if self._group_has_leg_beyond_max_tte(signals, group_id, asset_type, tagged_log):
             self._exhausted_arb_groups.add(group_id)
@@ -412,6 +441,28 @@ class SequentialTradingPipeline:
                 "reason": "daily_trade_limit_would_be_exceeded",
                 "group_id": group_id,
                 "n_legs": len(signals),
+            })
+            self._exhausted_arb_groups.add(group_id)
+            return
+
+        # Belt-and-suspenders hard ceiling (Point: runaway-trade-rate fix):
+        # the check above only compares against this strategy's own
+        # allocation (arbitrage_max_daily_trades, e.g. 200) — it says
+        # nothing about the account-wide MAX_DAILY_TRADES ceiling a human
+        # actually configured. TradingConfig only *warns* if per-strategy
+        # caps are set to sum higher than the global one; it never clamps
+        # them. This check makes the global cap a real ceiling regardless
+        # of how per-strategy limits are configured, so no single strategy
+        # (or misconfiguration) can spend the whole account's daily
+        # allowance through its own generous per-strategy bucket.
+        global_max_daily_trades = int(self.executor.config.max_daily_trades)
+        if self.executor.trade_count_today + len(signals) > global_max_daily_trades:
+            tagged_log("REJECTED", asset_type, group_id, {
+                "reason": "global_daily_trade_limit_would_be_exceeded",
+                "group_id": group_id,
+                "n_legs": len(signals),
+                "trade_count_today": self.executor.trade_count_today,
+                "global_max_daily_trades": global_max_daily_trades,
             })
             self._exhausted_arb_groups.add(group_id)
             return

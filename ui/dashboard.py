@@ -263,7 +263,16 @@ def _render_global_kpis() -> None:
         else f"${float(getattr(bridge, 'current_balance', 0.0)):,.2f}"
     )
     c1.metric("Current Balance", balance_label)
-    c2.metric("Total PnL", f"${float(getattr(bridge, 'total_pnl', 0.0)):,.2f}")
+
+    # Total PnL = Balance - Total Deposits: the true all-in figure (realized
+    # + unrealized + fees + slippage), not just the open-positions-only
+    # unrealized P&L (bridge.unrealized_pnl, still computed by
+    # PortfolioManager._refresh_portfolio() for anything that wants the
+    # narrower figure). Shares _compute_balance_snapshot() with the Balance
+    # view's own stats row so this KPI is numerically guaranteed to equal
+    # "Balance - Total Deposits" as shown there.
+    _, _, balance, total_deposits = _compute_balance_snapshot()
+    c2.metric("Total PnL", f"${balance - total_deposits:,.2f}")
 
 
 # ---------------------------------------------------------------------------
@@ -349,14 +358,22 @@ def _avg(values: list) -> float:
     return round(sum(values) / len(values), 2) if values else 0.0
 
 
-def _render_balance_stats_row() -> None:
-    # Deliberately read cash/holdings from bridge state (refreshed every
-    # pipeline tick by sync_live_account_state()/_refresh_portfolio()) rather
-    # than calling executor.get_balance()/get_open_positions() directly here.
-    # Those route into PaperAdapter -> pm_trader.Engine, whose sqlite3
-    # connection is thread-affine to the polybot-engine background thread —
-    # calling it from Streamlit's own thread would hit the exact cross-thread
-    # crash fixed for resolve_closed_markets() (see trading/decision_pipeline.py).
+def _compute_balance_snapshot() -> tuple[float, float, float, float]:
+    """Returns (cash, holdings, balance, total_deposits).
+
+    Deliberately read cash/holdings from bridge state (refreshed every
+    pipeline tick by sync_live_account_state()/_refresh_portfolio()) rather
+    than calling executor.get_balance()/get_open_positions() directly here.
+    Those route into PaperAdapter -> pm_trader.Engine, whose sqlite3
+    connection is thread-affine to the polybot-engine background thread —
+    calling it from Streamlit's own thread would hit the exact cross-thread
+    crash fixed for resolve_closed_markets() (see trading/decision_pipeline.py).
+
+    Shared by both the top-level "Total PnL" KPI and the Balance view's own
+    stats row so the two stay numerically consistent by construction
+    (Total PnL = Balance - Total Deposits) rather than by two separately
+    maintained copies of the same formula drifting apart.
+    """
     is_paper_mode = not getattr(bridge, "live_trading", False)
     cash = float(getattr(bridge, "current_balance", 0.0) or 0.0)
     holdings = float(getattr(bridge, "open_position_value", 0.0) or 0.0)
@@ -376,6 +393,12 @@ def _render_balance_stats_row() -> None:
         total_deposits = float(wallet_ctx.config.paper_balance_usd)
     else:
         total_deposits = float(getattr(bridge, "starting_balance", 0.0) or 0.0)
+
+    return cash, holdings, balance, total_deposits
+
+
+def _render_balance_stats_row() -> None:
+    cash, holdings, balance, total_deposits = _compute_balance_snapshot()
 
     stats = data_manager.get_trade_stats(wallet_ctx.db_path)
     closed_deltas = data_manager.get_closed_trade_deltas(wallet_ctx.db_path)
@@ -397,16 +420,36 @@ def _render_balance_stats_row() -> None:
     c8.metric("Avg $/share (Combined)",   f"${_avg(closed_deltas + open_deltas):,.2f}")
 
 
-def _render_balance_view() -> None:
-    st.markdown("### Balance")
-    _render_balance_stats_row()
-    
+def _render_equity_chart() -> None:
     if not getattr(bridge, "live_trading", False):
         from ui.components import render_paper_equity_curve
         snapshots = data_manager.get_paper_snapshots(wallet_ctx.db_path)
         render_paper_equity_curve(snapshots)
     else:
         render_equity_curve(data_manager, wallet_ctx.db_path)
+
+
+# The equity chart is an iframe (_echarts() -> components.html()): every
+# render tears it down and rebuilds it from scratch, producing a visible
+# white/grey flash. Riding the same 2s live_fragment as the rest of the
+# dashboard meant that flash fired every 2s. Its underlying data can't
+# change that fast anyway — paper snapshots are only written every ~3
+# minutes (see PortfolioManager._refresh_portfolio()'s 180s throttle) — so
+# it gets its own slower-refreshing fragment instead. Nested fragments
+# rerun independently of their parent in Streamlit >= 1.37, so this cuts
+# the flicker rate ~30x without restructuring the rest of the live loop.
+if hasattr(st, "fragment"):
+    @st.fragment(run_every="60s")
+    def _render_equity_chart_fragment() -> None:
+        _render_equity_chart()
+else:
+    _render_equity_chart_fragment = _render_equity_chart
+
+
+def _render_balance_view() -> None:
+    st.markdown("### Balance")
+    _render_balance_stats_row()
+    _render_equity_chart_fragment()
 
 
 # ---------------------------------------------------------------------------

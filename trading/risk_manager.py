@@ -57,7 +57,14 @@ class PortfolioManager:
         total_open_value = sum(float(getattr(p, "value", 0.0) or 0.0) for p in positions)
         self.bridge.open_position_value = float(total_open_value)
         self.bridge.open_positions_value = float(total_open_value)
-        self.bridge.total_pnl = sum(
+        # Unrealized only — open positions' (current - entry) x shares. The
+        # top-level "Total PnL" KPI (ui/dashboard.py::_render_global_kpis)
+        # uses the broader Balance - Total Deposits figure instead (realized
+        # + unrealized + fees + slippage); this narrower figure stays
+        # available under its own name for callers that specifically want it
+        # (e.g. ui/components.py's Portfolio-view "Unrealized PnL" stat,
+        # computed independently there but conceptually the same number).
+        self.bridge.unrealized_pnl = sum(
             (float(getattr(p, "current_price", 0.0) or 0.0) - float(getattr(p, "initial_price", 0.0) or 0.0))
             * float(getattr(p, "shares", 0.0) or 0.0)
             for p in positions

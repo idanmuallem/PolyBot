@@ -695,6 +695,18 @@ class TradeExecutor:
                      f"Daily trade limit ({strategy_max_daily_trades}) reached for {strategy_tag}")
             return False
 
+        # Belt-and-suspenders hard ceiling: the check above only compares
+        # against this strategy's own allocation. Per-strategy caps
+        # (crypto_max_daily_trades, arbitrage_max_daily_trades) can be
+        # configured to sum higher than the account-wide MAX_DAILY_TRADES —
+        # TradingConfig only warns about that, it never clamps it — so this
+        # makes the global cap an actual ceiling no strategy can bypass via
+        # its own generous per-strategy bucket.
+        if self.trade_count_today >= int(self.config.max_daily_trades):
+            log_func("RISK", asset_type, token_id,
+                     f"Global daily trade limit ({self.config.max_daily_trades}) reached")
+            return False
+
         if not self._validate_market(market, log_func):
             return False
 

@@ -29,7 +29,7 @@ def _make_components(initial_balance=50.0, take_profit=0.20, stop_loss=-0.50):
     bridge.current_portfolio = []
     bridge.open_position_value = 0.0
     bridge.open_positions_value = 0.0
-    bridge.total_pnl = 0.0
+    bridge.unrealized_pnl = 0.0
 
     config = TradingConfig(
         take_profit_pct=take_profit,

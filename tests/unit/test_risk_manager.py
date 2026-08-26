@@ -15,7 +15,7 @@ def _make_pm(take_profit=0.20, stop_loss=-0.50, min_hold_ev=-0.10):
     bridge.current_portfolio = []
     bridge.open_position_value = 0.0
     bridge.open_positions_value = 0.0
-    bridge.total_pnl = 0.0
+    bridge.unrealized_pnl = 0.0
     config = TradingConfig(
         take_profit_pct=take_profit,
         stop_loss_pct=stop_loss,

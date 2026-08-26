@@ -39,7 +39,17 @@ class BudgetManager:
 
     def get_remaining_budget(self, strategy_tag: str = "crypto") -> float:
         spent = self.spent_by_strategy.get(strategy_tag, 0.0)
-        return self._strategy_limit(strategy_tag) - spent
+        strategy_remaining = self._strategy_limit(strategy_tag) - spent
+
+        # Belt-and-suspenders hard ceiling: per-strategy limits (e.g.
+        # arbitrage_daily_limit_usd + crypto_daily_limit_usd) can be
+        # configured to sum higher than the account-wide daily_limit_usd —
+        # TradingConfig only warns about that, it never clamps it — so cap
+        # every strategy's remaining budget by what's actually left of the
+        # global ceiling too. No strategy can spend past the account-wide
+        # daily cap through its own generous allocation.
+        global_remaining = self.daily_limit_usd - self.total_spent_today
+        return min(strategy_remaining, global_remaining)
 
     def check_and_cap_bet(self, kelly_fraction: float, strategy_tag: str = "crypto"):
         remaining = self.get_remaining_budget(strategy_tag)
