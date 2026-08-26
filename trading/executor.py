@@ -32,6 +32,13 @@ except Exception as e:
     SELL = "SELL"
     CLOB_IMPORT_OK = False
 
+try:
+    from trading.paper_adapter import PaperAdapter
+    PAPER_ADAPTER_AVAILABLE = True
+except ImportError:
+    PaperAdapter = None
+    PAPER_ADAPTER_AVAILABLE = False
+
 
 class TradeExecutor:
     """Handles trade execution with risk management.
@@ -47,6 +54,23 @@ class TradeExecutor:
         self.paper_trade_mode = self.config.paper_trade_mode
         self.proxy_address = self.config.proxy_address
         self.client = None
+        self.paper: Optional[object] = None  # set below; stays None outside dry-run
+
+        # Paper trading adapter (active only in dry-run mode) — independent of
+        # the live CLOB client, so it must init before the CLOB_IMPORT_OK gate
+        # below. Otherwise an environment without py-clob-client would leave
+        # dry-run/paper trading dead even though it never needs the live client.
+        if self.dry_run and PAPER_ADAPTER_AVAILABLE:
+            try:
+                self.paper = PaperAdapter()
+                if self.paper.is_ready:
+                    print("[PAPER] Paper trading engine initialized")
+                else:
+                    print("[PAPER] Paper engine not available — DRY-RUN log-only mode")
+                    self.paper = None
+            except Exception as exc:
+                print(f"[PAPER] Paper engine init failed: {exc} — DRY-RUN log-only mode")
+                self.paper = None
 
         if not CLOB_IMPORT_OK:
             print("[FATAL] py-clob-client is not loaded correctly!")
@@ -138,7 +162,12 @@ class TradeExecutor:
 
     def get_balance(self) -> float:
         """Fetch available CLOB collateral balance (deployable cash)."""
-        if self.dry_run or self.client is None:
+        if self.dry_run:
+            if self.paper is not None:
+                return self.paper.get_cash_balance()
+            return float(self.config.paper_balance_usd)
+
+        if self.client is None:
             return float(self.config.paper_balance_usd)
 
         try:
@@ -169,6 +198,10 @@ class TradeExecutor:
         Uses Data API because py-clob-client does not expose a stable positions
         listing method across versions.
         """
+        # Paper trading mode — positions live in paper engine, not on-chain
+        if self.dry_run and self.paper is not None:
+            return self.paper.get_positions()
+
         wallet_address = self._resolve_positions_user_address()
         if not wallet_address:
             return []
@@ -268,6 +301,8 @@ class TradeExecutor:
         side: str,
         no_token_id: Optional[str],
         log_func: Callable,
+        condition_id: Optional[str] = None,
+        slug: Optional[str] = None,
     ) -> bool:
         """Execute a live order or simulate it based on configuration."""
         execution_side = str(side or "YES").upper()
@@ -288,6 +323,21 @@ class TradeExecutor:
                 "price": execution_price, "shares": shares,
                 "bet_amount_usd": bet_amount, "side": execution_side,
             })
+
+            # Paper trading fill (best-effort — must never affect the return value)
+            if self.paper is not None:
+                try:
+                    self.paper.execute_buy(
+                        slug=slug,
+                        condition_id=condition_id,
+                        token_id=token_id,
+                        side=execution_side,
+                        amount_usd=bet_amount,
+                        no_token_id=no_token_id,
+                    )
+                except Exception as exc:
+                    logging.warning(f"[PAPER] Paper fill failed (non-fatal): {exc}")
+
             return True
 
         if self.client is None:
@@ -334,6 +384,14 @@ class TradeExecutor:
             log_func("DRY-RUN-SELL", "Portfolio", token_id, {
                 "message": msg, "price": price, "shares": shares,
             })
+
+            # Paper trading sell (best-effort — must never affect the return value)
+            if self.paper is not None:
+                try:
+                    self.paper.execute_sell(token_id, shares)
+                except Exception as exc:
+                    logging.warning(f"[PAPER] Paper sell failed (non-fatal): {exc}")
+
             return True
 
         if self.client is None:
@@ -454,6 +512,8 @@ class TradeExecutor:
                 side=str(leg.get("side", "YES")),
                 no_token_id=leg.get("no_token_id"),
                 log_func=log_func,
+                condition_id=leg.get("condition_id"),
+                slug=leg.get("slug"),
             )
             fills[token_id] = shares
             self._record_strategy_trade(strategy_tag)
@@ -677,6 +737,8 @@ class TradeExecutor:
             side=execution_side,
             no_token_id=getattr(market, "no_market_id", None),
             log_func=log_func,
+            condition_id=getattr(market, "condition_id", None),
+            slug=getattr(market, "slug", None),
         )
         if executed:
             self.trade_count_today += 1

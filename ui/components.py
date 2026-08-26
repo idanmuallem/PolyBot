@@ -301,3 +301,105 @@ def render_correlation_matrix(bridge, config):
             "label": {"show": True, "color": "#e2e8f0"},
         }],
     }, height=max(280, 60 * len(asset_types)))
+
+
+def render_paper_equity_curve(snapshots: list[dict]):
+    st.subheader("Paper Equity Curve")
+    if not snapshots:
+        st.info("Waiting for equity data...")
+        return
+
+    # Parse and format timestamps for the x-axis
+    times = []
+    for s in snapshots:
+        ts = s.get("timestamp")
+        if isinstance(ts, str):
+            try:
+                # Truncate string to simple MM-DD HH:MM if standard sqlite format
+                parts = ts.split()
+                if len(parts) == 2:
+                    date_part, time_part = parts
+                    times.append(f"{date_part[5:]} {time_part[:5]}")
+                else:
+                    times.append(ts)
+            except Exception:
+                times.append(ts)
+        else:
+            times.append(str(ts))
+
+    cash_values = [round(s.get("cash", 0) or 0, 2) for s in snapshots]
+    pos_values = [round(s.get("positions_value", 0) or 0, 2) for s in snapshots]
+    total_values = [round(s.get("total_value", 0) or 0, 2) for s in snapshots]
+
+    _echarts({
+        "backgroundColor": "transparent",
+        "tooltip": {
+            "trigger": "axis",
+            "axisPointer": {"type": "cross"},
+            # Series array order below is Cash(0), Positions(1), Total(2) —
+            # {cN} tokens index into that same order.
+            "formatter": "{b}<br/>Total: ${c2}<br/>Cash: ${c0}<br/>Positions: ${c1}",
+        },
+        "legend": {
+            "data": ["Cash", "Positions", "Total"],
+            "textStyle": {"color": "#94a3b8"},
+            "top": "0%"
+        },
+        "grid": {"left": "2%", "right": "4%", "top": "12%", "bottom": "8%", "containLabel": True},
+        "xAxis": {
+            "type": "category",
+            "data": times,
+            "boundaryGap": False,
+            "axisLabel": {"color": "#94a3b8", "rotate": 30},
+            "axisLine": {"lineStyle": {"color": "#334155"}},
+        },
+        "yAxis": {
+            "type": "value",
+            "axisLabel": {"color": "#94a3b8", "formatter": "${value}"},
+            "splitLine": {"lineStyle": {"color": "#1e293b"}},
+        },
+        "series": [
+            {
+                "name": "Cash",
+                "type": "line",
+                "stack": "Composition",
+                "areaStyle": {},
+                "smooth": True,
+                "symbol": "none",
+                "itemStyle": {"color": "#38bdf8"},
+                "data": cash_values
+            },
+            {
+                "name": "Positions",
+                "type": "line",
+                "stack": "Composition",
+                "areaStyle": {},
+                "smooth": True,
+                "symbol": "none",
+                "itemStyle": {"color": "#4ade80"},
+                "data": pos_values
+            },
+            # Total — the primary line (drawn last so it renders on top of
+            # the cash/positions composition), styled the same way
+            # render_equity_curve() styles its total_equity line.
+            {
+                "name": "Total",
+                "type": "line",
+                "smooth": True,
+                "symbol": "none",
+                "z": 3,
+                "lineStyle": {"color": "#22c55e", "width": 3},
+                "itemStyle": {"color": "#22c55e"},
+                "areaStyle": {
+                    "color": {
+                        "type": "linear", "x": 0, "y": 0, "x2": 0, "y2": 1,
+                        "colorStops": [
+                            {"offset": 0, "color": "rgba(34,197,94,0.30)"},
+                            {"offset": 1, "color": "rgba(34,197,94,0.00)"},
+                        ],
+                    }
+                },
+                "data": total_values
+            }
+        ],
+    }, height=300)

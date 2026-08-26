@@ -11,6 +11,7 @@ requests==2.32.5
 py_builder_signing_sdk==0.0.2
 py_order_utils==0.3.2
 ccxt==4.4.62
+polymarket-paper-trader>=0.1.8
 
 # Test dependencies
 pytest==8.3.5

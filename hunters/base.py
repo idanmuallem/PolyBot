@@ -212,6 +212,8 @@ class BasePolymarketHunter(BaseHunter):
                                 volume=volume,
                                 expiry_date=expiry_date,
                                 no_market_id=no_market_id,
+                                condition_id=market.get("conditionId") or market.get("condition_id"),
+                                slug=market.get("slug") or event.get("slug"),
                             )
                             print(
                                 f"[{tag}] SELECT | {market_name} | "

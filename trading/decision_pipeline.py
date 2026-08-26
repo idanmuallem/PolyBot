@@ -429,6 +429,8 @@ class SequentialTradingPipeline:
                 "bet_amount_usd": signal.bet_amount_usd,
                 "asset_type": signal.market.asset_type,
                 "no_token_id": getattr(signal.market, "no_market_id", None),
+                "condition_id": getattr(signal.market, "condition_id", None),
+                "slug": getattr(signal.market, "slug", None),
                 "group_id": group_id,
             })
 
@@ -836,6 +838,18 @@ class SequentialTradingPipeline:
         while True:
             await asyncio.sleep(self.loop_delay)
             self._reset_daily_if_needed()
+
+            # Periodic Market Resolution Check (Phase 3)
+            if getattr(self.executor, "dry_run", True):
+                now = time.time()
+                if now - getattr(self, "_last_resolve_check_at", 0.0) >= 900.0:  # 15 minutes
+                    self._last_resolve_check_at = now
+                    paper = getattr(self.executor, "paper", None)
+                    if paper is not None:
+                        try:
+                            await asyncio.to_thread(paper.resolve_closed_markets)
+                        except Exception as e:
+                            self.log_func("PAPER-ERROR", "Engine", "resolve_all", {"error": str(e)})
 
             requested_live = bool(getattr(self.bridge, "live_trading", False))
             self.executor.dry_run = not requested_live

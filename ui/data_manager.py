@@ -56,6 +56,28 @@ def init_db(db_path: str):
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_snapshots (
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                cash REAL,
+                positions_value REAL,
+                total_value REAL
+            )
+            """
+        )
+
+
+def insert_paper_snapshot(db_path: str, cash: float, positions_value: float):
+    total_value = cash + positions_value
+    try:
+        with _open_db(db_path) as conn:
+            conn.execute(
+                "INSERT INTO paper_snapshots (cash, positions_value, total_value) VALUES (?, ?, ?)",
+                (float(cash), float(positions_value), float(total_value)),
+            )
+    except Exception as e:
+        print(f"[PAPER] DB error saving snapshot: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -373,3 +395,16 @@ def restore_runtime_state(db_path: str, fallback_starting_balance: float) -> dic
             break
 
     return state
+
+
+def get_paper_snapshots(db_path: str, limit: int = 100) -> list[dict]:
+    try:
+        with _open_db(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT timestamp, cash, positions_value, total_value FROM paper_snapshots ORDER BY timestamp ASC LIMIT ?",
+                (limit,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+    except Exception:
+        return []

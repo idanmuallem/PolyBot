@@ -16,6 +16,8 @@ class MarketData:
     volume: float
     expiry_date: Optional[str] = None
     no_market_id: Optional[str] = None
+    condition_id: Optional[str] = None   # Polymarket conditionId (0x...)
+    slug: Optional[str] = None           # Polymarket market slug
 
 
 @dataclass

@@ -364,7 +364,13 @@ def _render_balance_stats_row() -> None:
 def _render_balance_view() -> None:
     st.markdown("### Balance")
     _render_balance_stats_row()
-    render_equity_curve(data_manager, wallet_ctx.db_path)
+    
+    if not getattr(bridge, "live_trading", False):
+        from ui.components import render_paper_equity_curve
+        snapshots = data_manager.get_paper_snapshots(wallet_ctx.db_path)
+        render_paper_equity_curve(snapshots)
+    else:
+        render_equity_curve(data_manager, wallet_ctx.db_path)
 
 
 # ---------------------------------------------------------------------------

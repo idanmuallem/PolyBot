@@ -262,6 +262,10 @@ def test_none_response_is_invalid():
 def test_get_open_positions_live_ev_normalization_at_boundary():
     """A 1% gain (pnl_ratio=0.01) must produce live_ev=0.01."""
     executor = _make_executor()
+    # This test targets the live Data-API positions path specifically (field
+    # normalization), not the paper adapter — force the paper adapter off so
+    # get_open_positions() falls through to the mocked HTTP call below.
+    executor.paper = None
     from unittest.mock import patch as _patch
     raw_position = {
         "asset": "tok1",
@@ -288,7 +292,38 @@ def test_get_open_positions_live_ev_normalization_at_boundary():
 
 def test_get_balance_dry_run_returns_configured_paper_balance():
     executor = _make_executor(paper_balance_usd=500.0)
+    # This test targets the config-driven fallback used when no paper
+    # adapter is available, not the paper engine's own tracked balance.
+    executor.paper = None
     assert executor.get_balance() == 500.0
+
+
+# ── Paper trading adapter integration (best-effort, must not break dry-run) ──
+
+def test_dry_run_with_paper_adapter_still_returns_true():
+    """Paper adapter failures must not break the DRY-RUN return value."""
+    executor = _make_executor()  # dry_run=True
+
+    # Inject a paper adapter whose execute_buy always raises
+    mock_paper = MagicMock()
+    mock_paper.execute_buy.side_effect = RuntimeError("Engine exploded")
+    executor.paper = mock_paper
+
+    market = _valid_market()
+    log_calls = []
+
+    # Even if paper adapter raises, execute_trade should still return True
+    result = executor.evaluate_and_execute(
+        market=market,
+        fair_value=0.75,
+        ev=0.50,
+        current_poly_price=0.50,
+        bet_amount_usd=2.0,
+        side="YES",
+        log_func=lambda level, *a, **kw: log_calls.append(level),
+    )
+    assert result is True
+    assert "DRY-RUN" in log_calls
 
 
 # ── execute_arbitrage_group (Phase 3: limit order timeout + partial fills) ──

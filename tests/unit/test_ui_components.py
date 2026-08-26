@@ -108,3 +108,45 @@ def test_render_positions_handles_missing_analytics_gracefully():
         components.render_positions(bridge)  # must not raise
 
     mock_dataframe.assert_called_once()
+
+# ── render_paper_equity_curve ─────────────────────────────────────────────────
+
+def test_render_paper_equity_curve_empty():
+    with patch.object(components.st, "info") as mock_info, \
+         patch.object(components, "_echarts") as mock_echarts:
+        components.render_paper_equity_curve([])
+    mock_info.assert_called_once_with("Waiting for equity data...")
+    mock_echarts.assert_not_called()
+
+def test_render_paper_equity_curve_with_data():
+    snapshots = [
+        {"timestamp": "2026-08-25 15:00:00", "cash": 500.0, "positions_value": 200.0, "total_value": 700.0},
+        {"timestamp": "2026-08-25 15:03:00", "cash": 450.0, "positions_value": 260.0, "total_value": 710.0},
+    ]
+    with patch.object(components.st, "info") as mock_info, \
+         patch.object(components, "_echarts") as mock_echarts:
+        components.render_paper_equity_curve(snapshots)
+    
+    mock_info.assert_not_called()
+    mock_echarts.assert_called_once()
+    
+    options = mock_echarts.call_args[0][0]
+    # Verify times on X-axis (shortened as MM-DD HH:MM if standard)
+    assert len(options["xAxis"]["data"]) == 2
+    assert "08-25 15:00" in options["xAxis"]["data"][0]
+
+    # Verify values on series — Cash/Positions stacked (composition), plus
+    # an explicit, unstacked Total series carrying total_value (the primary
+    # "is my paper account up or down" line).
+    assert len(options["series"]) == 3
+    by_name = {s["name"]: s for s in options["series"]}
+    assert by_name["Cash"]["data"] == [500.0, 450.0]
+    assert by_name["Positions"]["data"] == [200.0, 260.0]
+    assert by_name["Total"]["data"] == [700.0, 710.0]
+
+    # Total must not be stacked with cash/positions, and must be visually
+    # distinguished (bolder line, drawn on top via z-order).
+    assert "stack" not in by_name["Total"]
+    assert by_name["Cash"].get("stack") == by_name["Positions"].get("stack")
+    assert by_name["Total"]["lineStyle"]["width"] >= 3
+    assert by_name["Total"].get("z", 0) > by_name["Cash"].get("z", 0)

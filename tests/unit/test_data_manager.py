@@ -24,6 +24,42 @@ def test_init_db_creates_table(db):
         ).fetchone()
     assert row is not None
 
+def test_init_db_creates_paper_snapshots_table(db):
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='paper_snapshots'"
+        ).fetchone()
+    assert row is not None
+
+# ── insert_paper_snapshot ─────────────────────────────────────────────────────
+
+def test_insert_paper_snapshot(db):
+    dm.insert_paper_snapshot(db_path=db, cash=100.50, positions_value=50.25)
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT cash, positions_value, total_value FROM paper_snapshots"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == 100.50
+    assert rows[0][1] == 50.25
+    assert rows[0][2] == 150.75
+
+def test_get_paper_snapshots(db):
+    dm.insert_paper_snapshot(db_path=db, cash=100.0, positions_value=50.0)
+    dm.insert_paper_snapshot(db_path=db, cash=120.0, positions_value=60.0)
+    
+    # Test ordering and format
+    snaps = dm.get_paper_snapshots(db)
+    assert len(snaps) == 2
+    assert snaps[0]["cash"] == 100.0
+    assert snaps[0]["total_value"] == 150.0
+    assert snaps[1]["cash"] == 120.0
+    assert snaps[1]["total_value"] == 180.0
+    
+    # Test limit
+    snaps_limit = dm.get_paper_snapshots(db, limit=1)
+    assert len(snaps_limit) == 1
+
 
 # ── log_event ─────────────────────────────────────────────────────────────────
 

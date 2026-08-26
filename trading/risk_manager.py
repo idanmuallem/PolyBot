@@ -1,7 +1,10 @@
 import json
 import os
 import sqlite3
+import time
 from typing import List, Optional
+
+from ui import data_manager
 
 from brains.pricing_engine import PricingEngine
 from trading.correlation import CorrelationTracker
@@ -46,6 +49,7 @@ class PortfolioManager:
         # log correlation_exposure on new candidates and to feed the
         # dashboard's correlation matrix visualization.
         self.correlation_tracker = CorrelationTracker(config=config)
+        self._last_snapshot_at: float = 0.0
 
     def _refresh_portfolio(self):
         positions = self.executor.get_open_positions()
@@ -58,6 +62,16 @@ class PortfolioManager:
             * float(getattr(p, "shares", 0.0) or 0.0)
             for p in positions
         )
+
+        # Paper tracking mark-to-market snapshot (Phase 3)
+        if getattr(self.executor, "dry_run", True):
+            now = time.time()
+            if now - self._last_snapshot_at >= 180.0:
+                cash = self.executor.get_balance()
+                positions_value = sum(float(getattr(p, "value", 0.0) or 0.0) for p in positions)
+                if self.db_path:
+                    data_manager.insert_paper_snapshot(self.db_path, cash, positions_value)
+                self._last_snapshot_at = now
 
     @staticmethod
     def _position_field(position, field_name, default=None):
