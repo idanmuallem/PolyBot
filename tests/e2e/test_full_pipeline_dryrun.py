@@ -28,6 +28,14 @@ def _wire_ctx(ctx: WalletContext, log_func) -> None:
     real WalletContext. Must run with any TradeExecutor patches already
     active, since it constructs a real TradeExecutor."""
     ctx.executor = TradeExecutor(config=ctx.config)
+    # These tests exercise full-loop pipeline mechanics with MarketData
+    # fixtures that don't carry a slug/condition_id — not real paper-engine
+    # fidelity. A real PaperAdapter (constructed unconditionally by
+    # TradeExecutor.__init__ whenever pm_trader is importable) would now
+    # honestly report those buys as failed (see trading/executor.py's
+    # dry-run branches), which isn't what these tests are about. See
+    # tests/unit/test_executor.py's _make_executor() for the same rationale.
+    ctx.executor.paper = None
     ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
     ctx.portfolio_manager = PortfolioManager(
         bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,

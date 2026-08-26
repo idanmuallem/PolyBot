@@ -324,10 +324,22 @@ class TradeExecutor:
                 "bet_amount_usd": bet_amount, "side": execution_side,
             })
 
-            # Paper trading fill (best-effort — must never affect the return value)
+            # Paper trading fill. A failed fill (e.g. missing slug/condition_id,
+            # so PaperAdapter can't resolve what to buy) must not be reported
+            # as success — the caller (evaluate_and_execute / arbitrage leg
+            # execution) uses this return value to decide whether to count
+            # the trade against budget/daily-trade-count and whether a real
+            # position now exists to manage. Reporting success for a buy that
+            # never landed in the paper engine desyncs the two: budget gets
+            # spent, trade count increments, but there's no position to ever
+            # sell — or worse, a *different*, unrelated position quietly
+            # inherits stale bookkeeping. No paper adapter configured at all
+            # is not a failure in this sense (log-only DRY-RUN mode, working
+            # as designed), so that case still reports success.
+            paper_buy_ok = True
             if self.paper is not None:
                 try:
-                    self.paper.execute_buy(
+                    paper_buy_ok = self.paper.execute_buy(
                         slug=slug,
                         condition_id=condition_id,
                         token_id=token_id,
@@ -336,9 +348,10 @@ class TradeExecutor:
                         no_token_id=no_token_id,
                     )
                 except Exception as exc:
-                    logging.warning(f"[PAPER] Paper fill failed (non-fatal): {exc}")
+                    logging.warning(f"[PAPER] Paper fill failed (non-fatal to pipeline): {exc}")
+                    paper_buy_ok = False
 
-            return True
+            return bool(paper_buy_ok)
 
         if self.client is None:
             log_func("PAPER-TRADE", asset_type, execution_token_id, {
@@ -385,14 +398,27 @@ class TradeExecutor:
                 "message": msg, "price": price, "shares": shares,
             })
 
-            # Paper trading sell (best-effort — must never affect the return value)
+            # Paper trading sell. Unlike buys, a failed sell must not be
+            # reported as success: PortfolioManager._exit_position() credits
+            # cash to bridge.current_balance based on this return value, and
+            # never actually removes the position from the paper engine's
+            # own book unless the sell genuinely landed there. Swallowing a
+            # failure here (the old unconditional `return True`) meant a
+            # position whose paper sell kept failing (e.g. a missing
+            # _token_map entry) got "sold" — and credited cash — on every
+            # single loop tick, forever, without ever actually closing.
+            # No paper adapter configured at all is not a failure in this
+            # sense (there's nothing to desync from), so that case still
+            # reports success.
+            paper_sell_ok = True
             if self.paper is not None:
                 try:
-                    self.paper.execute_sell(token_id, shares)
+                    paper_sell_ok = self.paper.execute_sell(token_id, shares)
                 except Exception as exc:
-                    logging.warning(f"[PAPER] Paper sell failed (non-fatal): {exc}")
+                    logging.warning(f"[PAPER] Paper sell failed (non-fatal to pipeline): {exc}")
+                    paper_sell_ok = False
 
-            return True
+            return bool(paper_sell_ok)
 
         if self.client is None:
             log_func("PAPER-SELL", "Portfolio", token_id, {

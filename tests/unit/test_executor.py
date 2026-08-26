@@ -27,10 +27,25 @@ def _dry_config(**overrides):
 
 
 def _make_executor(**config_overrides):
-    """Create a TradeExecutor with a controlled TradingConfig (no real CLOB)."""
+    """Create a TradeExecutor with a controlled TradingConfig (no real CLOB).
+
+    TradeExecutor.__init__ unconditionally tries to construct a real
+    PaperAdapter whenever dry_run=True and pm_trader is importable — which it
+    is in this environment. Most tests here are about evaluate_and_execute's
+    own gating logic (EV/price/budget/daily-limit), not paper-engine
+    fidelity, and now that sell_position()/execute_trade() honestly
+    propagate the paper adapter's real success/failure (see
+    trading/executor.py), a real adapter would make those tests depend on
+    incidental details like whether _valid_market() sets a slug/condition_id
+    — and would write real files to disk. Default it off here; tests that
+    specifically exercise paper-adapter behavior already set executor.paper
+    themselves (to a mock or back to None) right after this call.
+    """
     from trading.executor import TradeExecutor
     config = _dry_config(**config_overrides)
-    return TradeExecutor(config=config)
+    executor = TradeExecutor(config=config)
+    executor.paper = None
+    return executor
 
 
 def _valid_market():
@@ -322,8 +337,14 @@ def test_get_balance_dry_run_returns_configured_paper_balance():
 
 # ── Paper trading adapter integration (best-effort, must not break dry-run) ──
 
-def test_dry_run_with_paper_adapter_still_returns_true():
-    """Paper adapter failures must not break the DRY-RUN return value."""
+def test_dry_run_paper_adapter_failure_does_not_raise_but_reports_failure():
+    """A raising paper adapter must not crash the pipeline (no exception
+    propagates) — but the return value must honestly reflect that the paper
+    fill never landed, not claim success. evaluate_and_execute()'s caller
+    (budget/trade-count bookkeeping) and PortfolioManager._exit_position()'s
+    cash-crediting both key off this return value; a hardcoded True here
+    previously let a market whose paper fill kept failing get "traded"
+    forever without ever having a real position to show for it."""
     executor = _make_executor()  # dry_run=True
 
     # Inject a paper adapter whose execute_buy always raises
@@ -334,7 +355,7 @@ def test_dry_run_with_paper_adapter_still_returns_true():
     market = _valid_market()
     log_calls = []
 
-    # Even if paper adapter raises, execute_trade should still return True
+    # Must not raise, but must now honestly report failure.
     result = executor.evaluate_and_execute(
         market=market,
         fair_value=0.75,
@@ -344,8 +365,91 @@ def test_dry_run_with_paper_adapter_still_returns_true():
         side="YES",
         log_func=lambda level, *a, **kw: log_calls.append(level),
     )
+    assert result is False
+    assert "DRY-RUN" in log_calls  # still logged — the attempt itself isn't hidden
+
+
+def test_dry_run_no_paper_adapter_configured_still_returns_true():
+    """No paper adapter at all (pm_trader not installed) is the original
+    log-only DRY-RUN mode, working as designed — not a failure to report."""
+    executor = _make_executor()  # dry_run=True
+    executor.paper = None
+    market = _valid_market()
+
+    result = executor.evaluate_and_execute(
+        market=market,
+        fair_value=0.75,
+        ev=0.50,
+        current_poly_price=0.50,
+        bet_amount_usd=2.0,
+        side="YES",
+        log_func=lambda *a, **kw: None,
+    )
     assert result is True
-    assert "DRY-RUN" in log_calls
+
+
+def test_dry_run_paper_buy_returning_false_is_not_reported_as_success():
+    """A paper adapter that runs without raising but returns False (e.g.
+    missing slug/condition_id, or no token_map entry to resolve later) must
+    also not be reported as a successful trade."""
+    executor = _make_executor()
+    mock_paper = MagicMock()
+    mock_paper.execute_buy.return_value = False
+    executor.paper = mock_paper
+    market = _valid_market()
+
+    result = executor.evaluate_and_execute(
+        market=market,
+        fair_value=0.75,
+        ev=0.50,
+        current_poly_price=0.50,
+        bet_amount_usd=2.0,
+        side="YES",
+        log_func=lambda *a, **kw: None,
+    )
+    assert result is False
+
+
+def test_dry_run_sell_paper_failure_is_not_reported_as_success():
+    """The actual bug being fixed: a failed paper SELL must not be reported
+    as sold — PortfolioManager._exit_position() credits cash and treats the
+    position as closed based on this return value alone."""
+    executor = _make_executor()
+    mock_paper = MagicMock()
+    mock_paper.execute_sell.return_value = False
+    executor.paper = mock_paper
+
+    log_calls = []
+    result = executor.sell_position(
+        token_id="stuck_tok", shares=1000.0, price=0.0005,
+        log_func=lambda level, *a, **kw: log_calls.append(level),
+    )
+    assert result is False
+    assert "DRY-RUN-SELL" in log_calls  # attempt still logged, just not as a success
+
+
+def test_dry_run_sell_paper_raising_is_not_reported_as_success():
+    executor = _make_executor()
+    mock_paper = MagicMock()
+    mock_paper.execute_sell.side_effect = RuntimeError("Engine exploded")
+    executor.paper = mock_paper
+
+    result = executor.sell_position(
+        token_id="stuck_tok", shares=1000.0, price=0.0005,
+        log_func=lambda *a, **kw: None,
+    )
+    assert result is False
+
+
+def test_dry_run_sell_no_paper_adapter_configured_still_returns_true():
+    executor = _make_executor()
+    executor.paper = None
+
+    result = executor.sell_position(
+        token_id="tok1", shares=10.0, price=0.5,
+        log_func=lambda *a, **kw: None,
+    )
+    assert result is True
 
 
 # ── execute_arbitrage_group (Phase 3: limit order timeout + partial fills) ──
