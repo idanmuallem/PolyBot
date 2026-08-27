@@ -40,6 +40,17 @@ class TradingConfig:
     daily_limit_usd: float = DEFAULT_DAILY_LIMIT_USD
     max_bet_size_usd: float = DEFAULT_MAX_BET_SIZE_USD
 
+    # Top-level kill switch for the arbitrage strategy path (EventSumStrategy
+    # et al.), checked at the very top of SequentialTradingPipeline's
+    # _stage_strategy_scan() before any Gamma API call or strategy.scan().
+    # Deliberately NOT the same thing as arbitrage_max_daily_trades=0: that
+    # would still scan/evaluate every cycle and just reject at the budget
+    # gate, burning API calls and log noise for a strategy that should not
+    # run at all. False means zero event-discovery calls, zero
+    # STRATEGY-GROUP/STRATEGY-LEG log entries — the strategy simply never
+    # runs, full stop.
+    enable_arbitrage: bool = True
+
     # Per-strategy budget isolation (see trading/budget_manager.py): the
     # arbitrage and crypto-brain paths draw from the same wallet cash pool
     # but track spend/trade-count independently, so one can't starve the
@@ -158,6 +169,7 @@ class TradingConfig:
             model_weight=float(os.getenv("MODEL_WEIGHT", str(DEFAULT_MODEL_WEIGHT))),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.20")),
+            enable_arbitrage=_env_bool("ENABLE_ARBITRAGE", "True"),
             arbitrage_daily_limit_usd=float(os.getenv("ARBITRAGE_DAILY_LIMIT_USD", "50.0")),
             arbitrage_max_daily_trades=int(os.getenv("ARBITRAGE_MAX_DAILY_TRADES", "50")),
             crypto_daily_limit_usd=float(os.getenv("CRYPTO_DAILY_LIMIT_USD", "50.0")),

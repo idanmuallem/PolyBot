@@ -2,7 +2,7 @@
 model-driven trades, tagged with strategy_type for separate tracking."""
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -177,20 +177,26 @@ async def test_insufficient_cash_rejects_whole_group():
 
 
 @pytest.mark.asyncio
-async def test_already_held_group_is_skipped_not_rebought():
+async def test_fully_held_group_is_skipped_not_rebought():
     """Restart-safety: _filled_arb_groups (in-memory) resets on every
     process restart, but real holdings — reflected in bridge.current_portfolio
-    — persist across restarts. A group with a leg already in the portfolio
-    must be skipped even on a "fresh" pipeline instance that has never seen
-    this group_id before, or a redeploy re-buys everything it already
-    holds (the confirmed root cause of a runaway-trade-rate incident)."""
+    — persist across restarts. A group whose ENTIRE currently-valid basket
+    is already held must be skipped even on a "fresh" pipeline instance
+    that has never seen this group_id before, or a redeploy re-buys
+    everything it already holds (the confirmed root cause of a
+    runaway-trade-rate incident). See test_partially_held_group_* below
+    for the complementary case: a basket only PARTLY held must NOT be
+    skipped — see _group_already_held's docstring for why the check is
+    ALL-legs, not ANY-leg."""
     pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
     event = _underpriced_event(n=3)
 
-    # Simulate "already holding" one leg of this group, as if positions
-    # persisted across a restart that wiped _filled_arb_groups.
-    held = SimpleNamespace(asset_id="evt1_tok0")
-    bridge.current_portfolio = [held]
+    # Simulate holding every leg, as if positions persisted across a
+    # restart that wiped _filled_arb_groups.
+    bridge.current_portfolio = [
+        SimpleNamespace(asset_id=f"evt1_tok{i}", shares=3.0, initial_price=0.30)
+        for i in range(3)
+    ]
 
     with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[event]):
         await pipeline._stage_strategy_scan()
@@ -201,6 +207,70 @@ async def test_already_held_group_is_skipped_not_rebought():
         for c in log_calls
     )
     assert pipeline.budget_manager.total_spent_today == 0.0
+    assert "event_sum:evt1" in pipeline._filled_arb_groups
+
+
+@pytest.mark.asyncio
+async def test_partially_held_group_not_skipped_only_missing_leg_bought():
+    """A basket where 2 of 3 currently-valid legs are already held (e.g.
+    the event gained a new candidate/outcome after the original buy — see
+    _group_already_held's docstring for the real Nobel Peace Prize case
+    this is modeled on) must NOT be skipped, and the pipeline must only
+    attempt to buy the still-missing leg — not re-buy the 2 it already
+    holds."""
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    event = _underpriced_event(n=3)
+
+    bridge.current_portfolio = [
+        SimpleNamespace(asset_id="evt1_tok0", shares=10.0, initial_price=0.30),
+        SimpleNamespace(asset_id="evt1_tok1", shares=10.0, initial_price=0.30),
+    ]
+
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[event]):
+        await pipeline._stage_strategy_scan()
+
+    assert not [c for c in log_calls if c["level"] == "SCAN-SKIP"]
+    dry_run_entries = [c for c in log_calls if c["level"] == "DRY-RUN"]
+    leg_entries = [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert [c["token_id"] for c in dry_run_entries] == ["evt1_tok2"]
+    assert [c["token_id"] for c in leg_entries] == ["evt1_tok2"]
+
+    group_entries = [c for c in log_calls if c["level"] == "STRATEGY-GROUP"]
+    assert len(group_entries) == 1
+    assert group_entries[0]["payload"]["n_legs"] == 1
+    assert group_entries[0]["payload"]["legs_already_held"] == 2
+    assert group_entries[0]["payload"]["legs_total_in_basket"] == 3
+
+    assert "event_sum:evt1" in pipeline._filled_arb_groups
+
+
+@pytest.mark.asyncio
+async def test_partial_hold_topup_trims_new_leg_to_held_share_count():
+    """The missing leg is bought for a fixed dollar amount, which can land
+    far more shares than the already-held legs hold — e.g. a cheap
+    long-shot outcome added to the event after the original buy. The true
+    guaranteed-set size is bounded by the SCARCEST leg in the whole
+    basket, held or new, so the excess on the newly-bought leg must be
+    trimmed back to the held legs' share count, not kept as naked
+    exposure on a candidate that can't actually complete a full set."""
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    event = _underpriced_event(n=3)
+    event["markets"][2]["lastTradePrice"] = 0.05  # cheap long-shot leg: $1 buys ~20 shares
+
+    bridge.current_portfolio = [
+        SimpleNamespace(asset_id="evt1_tok0", shares=2.0, initial_price=0.30),
+        SimpleNamespace(asset_id="evt1_tok1", shares=2.0, initial_price=0.30),
+    ]
+
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[event]):
+        await pipeline._stage_strategy_scan()
+
+    leg_entries = [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert len(leg_entries) == 1
+    assert leg_entries[0]["token_id"] == "evt1_tok2"
+    assert leg_entries[0]["payload"]["shares"] == pytest.approx(2.0)  # trimmed to the held legs' 2.0 shares
+
+    assert any(c["level"] == "DRY-RUN-SELL" for c in log_calls)  # ~18 excess shares sold back
     assert "event_sum:evt1" in pipeline._filled_arb_groups
 
 
@@ -390,6 +460,43 @@ async def test_no_strategies_registered_is_a_noop():
     mock_fetch.assert_not_called()
 
 
+# ── ENABLE_ARBITRAGE kill switch: early exit, not a downstream cap ───────────
+
+@pytest.mark.asyncio
+async def test_enable_arbitrage_false_skips_scan_entirely_no_api_call():
+    """config.enable_arbitrage=False must stop _stage_strategy_scan() before
+    any Gamma API call and before strategy.scan() runs at all — not just
+    reject every signal downstream (that's what ARBITRAGE_MAX_DAILY_TRADES=0
+    already does, and is explicitly NOT what this flag is for)."""
+    config = TradingConfig(
+        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        daily_limit_usd=15.0, max_bet_size_usd=3.0,
+        max_daily_trades=10, min_trading_balance=1.0,
+        enable_arbitrage=False,
+    )
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0, config=config)
+
+    with patch.object(PolymarketClient, "get_multi_outcome_events") as mock_fetch, \
+         patch.object(pipeline.strategies[0], "scan", new=AsyncMock()) as mock_scan:
+        await pipeline._stage_strategy_scan()
+
+    mock_fetch.assert_not_called()
+    mock_scan.assert_not_called()
+    assert not log_calls  # zero log entries of any kind — the stage never ran
+
+
+@pytest.mark.asyncio
+async def test_enable_arbitrage_true_default_preserves_current_behavior():
+    """Default (unset/True) must behave exactly as before this flag existed."""
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    assert pipeline.config.enable_arbitrage is True
+
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[_underpriced_event(n=3)]):
+        await pipeline._stage_strategy_scan()
+
+    assert [c for c in log_calls if c["level"] == "STRATEGY-GROUP"]
+
+
 # ── Group-level guaranteed-profit re-verification against real fills ─────────
 #
 # EventSumStrategy.scan() only checks profitability once, against a stale
@@ -534,3 +641,77 @@ async def test_arbitrage_unwinds_when_group_incomplete():
     )
     assert "event_sum:evt1" not in pipeline._filled_arb_groups
     assert "event_sum:evt1" in pipeline._exhausted_arb_groups
+
+
+# ── End-to-end: real _execute_paper_limit_arbitrage_group, not a mocked
+# execute_arbitrage_group result — confirms the whole chain (limit-order
+# placement/polling in executor.py -> execute_arbitrage_group's dispatch ->
+# _execute_strategy_group's post-fill verification/unwind) works together,
+# not just each piece in isolation.
+
+def _mock_paper_limit_orders(fills_by_token: dict):
+    condition_to_token = {}
+
+    def fake_place_limit_buy(slug, condition_id, token_id, side, amount_usd, limit_price, no_token_id=None):
+        cond = f"cond_{token_id}"
+        condition_to_token[cond] = token_id
+        return {"id": f"order_{token_id}", "market_condition_id": cond, "outcome": side.lower()}
+
+    def fake_get_position_shares(condition_id, outcome):
+        token_id = condition_to_token.get(condition_id)
+        return fills_by_token.get(token_id, 0.0)
+
+    paper = MagicMock()
+    paper.place_limit_buy.side_effect = fake_place_limit_buy
+    paper.check_pending_limit_orders.return_value = []
+    paper.get_position_shares.side_effect = fake_get_position_shares
+    paper.cancel_limit_order.return_value = True
+    return paper
+
+
+@pytest.mark.asyncio
+async def test_paper_limit_orders_end_to_end_some_legs_fill_others_dont():
+    """A 2-leg group where the limit-order path genuinely fills one leg and
+    never fills the other: the real _execute_paper_limit_arbitrage_group
+    voids the group (arb_sets=0, per its own unfilled-leg rule), and that
+    correctly flows into _execute_strategy_group's incomplete-group unwind —
+    the leg that did fill gets sold back, not held as a naked position."""
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    pipeline.executor.paper = _mock_paper_limit_orders({"tokA": 3.33})  # tokB never fills
+    pipeline.config.arbitrage_order_timeout_seconds = 0.05  # keep the poll loop's deadline short
+
+    with patch.object(pipeline.executor, "sell_position", return_value=True) as mock_sell:
+        await pipeline._execute_strategy_group(
+            _FAKE_ARBITRAGE_STRATEGY, "event_sum:evt1",
+            [_signal("tokA", 0.30), _signal("tokB", 0.35)],
+        )
+
+    pipeline.executor.paper.place_limit_buy.assert_called()
+    assert pipeline.executor.paper.place_limit_buy.call_count == 2
+    mock_sell.assert_called_once()
+    assert mock_sell.call_args.args[0] == "tokA"
+    assert mock_sell.call_args.args[1] == pytest.approx(3.33)
+
+    assert not [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert any(
+        c["level"] == "REJECTED" and c["payload"].get("reason") == "group_incomplete_unwound_partial_fills"
+        for c in log_calls
+    )
+    assert "event_sum:evt1" not in pipeline._filled_arb_groups
+
+
+@pytest.mark.asyncio
+async def test_paper_limit_orders_end_to_end_all_legs_fill():
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    pipeline.executor.paper = _mock_paper_limit_orders({"tokA": 3.33, "tokB": 2.85})
+    pipeline.config.arbitrage_order_timeout_seconds = 0.05
+
+    await pipeline._execute_strategy_group(
+        _FAKE_ARBITRAGE_STRATEGY, "event_sum:evt1",
+        [_signal("tokA", 0.30), _signal("tokB", 0.35)],
+    )
+
+    leg_entries = [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
+    assert len(leg_entries) == 2
+    assert all(c["payload"]["executed"] for c in leg_entries)
+    assert "event_sum:evt1" in pipeline._filled_arb_groups

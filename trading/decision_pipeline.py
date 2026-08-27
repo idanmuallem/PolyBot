@@ -300,6 +300,17 @@ class SequentialTradingPipeline:
         find trades directly from market-price arithmetic, so they skip the
         brain/PricingEngine path entirely and go straight to execution.
         """
+        # Top-level kill switch (config.enable_arbitrage) — checked first,
+        # before the scan-interval throttle and before any Gamma API call.
+        # self.strategies is arbitrage-only today (EventSumStrategy), so
+        # this is the actual entry point for the whole arbitrage path: when
+        # disabled, zero event-discovery calls happen and zero strategy.scan()
+        # calls happen — not "runs but always rejects downstream". A budget
+        # cap like ARBITRAGE_MAX_DAILY_TRADES=0 would still scan/evaluate
+        # every cycle for nothing; this early-return skips that work entirely.
+        if not self.config.enable_arbitrage:
+            return
+
         if not self.strategies:
             return
 
@@ -362,8 +373,33 @@ class SequentialTradingPipeline:
             else str(getattr(signal.market, "no_market_id", None) or signal.market.market_id)
         )
 
+    def _held_token_map(self) -> dict:
+        """token_id -> live Position for every currently open real position,
+        keyed the same way _leg_token_id() results are looked up elsewhere
+        in this class (asset_id, falling back to token_id)."""
+        return {
+            str(getattr(position, "asset_id", getattr(position, "token_id", ""))): position
+            for position in (getattr(self.bridge, "current_portfolio", None) or [])
+        }
+
     def _group_already_held(self, signals: list) -> bool:
-        """True if any leg of this group is already an open position.
+        """True only if EVERY currently-valid leg of this group is already
+        an open position — i.e. the basket is genuinely complete.
+
+        Used to be an ANY-leg check ("is at least one leg of this event
+        held?"), which permanently marked the WHOLE event "done" the
+        instant a single leg was bought — including legs that didn't exist
+        yet at buy time and were added to the event later (confirmed via
+        real data: the Nobel Peace Prize event has 20 currently-valid legs
+        per EventSumStrategy._extract_legs(), only 12 held; the other 8
+        aren't filtered out by _extract_legs() at all, they simply weren't
+        part of the event yet when it was first bought — the ANY-check saw
+        the 12 held tokens among today's 20 signals and called the whole
+        group done, forever). An ALL-legs check instead only treats the
+        group as complete when every leg currently valid is actually held,
+        so _execute_strategy_group can keep topping up a partial basket as
+        new legs appear, while a genuinely complete basket still gets
+        skipped so it isn't re-evaluated every scan.
 
         _filled_arb_groups (the primary re-buy guard) is in-memory and
         resets to empty on every process restart, while the positions it's
@@ -376,15 +412,14 @@ class SequentialTradingPipeline:
         current portfolio (refreshed every loop tick, before this runs) is
         restart-proof because it reflects real holdings, not session state.
         """
-        held_tokens = {
-            str(getattr(position, "asset_id", getattr(position, "token_id", "")))
-            for position in (getattr(self.bridge, "current_portfolio", None) or [])
-        }
-        for signal in signals:
-            token_id = self._leg_token_id(signal)
-            if token_id in held_tokens or token_id in self._simulated_positions:
-                return True
-        return False
+        if not signals:
+            return False
+        held_tokens = self._held_token_map()
+        return all(
+            self._leg_token_id(signal) in held_tokens
+            or self._leg_token_id(signal) in self._simulated_positions
+            for signal in signals
+        )
 
     async def _execute_strategy_group(self, strategy: Strategy, group_id: str, signals: list):
         """Execute every leg of one strategy opportunity (e.g. every outcome
@@ -432,11 +467,32 @@ class SequentialTradingPipeline:
             self._filled_arb_groups.add(group_id)
             return
 
-        if self._group_has_leg_beyond_max_tte(signals, group_id, asset_type, tagged_log):
+        # Some (not all) legs are already held — _group_already_held above
+        # only returned False because at least one currently-valid leg is
+        # missing. Only attempt to buy the missing legs: re-buying a leg
+        # already held would just double the position for no reason.
+        # `missing_signals` drives what actually gets bought (and the TTE/
+        # budget/trade-count gates below, since only new capital is at
+        # stake there); `signals` (the FULL current basket) and
+        # `held_signals` are kept for the group-level profitability
+        # re-verification further down, which judges completing the
+        # basket against its real total cost — sunk cost of what's already
+        # held plus the cost of what's newly bought — not just the cost of
+        # this one attempt in isolation. See that section for why.
+        held_tokens = self._held_token_map()
+
+        def _is_held(s):
+            tid = self._leg_token_id(s)
+            return tid in held_tokens or tid in self._simulated_positions
+
+        missing_signals = [s for s in signals if not _is_held(s)]
+        held_signals = [s for s in signals if _is_held(s)]
+
+        if self._group_has_leg_beyond_max_tte(missing_signals, group_id, asset_type, tagged_log):
             self._exhausted_arb_groups.add(group_id)
             return
 
-        total_cost = sum(float(s.bet_amount_usd) for s in signals)
+        total_cost = sum(float(s.bet_amount_usd) for s in missing_signals)
         cash_balance = float(self.bridge.current_balance)
         remaining_budget = float(self.budget_manager.get_remaining_budget("arbitrage"))
 
@@ -448,7 +504,7 @@ class SequentialTradingPipeline:
             tagged_log("REJECTED", asset_type, group_id, {
                 "reason": "insufficient_cash",
                 "group_id": group_id,
-                "n_legs": len(signals),
+                "n_legs": len(missing_signals),
                 "total_cost": round(total_cost, 4),
                 "cash_balance": round(cash_balance, 4),
             })
@@ -458,7 +514,7 @@ class SequentialTradingPipeline:
             tagged_log("REJECTED", asset_type, group_id, {
                 "reason": "insufficient_budget",
                 "group_id": group_id,
-                "n_legs": len(signals),
+                "n_legs": len(missing_signals),
                 "total_cost": round(total_cost, 4),
                 "remaining_budget": round(remaining_budget, 4),
             })
@@ -467,11 +523,11 @@ class SequentialTradingPipeline:
 
         arbitrage_max_daily_trades = self.executor._strategy_max_daily_trades("arbitrage")
         arbitrage_trades_today = self.executor.trades_by_strategy.get("arbitrage", 0)
-        if arbitrage_trades_today + len(signals) > arbitrage_max_daily_trades:
+        if arbitrage_trades_today + len(missing_signals) > arbitrage_max_daily_trades:
             tagged_log("REJECTED", asset_type, group_id, {
                 "reason": "daily_trade_limit_would_be_exceeded",
                 "group_id": group_id,
-                "n_legs": len(signals),
+                "n_legs": len(missing_signals),
             })
             self._exhausted_arb_groups.add(group_id)
             return
@@ -487,11 +543,11 @@ class SequentialTradingPipeline:
         # (or misconfiguration) can spend the whole account's daily
         # allowance through its own generous per-strategy bucket.
         global_max_daily_trades = int(self.executor.config.max_daily_trades)
-        if self.executor.trade_count_today + len(signals) > global_max_daily_trades:
+        if self.executor.trade_count_today + len(missing_signals) > global_max_daily_trades:
             tagged_log("REJECTED", asset_type, group_id, {
                 "reason": "global_daily_trade_limit_would_be_exceeded",
                 "group_id": group_id,
-                "n_legs": len(signals),
+                "n_legs": len(missing_signals),
                 "trade_count_today": self.executor.trade_count_today,
                 "global_max_daily_trades": global_max_daily_trades,
             })
@@ -499,7 +555,7 @@ class SequentialTradingPipeline:
             return
 
         legs = []
-        for signal in signals:
+        for signal in missing_signals:
             shares = math.floor((signal.bet_amount_usd / signal.price) * 100.0) / 100.0
             if shares <= 0:
                 continue
@@ -526,6 +582,30 @@ class SequentialTradingPipeline:
         fills: dict = dict(result.get("fills") or {})
         arb_sets = float(result.get("arb_sets", 0.0) or 0.0)
 
+        # Cap the guaranteed-set size by the ALREADY-HELD legs' real share
+        # counts too, not just this attempt's fills. A top-up buy is sized
+        # to the same fixed trade_size_usd as any other leg, so it can land
+        # far more shares per dollar on a newly-added, cheap long-shot leg
+        # than the originally-bought legs hold (e.g. a long-shot candidate
+        # at $0.02 buys ~50 shares/$1; legs bought earlier around $0.25
+        # might only hold ~4 shares each) — the true guaranteed structure
+        # is bounded by the SCARCEST leg across the WHOLE basket, held or
+        # new, not just what got bought in this one attempt. Legs held only
+        # via _simulated_positions (a same-tick dry-run backstop with no
+        # share-count data of its own — see its definition in __init__)
+        # can't be capped this way; treating them as unconstrained here is
+        # the conservative choice, since in practice _execute_strategy_group
+        # never adds to _simulated_positions itself (only the model-driven
+        # path does), so this case doesn't arise for arbitrage legs today.
+        if arb_sets > 0 and held_signals:
+            held_share_counts = [
+                float(getattr(held_tokens[self._leg_token_id(s)], "shares", 0.0))
+                for s in held_signals
+                if self._leg_token_id(s) in held_tokens
+            ]
+            if held_share_counts:
+                arb_sets = min(arb_sets, min(held_share_counts))
+
         # Group-level guaranteed-profit re-verification against REAL fills.
         # EventSumStrategy's own scan-time edge check (sum of lastTradePrice
         # snapshots vs a flat fee estimate) is a stale, pre-execution
@@ -539,25 +619,45 @@ class SequentialTradingPipeline:
         # spent for what was actually received), so this checks the thing
         # that actually determines whether the trade is locked-in
         # profitable, not a theoretical proxy for it.
+        #
+        # held_signals' cost is sunk — already spent whether or not this
+        # top-up completes the basket — but still counts toward whether the
+        # COMPLETE basket clears the guaranteed-profit margin: ignoring it
+        # would let a basket with an expensive already-held leg look
+        # "profitable" forever just because today's missing leg is cheap,
+        # even though the finished basket, taken as a whole, costs more
+        # than its $1 guaranteed payout.
         if arb_sets > 0:
             per_leg_unit_cost: dict = {}
-            for signal in signals:
+            for signal in missing_signals:
                 tid = self._leg_token_id(signal)
                 filled = fills.get(tid, 0.0)
                 if filled > 0:
                     per_leg_unit_cost[tid] = float(signal.bet_amount_usd) / filled
 
+            held_unit_costs = [
+                float(getattr(held_tokens[self._leg_token_id(s)], "initial_price", 0.0))
+                for s in held_signals
+                if self._leg_token_id(s) in held_tokens
+            ]
+
             guaranteed_payout = arb_sets * 1.0
-            guaranteed_cost = sum(unit_cost * arb_sets for unit_cost in per_leg_unit_cost.values())
+            guaranteed_cost = (
+                sum(unit_cost * arb_sets for unit_cost in per_leg_unit_cost.values())
+                + sum(unit_cost * arb_sets for unit_cost in held_unit_costs)
+            )
             net_edge = guaranteed_payout - guaranteed_cost
 
             if net_edge < guaranteed_payout * _MIN_ARBITRAGE_MARGIN:
                 # Real fills don't clear a genuine margin after real costs.
                 # Keeping this would just be naked directional risk on
                 # whichever illiquid long-shot outcomes happened to fill —
-                # not arbitrage. Unwind everything bought instead of
-                # holding it.
-                for signal in signals:
+                # not arbitrage. Unwind what was newly bought this attempt
+                # (held_signals' shares are sunk from an earlier attempt —
+                # not this one's to unwind; leaving them held merely
+                # reverts to the same partial-basket state this attempt
+                # started from, eligible for another top-up try later).
+                for signal in missing_signals:
                     tid = self._leg_token_id(signal)
                     filled = fills.get(tid, 0.0)
                     if filled > 0:
@@ -569,7 +669,7 @@ class SequentialTradingPipeline:
                 tagged_log("REJECTED", asset_type, group_id, {
                     "reason": "not_profitable_after_real_fills",
                     "group_id": group_id,
-                    "n_legs": len(signals),
+                    "n_legs": len(missing_signals),
                     "arb_sets": arb_sets,
                     "guaranteed_cost": round(guaranteed_cost, 4),
                     "guaranteed_payout": round(guaranteed_payout, 4),
@@ -596,7 +696,7 @@ class SequentialTradingPipeline:
         #     however they resolve, not a guaranteed structure, regardless
         #     of how "good" those individual fills looked.
         unwound_incomplete_group = False
-        for signal in signals:
+        for signal in missing_signals:
             tid = self._leg_token_id(signal)
             filled = fills.get(tid, 0.0)
             excess = round(filled - arb_sets, 4)
@@ -613,14 +713,14 @@ class SequentialTradingPipeline:
             tagged_log("REJECTED", asset_type, group_id, {
                 "reason": "group_incomplete_unwound_partial_fills",
                 "group_id": group_id,
-                "n_legs": len(signals),
+                "n_legs": len(missing_signals),
                 "unfilled": result.get("unfilled", []),
             })
             self._exhausted_arb_groups.add(group_id)
             return
 
         executed_legs = 0
-        for signal in signals:
+        for signal in missing_signals:
             token_id = self._leg_token_id(signal)
             filled_shares = float(fills.get(token_id, 0.0))
             executed = filled_shares > 0.0
@@ -646,7 +746,9 @@ class SequentialTradingPipeline:
         tagged_log("STRATEGY-GROUP", asset_type, group_id, {
             "group_id": group_id,
             "strategy_type": strategy.strategy_type,
-            "n_legs": len(signals),
+            "n_legs": len(missing_signals),
+            "legs_already_held": len(held_signals),
+            "legs_total_in_basket": len(signals),
             "executed_legs": executed_legs,
             "success": result["success"],
             "arb_sets": arb_sets,

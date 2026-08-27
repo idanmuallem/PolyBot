@@ -415,6 +415,7 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `WANG_MIN_EDGE` | `0.05` | Minimum \|Wang edge\| (probability points) for the exit-side decay check |
 | `KELLY_FRACTION` | `0.25` | Fraction of full Kelly used for position sizing |
 | `MAX_DRAWDOWN_PCT` | `0.20` | Equity drop from peak that pauses new entries (exits still run) |
+| `ENABLE_ARBITRAGE` | `True` | Top-level kill switch for the arbitrage strategy path (EventSumStrategy). `False` skips it entirely at the top of the scan cycle — no Gamma event-discovery calls, no `strategy.scan()`, no `STRATEGY-GROUP`/`STRATEGY-LEG` logs. Not the same as `ARBITRAGE_MAX_DAILY_TRADES=0`, which still scans/evaluates every cycle and only rejects at the budget gate |
 | `ARBITRAGE_DAILY_LIMIT_USD` | `50.0` | Daily USD budget reserved for the arbitrage strategy path — independent of `CRYPTO_DAILY_LIMIT_USD`, so one path can't starve the other's spend on the shared wallet balance |
 | `ARBITRAGE_MAX_DAILY_TRADES` | `50` | Daily trade-count cap for the arbitrage strategy path |
 | `CRYPTO_DAILY_LIMIT_USD` | `50.0` | Daily USD budget reserved for the crypto/model-driven strategy path |
