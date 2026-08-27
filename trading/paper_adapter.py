@@ -44,6 +44,14 @@ class PaperAdapter:
         self._token_map_path: Optional[Path] = None
         self._skip_warned_at: Dict[str, float] = {}  # token_id → last "skipping paper fill" warning time
 
+        # token_ids opened through place_limit_buy() — arbitrage's sole paper
+        # entry path (see the "Limit orders" section below; execute_buy is
+        # the crypto/model path's only entry point). Lets resolve_closed_markets()
+        # identify which open positions are arbitrage legs without needing to
+        # know anything about asset_type/strategy tagging, which lives outside
+        # this class entirely (see ENABLE_ARBITRAGE kill switch).
+        self._arbitrage_tokens: set = set()
+
         # Positions cache — Engine.get_portfolio() makes one live HTTP call
         # per open position, and get_positions() can be called many times
         # per pipeline tick (see PortfolioManager._refresh_portfolio callers),
@@ -92,24 +100,40 @@ class PaperAdapter:
             self.engine = None
 
     def _load_token_map(self):
-        """Load persisted token_id → (slug, outcome) mapping from disk."""
+        """Load persisted token_id → (slug, outcome) mapping (plus the
+        arbitrage-tagging set) from disk."""
         if self._token_map_path and self._token_map_path.exists():
             try:
                 with open(self._token_map_path, "r") as f:
                     raw = json.load(f)
-                # JSON stores tuples as lists, convert back
-                self._token_map = {k: tuple(v) for k, v in raw.items()}
+                if isinstance(raw, dict) and "tokens" in raw:
+                    # Current format.
+                    self._token_map = {k: tuple(v) for k, v in raw.get("tokens", {}).items()}
+                    self._arbitrage_tokens = set(raw.get("arbitrage_tokens", []))
+                else:
+                    # Legacy format written before arbitrage-tagging existed:
+                    # a flat token_id -> [slug, outcome] dict with no tagging
+                    # info. Any arbitrage legs it holds are untagged until
+                    # their next place_limit_buy() call re-adds them — the
+                    # next _save_token_map() upgrades the file either way.
+                    self._token_map = {k: tuple(v) for k, v in raw.items()}
+                    self._arbitrage_tokens = set()
                 logger.info(f"[PAPER] Loaded {len(self._token_map)} token mappings from disk")
             except Exception as exc:
                 logger.warning(f"[PAPER] Failed to load token map: {exc}")
                 self._token_map = {}
+                self._arbitrage_tokens = set()
 
     def _save_token_map(self):
-        """Persist the token_id → (slug, outcome) mapping to disk."""
+        """Persist the token_id → (slug, outcome) mapping and the
+        arbitrage-tagging set to disk."""
         if self._token_map_path:
             try:
                 with open(self._token_map_path, "w") as f:
-                    json.dump(self._token_map, f)
+                    json.dump({
+                        "tokens": self._token_map,
+                        "arbitrage_tokens": sorted(self._arbitrage_tokens),
+                    }, f)
             except Exception as exc:
                 logger.warning(f"[PAPER] Failed to save token map: {exc}")
 
@@ -183,9 +207,123 @@ class PaperAdapter:
                 f"[PAPER] SELL {outcome.upper()} {shares:.4f} shares → "
                 f"${result.trade.amount_usd:.2f} @ ${result.trade.avg_price:.4f}"
             )
+            # get_positions() caches for _positions_cache_ttl seconds (30s) —
+            # without invalidating here, a caller that reads positions right
+            # after this sell (e.g. PortfolioManager.manage_portfolio()'s
+            # trailing _refresh_portfolio()) still gets the pre-sell snapshot
+            # and re-attempts to sell the same, already-closed position on
+            # every tick until the cache naturally expires. Forcing the next
+            # get_positions() call to hit the engine fresh closes that gap.
+            self._positions_cache_at = 0.0
             return True
         except Exception as exc:
             logger.warning(f"[PAPER] Sell failed for {slug_or_id} {outcome}: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Limit orders — used by arbitrage-group legs instead of the market-
+    # order path above (execute_buy walks the book at whatever price it
+    # takes to fill the full dollar amount; a limit order caps the price
+    # paid instead, at the cost of possibly not filling at all). Mirrors
+    # execute_buy/execute_sell's same error-handling and honesty contract:
+    # best-effort, never raises out, returns a falsy value on any failure.
+    # ------------------------------------------------------------------
+
+    def place_limit_buy(
+        self,
+        slug: Optional[str],
+        condition_id: Optional[str],
+        token_id: str,
+        side: str,
+        amount_usd: float,
+        limit_price: float,
+        no_token_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Place a GTC limit buy for one leg. Returns the pm_trader order
+        dict (carries market_condition_id/outcome, needed for the caller's
+        later position-shares polling) on success, None if it couldn't even
+        be placed — same honesty contract as execute_buy.
+        """
+        if not self.is_ready:
+            return None
+
+        slug_or_id = slug or condition_id
+        if not slug_or_id:
+            now = time.time()
+            last_warned = self._skip_warned_at.get(token_id, 0.0)
+            if now - last_warned >= _SKIP_WARNING_INTERVAL_SECONDS:
+                self._skip_warned_at[token_id] = now
+                logger.warning(f"[PAPER] No slug or condition_id for token {token_id} — skipping limit order")
+            return None
+
+        outcome = side.lower()
+
+        try:
+            order = self.engine.place_limit_order(
+                slug_or_id, outcome, "buy", amount_usd, limit_price, order_type="gtc",
+            )
+
+            # Record the token mapping so a subsequent sell can find this,
+            # same as execute_buy — harmless if the order never fills (an
+            # unused mapping entry costs nothing; only positions that
+            # genuinely exist ever get looked up through it).
+            execution_token = token_id
+            if outcome == "no" and no_token_id:
+                execution_token = no_token_id
+            self._token_map[execution_token] = (slug_or_id, outcome)
+            # This is arbitrage's only paper-fill path (see the module-level
+            # comment above) — tag it so resolve_closed_markets() can skip
+            # it entirely while ENABLE_ARBITRAGE is off.
+            self._arbitrage_tokens.add(execution_token)
+            self._save_token_map()
+
+            logger.info(
+                f"[PAPER] LIMIT BUY {outcome.upper()} ${amount_usd:.2f} @ "
+                f"<= ${limit_price:.4f} — order id {order.get('id')}"
+            )
+            return order
+        except Exception as exc:
+            logger.warning(f"[PAPER] Limit buy placement failed for {slug_or_id} {outcome}: {exc}")
+            return None
+
+    def check_pending_limit_orders(self) -> list:
+        """Advance every pending limit order one tick against the live
+        order book (fills at-or-better than each order's limit price).
+        Best-effort: an engine failure here must not crash the poller.
+        """
+        if not self.is_ready:
+            return []
+        try:
+            return self.engine.check_orders()
+        except Exception as exc:
+            logger.warning(f"[PAPER] check_orders failed: {exc}")
+            return []
+
+    def get_position_shares(self, condition_id: str, outcome: str) -> float:
+        """Current shares held for one (condition_id, outcome), read fresh
+        from the engine's own ledger — NOT get_positions()'s 30s cache,
+        since the limit-order poll loop needs up-to-date reads within a
+        much shorter window than that cache is meant to serve.
+        """
+        if not self.is_ready:
+            return 0.0
+        try:
+            position = self.engine.db.get_position(condition_id, outcome)
+        except Exception as exc:
+            logger.warning(f"[PAPER] get_position failed for {condition_id}/{outcome}: {exc}")
+            return 0.0
+        return float(position.shares) if position else 0.0
+
+    def cancel_limit_order(self, order_id: int) -> bool:
+        """Cancel one still-pending limit order. Returns True if a pending
+        order was found and cancelled, False otherwise (including if it had
+        already filled, expired, or the engine call itself failed)."""
+        if not self.is_ready:
+            return False
+        try:
+            return self.engine.cancel_limit_order(order_id) is not None
+        except Exception as exc:
+            logger.warning(f"[PAPER] Cancel failed for limit order {order_id}: {exc}")
             return False
 
     def get_positions(self) -> List[Position]:
@@ -225,12 +363,37 @@ class PaperAdapter:
                 if avg_entry > 0 else 0.0
             )
 
-            # Resolve token_id from our mapping (reverse lookup)
+            # Resolve token_id from our mapping (reverse lookup). A miss
+            # here means the engine's own ledger (persisted independently
+            # and, per the position genuinely showing up in
+            # engine.get_portfolio(), definitely holding real shares) has
+            # outlived this adapter's _token_map entry for it — most likely
+            # a token_map.json persistence gap around a process restart
+            # (see execute_buy's _save_token_map() call). Falling back to
+            # the slug as a fake token_id used to make this position look
+            # normal everywhere downstream, while actually being permanently
+            # unsellable: execute_sell()'s own _token_map lookup can never
+            # match a slug (only real token_ids are ever stored as keys),
+            # so every exit attempt failed silently forever. Surface it as
+            # an explicitly broken id instead — obvious in logs/dashboard,
+            # and guaranteed not to collide with a real token_id — so this
+            # gets noticed rather than mistaken for an ordinary position.
             token_id = self._find_token_for_slug(slug, outcome)
+            if not token_id:
+                now_ts = time.time()
+                last_warned = self._skip_warned_at.get(f"unmapped:{slug}:{outcome}", 0.0)
+                if now_ts - last_warned >= _SKIP_WARNING_INTERVAL_SECONDS:
+                    self._skip_warned_at[f"unmapped:{slug}:{outcome}"] = now_ts
+                    logger.warning(
+                        f"[PAPER] Open position {slug}/{outcome} has no _token_map "
+                        "entry — it cannot be sold until this is resolved (see "
+                        "trading/paper_adapter.py's get_positions())"
+                    )
+                token_id = f"__unmapped__:{slug}:{outcome}"
 
             positions.append(Position(
                 market_id=slug,
-                token_id=token_id or slug,
+                token_id=token_id,
                 initial_price=avg_entry,
                 current_price=live_price,
                 shares=shares,
@@ -268,13 +431,26 @@ class PaperAdapter:
             logger.warning(f"[PAPER] Failed to fetch total value: {exc}")
             return 0.0
 
-    def resolve_closed_markets(self) -> int:
-        """Resolve any paper positions in markets that have closed. Returns count resolved."""
+    def resolve_closed_markets(self, resolve_arbitrage: bool = True) -> int:
+        """Resolve any paper positions in markets that have closed. Returns count resolved.
+
+        resolve_arbitrage=False is the ENABLE_ARBITRAGE kill switch: while
+        arbitrage is disabled, no arbitrage-specific position handling may
+        run at all — not even resolving an already-open arbitrage leg —
+        regardless of what's sitting in the paper ledger. Markets whose only
+        tracked position came from place_limit_buy() (arbitrage's sole
+        paper-fill path — see self._arbitrage_tokens) are skipped entirely
+        in that case; non-arbitrage (crypto) positions resolve exactly as
+        they always have, either way.
+        """
         if not self.is_ready:
             return 0
 
         try:
-            results = self.engine.resolve_all()
+            if resolve_arbitrage:
+                results = self.engine.resolve_all()
+            else:
+                results = self._resolve_non_arbitrage_closed_markets()
             if results:
                 for r in results:
                     logger.info(
@@ -285,6 +461,37 @@ class PaperAdapter:
         except Exception as exc:
             logger.warning(f"[PAPER] resolve_all failed: {exc}")
             return 0
+
+    def _resolve_non_arbitrage_closed_markets(self) -> list:
+        """Mirrors Engine.resolve_all()'s own closed-market loop, but skips
+        any market whose open position is tagged arbitrage (see
+        resolve_closed_markets()'s resolve_arbitrage=False path). Reaches
+        into engine.db/engine.api the same way get_position_shares() above
+        already does — there's no narrower public Engine method for
+        "resolve all except these slugs".
+        """
+        arbitrage_slugs = {
+            self._token_map[tok][0]
+            for tok in self._arbitrage_tokens
+            if tok in self._token_map
+        }
+
+        positions = self.engine.db.get_open_positions()
+        seen_markets = set()
+        results = []
+        for pos in positions:
+            if pos.market_condition_id in seen_markets:
+                continue
+            if pos.market_slug in arbitrage_slugs:
+                continue
+            try:
+                market = self.engine.api.get_market(pos.market_slug)
+                if market.closed:
+                    seen_markets.add(pos.market_condition_id)
+                    results.extend(self.engine.resolve_market(pos.market_slug))
+            except Exception:
+                continue  # transient — retry on next call, same as resolve_all()
+        return results
 
     def _find_mapping_from_positions(self, token_id: str) -> Optional[Tuple[str, str]]:
         """Try to recover a mapping from the persisted token map on disk.

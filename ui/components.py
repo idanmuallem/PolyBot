@@ -1,11 +1,23 @@
 import json
-from dataclasses import asdict
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
 _ECHARTS_CDN = "https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"
+
+
+def fmt_dollars(value: float) -> str:
+    """Format a dollar figure, killing the "-0.00" artifact: Python's
+    string formatting sign-extends small negative floats that round to
+    zero at 2 decimals (f"{-0.0003:.2f}" == "-0.00"), which reads as a
+    nonsensical "negative zero" to anyone looking at the dashboard. Shared
+    by every signed dollar display (Total PnL, Avg $/share, Cash, ...) —
+    not just the ones that happened to show it first.
+    """
+    if abs(value) < 0.005:  # rounds to 0.00 at 2 decimals — kill the sign
+        value = 0.0
+    return f"${value:,.2f}"
 
 
 def _echarts(options: dict, height: int = 350) -> None:
@@ -22,13 +34,14 @@ def _echarts(options: dict, height: int = 350) -> None:
     components.html(html, height=height + 20)
 
 
-def render_ev_chart(bridge):
+def render_ev_chart(items: list[dict]):
+    """`items` is data_manager.get_latest_ev_by_token()'s result — already
+    sorted by EV descending and capped at the desired count."""
     st.subheader("EV by Market")
-    if not bridge.opportunity_map:
+    if not items:
         st.info("No EV market data captured yet.")
         return
 
-    items = sorted(bridge.opportunity_map.values(), key=lambda x: x["ev"], reverse=True)[:15]
     names = [
         x["market_name"][:35] + ("…" if len(x["market_name"]) > 35 else "")
         for x in items
@@ -112,8 +125,10 @@ def render_equity_curve(data_manager, db_path: str):
     }, height=300)
 
 
-def render_activity_chart(bridge):
-    counts = {k: v for k, v in bridge.level_counts.items() if v > 0}
+def render_activity_chart(level_counts: dict):
+    """`level_counts` is data_manager.get_level_counts()'s result (level ->
+    count), replacing the old in-memory bridge.level_counts."""
+    counts = {k: v for k, v in level_counts.items() if v > 0}
     if not counts:
         return
 
@@ -156,83 +171,81 @@ def render_activity_chart(bridge):
     }, height=260)
 
 
-def render_positions(bridge):
-    positions = bridge.current_portfolio
+def _readable_market_name(pos: dict, opportunity_map: dict) -> str:
+    """Human-readable market name for one position. A position row only
+    carries market_id (the slug in paper mode) and token_id — the readable
+    name/question lives in the EV opportunity map (populated by
+    ui/data_manager.log_event for any EV-bearing log row, same source
+    render_ev_chart() already reads market_name from), keyed by token_id.
+    Falls back to reformatting the slug/id when no name is on record.
+    """
+    token_id = str(pos.get("token_id", "") or "")
+    market_id = str(pos.get("market_id", "") or "")
+    for key in (token_id, market_id):
+        if not key:
+            continue
+        snapshot = opportunity_map.get(key)
+        name = snapshot.get("market_name") if isinstance(snapshot, dict) else None
+        if name:
+            return str(name)
+
+    slug = market_id or token_id
+    return slug.replace("-", " ").replace("_", " ").title() if slug else "Unknown Market"
+
+
+def render_positions(positions: list[dict], opportunity_map: dict | None = None):
+    """`positions` is data_manager.read_open_positions()'s result;
+    `opportunity_map` is data_manager.get_recent_opportunity_map()'s result
+    — both DB-derived now that the engine runs as a separate process (see
+    run_engine.py), replacing the old in-memory bridge.current_portfolio/
+    bridge.opportunity_map reads."""
     if not positions:
         st.info("No open positions currently.")
         return
 
-    total_value = sum(float(getattr(p, "value", 0.0) or 0.0) for p in positions)
+    opportunity_map = opportunity_map or {}
+
+    total_value = sum(float(p.get("value", 0.0) or 0.0) for p in positions)
     total_pnl = sum(
-        (float(getattr(p, "current_price", 0.0)) - float(getattr(p, "initial_price", 0.0)))
-        * float(getattr(p, "shares", 0.0))
+        (float(p.get("current_price", 0.0) or 0.0) - float(p.get("initial_price", 0.0) or 0.0))
+        * float(p.get("shares", 0.0) or 0.0)
         for p in positions
     )
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Open Positions", len(positions))
-    c2.metric("Total Value", f"${total_value:,.2f}")
-    c3.metric("Unrealized PnL", f"${total_pnl:,.2f}")
-
-    analytics = getattr(bridge, "position_analytics", {}) or {}
+    c2.metric("Total Value", fmt_dollars(total_value))
+    c3.metric("Unrealized PnL", fmt_dollars(total_pnl))
 
     rows = []
     for pos in positions:
-        try:
-            row = asdict(pos)
-        except Exception:
-            row = pos.__dict__ if hasattr(pos, "__dict__") else {}
+        shares = float(pos.get("shares", 0.0) or 0.0)
+        initial_price = float(pos.get("initial_price", 0.0) or 0.0)
+        current_price = float(pos.get("current_price", 0.0) or 0.0)
+        rows.append({
+            "Market": _readable_market_name(pos, opportunity_map),
+            "Side": str(pos.get("side", "") or "").upper(),
+            "Invested": shares * initial_price,
+            "Entry Price": initial_price,
+            "Current Price": current_price,
+            "P&L": float(pos.get("pnl_ratio", 0.0) or 0.0),
+        })
 
-        # Phase 7: edge-decay tracking — how the Wang edge has moved since
-        # entry, re-derived by PortfolioManager every management cycle.
-        snapshot = analytics.get(str(row.get("token_id", "")), {})
-        row["wang_edge_entry"] = snapshot.get("entry_wang_edge")
-        row["wang_edge_now"] = snapshot.get("current_wang_edge")
-        row["wang_edge_delta"] = snapshot.get("edge_delta")
-        rows.append(row)
+    pos_df = pd.DataFrame(rows, columns=["Market", "Side", "Invested", "Entry Price", "Current Price", "P&L"])
 
-    pos_df = pd.DataFrame(rows)
-    desired_cols = [
-        "market_id", "token_id", "side", "shares", "initial_price", "current_price", "value", "pnl_ratio",
-        "wang_edge_entry", "wang_edge_now", "wang_edge_delta",
-    ]
-    pos_df = pos_df[[c for c in desired_cols if c in pos_df.columns]]
-    pos_df = pos_df.rename(columns={
-        "wang_edge_entry": "Wang Edge (entry)",
-        "wang_edge_now": "Wang Edge (now)",
-        "wang_edge_delta": "Edge Δ",
-    })
-
-    format_map = {
-        "initial_price": "{:.4f}",
-        "current_price": "{:.4f}",
-        "value": "${:,.2f}",
-        "pnl_ratio": "{:.2%}",
-    }
-    for col in ("Wang Edge (entry)", "Wang Edge (now)", "Edge Δ"):
-        if col in pos_df.columns:
-            format_map[col] = lambda v: "-" if pd.isna(v) else f"{v:.4f}"
-
-    styled = pos_df.style.format(format_map, na_rep="-").map(
+    styled = pos_df.style.format({
+        "Invested": "${:,.2f}",
+        "Entry Price": "${:,.4f}",
+        "Current Price": "${:,.4f}",
+        "P&L": "{:+.2%}",
+    }).map(
         lambda v: "color: #16a34a" if v > 0 else ("color: #dc2626" if v < 0 else ""),
-        subset=["pnl_ratio"],
+        subset=["P&L"],
+    ).map(
+        lambda v: "color: #16a34a; font-weight: 700;" if v == "YES"
+        else ("color: #f59e0b; font-weight: 700;" if v == "NO" else ""),
+        subset=["Side"],
     )
-
-    if "Edge Δ" in pos_df.columns:
-        styled = styled.map(
-            lambda v: "" if pd.isna(v) else (
-                "color: #dc2626; font-weight: 700;" if v < 0  # edge decaying since entry
-                else ("color: #16a34a;" if v > 0 else "")
-            ),
-            subset=["Edge Δ"],
-        )
-
-    if "side" in pos_df.columns:
-        styled = styled.map(
-            lambda v: "color: #16a34a; font-weight: 700;" if str(v).upper() == "YES"
-            else ("color: #f59e0b; font-weight: 700;" if str(v).upper() == "NO" else ""),
-            subset=["side"],
-        )
 
     st.dataframe(styled, hide_index=True, use_container_width=True)
 

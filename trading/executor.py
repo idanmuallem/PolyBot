@@ -520,9 +520,14 @@ class TradeExecutor:
         self, legs: List[Dict[str, Any]], log_func: Callable,
         asset_type: str, group_id: Optional[str], strategy_tag: str,
     ) -> Dict[str, Any]:
-        """Dry-run/paper simulation: attempt every leg through execute_trade()
-        (which routes to the paper engine, walking its real order book), and
-        only record a leg as filled if that attempt genuinely succeeded.
+        """Log-only fallback for when NO real PaperAdapter is available
+        (pm_trader not installed) — execute_arbitrage_group() now routes to
+        _execute_paper_limit_arbitrage_group() instead whenever self.paper
+        is set, so this only runs in the degraded "no paper engine at all"
+        mode. Attempts every leg through execute_trade() and only records a
+        leg as filled if that attempt genuinely succeeded (execute_trade()
+        with no paper adapter returns True unconditionally — the original
+        log-only DRY-RUN behavior, working as designed).
 
         Previously this recorded every leg's *requested* shares as filled
         unconditionally, ignoring execute_trade()'s return value entirely —
@@ -665,6 +670,137 @@ class TradeExecutor:
 
         return {"success": True, "arb_sets": arb_sets, "fills": fills, "unfilled": [], "surplus": surplus}
 
+    async def _execute_paper_limit_arbitrage_group(
+        self, legs: List[Dict[str, Any]], timeout_seconds: float, log_func: Callable,
+        strategy_tag: str, asset_type: str, group_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Paper-mode arbitrage execution via limit orders, replacing
+        _simulate_full_fill_arbitrage_group()'s market-order walk for
+        groups where a real PaperAdapter is available. A market order pays
+        whatever it takes to fill the full requested dollar amount — real
+        arbitrage-leg data showed that walk was where 100% of this
+        strategy's cost overhead came from, concentrated in the thinnest
+        (<$0.05) price tier. A limit order caps the price paid per leg
+        instead, at the cost of possibly not filling (fully, or at all).
+        The limit price is the raw scan-time leg["price"], no premium above
+        it — same price _execute_live_arbitrage_group() submits at, so
+        paper's fill rate isn't systematically more lenient than live's
+        would be for the same signal (a buffer here previously let paper
+        fill in cases where live's unbuffered order at the same price would
+        time out unfilled).
+
+        Structurally mirrors _execute_live_arbitrage_group() above (submit
+        every leg, poll with a bounded async loop, collect fills as they
+        land, cancel/void whatever's left unfilled at the timeout) — see
+        that method for the live-CLOB equivalent this is modeled on.
+        pm_trader.Engine's own limit-order support (place_limit_order/
+        check_orders/cancel_limit_order) plays the same role here that the
+        live CLOB client's order endpoints play there.
+
+        One real difference from the live path worth knowing: pm_trader's
+        check_orders() uses "fak" (fill-and-kill) semantics per check — the
+        first check that finds ANY liquidity within a leg's limit price
+        fills it (fully or partially) and immediately marks that order
+        done; it does not keep resting to pick up more shares on later
+        checks. So polling here mainly gives legs that haven't found ANY
+        liquidity yet a chance for the book to move favorably before the
+        timeout — not a chance for an already-partially-filled leg to grow.
+        """
+        # check_orders() operates on every pending order in the engine, not
+        # just this group's — harmless in practice since arbitrage legs are
+        # the only place this codebase ever places limit orders, and groups
+        # are processed one at a time (_stage_strategy_scan awaits each
+        # _execute_strategy_group call before starting the next).
+        orders: Dict[str, Optional[dict]] = {}
+
+        for leg in legs:
+            token_id = str(leg["token_id"])
+            price = float(leg["price"])
+            shares = float(leg["shares"])
+            order = self.paper.place_limit_buy(
+                slug=leg.get("slug"),
+                condition_id=leg.get("condition_id"),
+                token_id=token_id,
+                side=str(leg.get("side", "YES")),
+                amount_usd=float(leg.get("bet_amount_usd", shares * price)),
+                limit_price=price,
+                no_token_id=leg.get("no_token_id"),
+            )
+            orders[token_id] = order
+            if order is None:
+                log_func("EXECUTION-ERROR", asset_type, token_id, {
+                    "reason": "limit_order_placement_failed",
+                    "group_id": group_id,
+                })
+
+        fills: Dict[str, float] = {tid: 0.0 for tid in orders}
+        poll_interval = max(0.01, min(1.0, timeout_seconds / 10.0)) if timeout_seconds > 0 else 0.0
+        deadline = time.monotonic() + timeout_seconds
+
+        while True:
+            self.paper.check_pending_limit_orders()
+            for token_id, order in orders.items():
+                if order is not None:
+                    fills[token_id] = self.paper.get_position_shares(
+                        order["market_condition_id"], order["outcome"],
+                    )
+            if fills and all(filled > 0 for filled in fills.values()):
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(poll_interval)
+
+        unfilled = [tid for tid, filled in fills.items() if filled <= 0]
+
+        if unfilled:
+            # Cancel every order, matching _execute_live_arbitrage_group's
+            # structure — cancelling one that already filled is a harmless
+            # no-op (pm_trader's check_orders() already removed it from
+            # "pending" via mark_filled(); it doesn't retract the fill).
+            for order in orders.values():
+                if order is not None:
+                    self.paper.cancel_limit_order(order["id"])
+
+            for token_id in unfilled:
+                log_func("REJECTED", asset_type, token_id, {
+                    "reason": "limit_order_not_filled",
+                    "group_id": group_id,
+                    "timeout_seconds": timeout_seconds,
+                })
+
+            log_func("REJECTED", asset_type, group_id or "group", {
+                "reason": "partial_fill_no_arb",
+                "group_id": group_id,
+                "unfilled": unfilled,
+                "fills": fills,
+            })
+
+            # Shares that did fill before the group was voided are real,
+            # unretractable trades (cancel only stops further fills) —
+            # they still count against this strategy's daily trade count,
+            # same as the live path.
+            for token_id, filled in fills.items():
+                if filled > 0:
+                    self._record_strategy_trade(strategy_tag)
+
+            return {"success": False, "arb_sets": 0, "fills": fills, "unfilled": unfilled, "surplus": {}}
+
+        arb_sets = min(fills.values())
+        surplus = {tid: round(filled - arb_sets, 4) for tid, filled in fills.items() if filled > arb_sets}
+
+        for _token_id in fills:
+            self._record_strategy_trade(strategy_tag)
+
+        log_func("ARBITRAGE-FILL", asset_type, group_id or "group", {
+            "reason": "all_legs_filled_via_limit_order",
+            "group_id": group_id,
+            "fills": fills,
+            "arb_sets": arb_sets,
+            "surplus": surplus,
+        })
+
+        return {"success": True, "arb_sets": arb_sets, "fills": fills, "unfilled": [], "surplus": surplus}
+
     async def execute_arbitrage_group(
         self,
         legs: List[Dict[str, Any]],
@@ -684,14 +820,20 @@ class TradeExecutor:
 
         *legs* is `[{token_id, price, shares, side, ...}, ...]` — optional
         per-leg keys `bet_amount_usd`, `asset_type`, `no_token_id`, and
-        `group_id` (read from the first leg) enrich logging and let
-        dry-run reuse execute_trade()'s existing simulation path.
+        `group_id` (read from the first leg) enrich logging.
 
-        Dry-run/paper (no live client): every leg is simulated as a
-        complete fill — same as execute_trade()'s existing behavior — and
-        the timeout is never waited on, only the group structure is
-        logged. There's no real order book to poll fills against in
-        either case, so both collapse to the same simulated path.
+        Dry-run/paper with a real PaperAdapter available: legs are executed
+        via _execute_paper_limit_arbitrage_group() — limit orders against
+        pm_trader's simulated order book, capping the price paid per leg
+        instead of walking the book as deep as it takes (see that method's
+        docstring for why: real trade data showed 100% of this strategy's
+        cost overhead was slippage from that walk).
+
+        Dry-run/paper with no PaperAdapter (pm_trader not installed): falls
+        back to _simulate_full_fill_arbitrage_group()'s log-only
+        simulation — there's no real order book to place anything against
+        in this degraded mode, so it just logs the group structure and
+        reuses execute_trade()'s existing "no paper adapter" behavior.
         """
         if not legs:
             return {"success": False, "arb_sets": 0, "fills": {}, "unfilled": [], "surplus": {}}
@@ -700,6 +842,10 @@ class TradeExecutor:
         group_id = legs[0].get("group_id")
 
         if self.dry_run or self.client is None:
+            if self.paper is not None:
+                return await self._execute_paper_limit_arbitrage_group(
+                    legs, float(timeout_seconds), log_func, strategy_tag, asset_type, group_id,
+                )
             return self._simulate_full_fill_arbitrage_group(legs, log_func, asset_type, group_id, strategy_tag)
 
         return await self._execute_live_arbitrage_group(

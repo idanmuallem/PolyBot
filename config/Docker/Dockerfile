@@ -18,6 +18,13 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy the rest of your bot's code
 COPY . .
 
+# Normalize line endings and make executable — the repo may be checked out
+# with CRLF line endings on Windows, which breaks `/bin/sh` shebang parsing.
+RUN sed -i 's/\r$//' config/Docker/entrypoint.sh && chmod +x config/Docker/entrypoint.sh
+
 EXPOSE 8501
 
-CMD ["streamlit", "run", "ui/dashboard.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# Runs both the headless trading engine (run_engine.py) and the Streamlit
+# dashboard in this one container — see config/Docker/entrypoint.sh. The
+# engine no longer starts only when a browser loads the dashboard page.
+CMD ["./config/Docker/entrypoint.sh"]

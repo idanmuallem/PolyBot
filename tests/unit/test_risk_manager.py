@@ -143,6 +143,57 @@ def test_healthy_wang_edge_does_not_trigger_exit():
     assert "WANG-EDGE-DECAY" not in log_levels
 
 
+# ── manage_portfolio: ENABLE_ARBITRAGE gate ───────────────────────────────────
+
+def test_arbitrage_position_skipped_entirely_when_disabled():
+    """With ENABLE_ARBITRAGE=False, an arbitrage-tagged position must not be
+    touched by manage_portfolio() at all -- not exited, not even stashed into
+    position_analytics -- while a crypto position in the same book is still
+    handled normally in the same loop."""
+    pm, bridge, executor = _make_pm()
+    pm.enable_arbitrage = False
+
+    arb_pos = _pos(pnl_ratio=0.99, token_id="arb_tok")        # would hit TAKE-PROFIT if processed
+    crypto_pos = _pos(pnl_ratio=0.25, token_id="crypto_tok")  # genuinely hits TAKE-PROFIT
+    bridge.opportunity_map = {
+        "arb_tok": {"asset_type": "Arbitrage::EventSum"},
+        "crypto_tok": {"asset_type": "Crypto::BTCUSDT"},
+    }
+    executor.get_open_positions.side_effect = [[arb_pos, crypto_pos], []]
+    executor.sell_position.return_value = True
+
+    log_calls = []
+    pm.manage_portfolio(lambda level, asset_type, token_id, payload: log_calls.append((level, token_id)))
+
+    # Zero calls into the exit path for the arbitrage leg -- only the crypto
+    # position was ever handed to sell_position.
+    executor.sell_position.assert_called_once()
+    assert executor.sell_position.call_args[0][0] == "crypto_tok"
+
+    assert not any(token_id == "arb_tok" for _level, token_id in log_calls)
+    assert any(token_id == "crypto_tok" for _level, token_id in log_calls)
+    assert "arb_tok" not in bridge.position_analytics
+    assert "crypto_tok" in bridge.position_analytics
+
+
+def test_arbitrage_position_processed_normally_when_enabled():
+    """Sanity check: the gate only fires when the flag is off -- the same
+    arbitrage-tagged position is exited normally when ENABLE_ARBITRAGE is on."""
+    pm, bridge, executor = _make_pm()
+    assert pm.enable_arbitrage is True
+
+    arb_pos = _pos(pnl_ratio=0.99, token_id="arb_tok")
+    bridge.opportunity_map = {"arb_tok": {"asset_type": "Arbitrage::EventSum"}}
+    executor.get_open_positions.side_effect = [[arb_pos], []]
+    executor.sell_position.return_value = True
+
+    log_levels = []
+    pm.manage_portfolio(lambda level, *a, **kw: log_levels.append(level))
+
+    executor.sell_position.assert_called_once()
+    assert "TAKE-PROFIT" in log_levels
+
+
 def test_wang_edge_decay_skipped_without_raw_probability():
     # No opportunity_map entry and no DB row -> nothing to re-evaluate;
     # falls through to the existing P&L-based checks untouched.

@@ -36,6 +36,12 @@ class PortfolioManager:
         self.stop_loss_pct = float(config.stop_loss_pct)
         self.min_hold_ev = float(config.min_hold_ev)
 
+        # ENABLE_ARBITRAGE kill switch: manage_portfolio() below skips every
+        # arbitrage-tagged position entirely when this is False, so that
+        # cleanup/exit handling — not just new-trade entry — also stops
+        # touching arbitrage positions. Crypto positions are unaffected.
+        self.enable_arbitrage = bool(getattr(config, "enable_arbitrage", True))
+
         # Wang edge decay exit (see _check_wang_edge_decay): an additional,
         # earlier exit signal alongside take-profit/stop-loss, not a
         # replacement for them.
@@ -216,6 +222,15 @@ class PortfolioManager:
         needed for correlation exposure, since Position itself doesn't carry it."""
         val = self._resolve_position_field(position, "asset_type", direct_key="asset_type", caster=str)
         return val or None
+
+    def _is_arbitrage_position(self, position) -> bool:
+        """True if this position's resolved asset_type marks it as an
+        arbitrage leg (e.g. "Arbitrage::EventSum", see trading/strategies/
+        event_sum.py). Used only by manage_portfolio()'s ENABLE_ARBITRAGE
+        gate below — not an exit decision itself, and not needed by any
+        crypto-only caller (correlation exposure, dashboard analytics, ...)."""
+        asset_type = self._resolve_position_asset_type(position)
+        return bool(asset_type) and asset_type.startswith("Arbitrage::")
 
     def _resolve_position_entry_wang_edge(self, position):
         """Look up the Wang edge recorded at entry, for the dashboard's edge-decay display."""
@@ -475,6 +490,14 @@ class PortfolioManager:
         self._refresh_portfolio()
 
         for position in list(self.bridge.current_portfolio):
+            # ENABLE_ARBITRAGE kill switch: while arbitrage is disabled, no
+            # arbitrage-specific handling may run at all — not even exiting
+            # an already-open arbitrage leg — regardless of what's in the
+            # book. Non-arbitrage (crypto) positions in this same loop are
+            # completely unaffected by this check.
+            if not self.enable_arbitrage and self._is_arbitrage_position(position):
+                continue
+
             pnl_ratio = float(self._position_field(position, "pnl_ratio", 0.0) or 0.0)
 
             # Computed once per position per cycle — feeds both the decay

@@ -87,7 +87,7 @@ async def test_resolve_closed_markets_runs_on_the_calling_thread():
     seen_thread_ids = []
 
     mock_paper = MagicMock()
-    mock_paper.resolve_closed_markets.side_effect = lambda: seen_thread_ids.append(threading.get_ident())
+    mock_paper.resolve_closed_markets.side_effect = lambda **kw: seen_thread_ids.append(threading.get_ident())
     pipeline.executor.paper = mock_paper
 
     # Force the periodic (15-min) check to fire on the very first iteration.

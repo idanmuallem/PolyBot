@@ -564,3 +564,158 @@ def test_execute_arbitrage_group_dry_run_simulates_full_fill_no_real_orders():
     assert executor.client is None
     assert log_calls.count("DRY-RUN") == 2
     assert "ARBITRAGE-FILL" in log_calls
+
+
+# ── _execute_paper_limit_arbitrage_group ──────────────────────────────────────
+#
+# Paper-mode arbitrage now goes through limit orders (capping the price
+# paid per leg) instead of _simulate_full_fill_arbitrage_group's market-order
+# walk, whenever a real PaperAdapter is available. These mock PaperAdapter
+# directly (place_limit_buy/check_pending_limit_orders/get_position_shares/
+# cancel_limit_order) rather than a real pm_trader engine, mirroring how the
+# live-branch tests above mock _submit_order/_get_order_filled_shares.
+
+def _paper_limit_executor(**config_overrides):
+    """A TradeExecutor wired for the paper-limit-order branch of
+    execute_arbitrage_group — dry_run=True with a mocked PaperAdapter."""
+    executor = _make_executor(**config_overrides)  # dry_run=True, paper=None by default
+    executor.paper = MagicMock()
+    return executor
+
+
+def _mock_paper_limit_orders(fills_by_token: dict):
+    """Configures a MagicMock as PaperAdapter for the limit-order path,
+    matched by token_id via a deterministic order/condition id, so tests
+    can simulate arbitrary per-leg fills without a real order book."""
+    condition_to_token = {}
+
+    def fake_place_limit_buy(slug, condition_id, token_id, side, amount_usd, limit_price, no_token_id=None):
+        cond = f"cond_{token_id}"
+        condition_to_token[cond] = token_id
+        return {"id": f"order_{token_id}", "market_condition_id": cond, "outcome": side.lower()}
+
+    def fake_get_position_shares(condition_id, outcome):
+        token_id = condition_to_token.get(condition_id)
+        return fills_by_token.get(token_id, 0.0)
+
+    paper = MagicMock()
+    paper.place_limit_buy.side_effect = fake_place_limit_buy
+    paper.check_pending_limit_orders.return_value = []
+    paper.get_position_shares.side_effect = fake_get_position_shares
+    paper.cancel_limit_order.return_value = True
+    return paper
+
+
+def test_paper_limit_arbitrage_group_all_legs_fill_returns_success():
+    executor = _paper_limit_executor()
+    executor.paper = _mock_paper_limit_orders({"A": 3.0, "B": 2.0})
+    legs = [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 0.9},
+        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES", "bet_amount_usd": 0.8},
+    ]
+
+    result = asyncio.run(executor.execute_arbitrage_group(
+        legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
+    ))
+
+    assert result["success"] is True
+    assert result["arb_sets"] == 2.0
+    assert result["unfilled"] == []
+    assert result["fills"] == {"A": 3.0, "B": 2.0}
+    # Limit price = the raw scan-time leg price, no premium — same price
+    # _execute_live_arbitrage_group() submits at, so paper doesn't fill
+    # more easily than live would for the same signal.
+    call_kwargs = {c.kwargs["token_id"]: c.kwargs for c in executor.paper.place_limit_buy.call_args_list}
+    assert call_kwargs["A"]["limit_price"] == 0.30
+    assert call_kwargs["B"]["limit_price"] == 0.40
+
+
+def test_paper_limit_arbitrage_group_never_filled_leg_voids_group():
+    executor = _paper_limit_executor()
+    executor.paper = _mock_paper_limit_orders({"A": 3.0, "B": 0.0})  # B's limit never touched
+    legs = [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
+        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES"},
+    ]
+
+    result = asyncio.run(executor.execute_arbitrage_group(
+        legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
+    ))
+
+    assert result["success"] is False
+    assert result["arb_sets"] == 0
+    assert result["unfilled"] == ["B"]
+    assert result["fills"] == {"A": 3.0, "B": 0.0}
+    # Both orders get cancelled when the group is voided — cancelling an
+    # already-filled one is a harmless no-op.
+    assert executor.paper.cancel_limit_order.call_count == 2
+
+
+def test_paper_limit_arbitrage_group_partial_fill_counts_as_unfilled_for_group_purposes():
+    """A limit order that partially fills (some shares, less than
+    requested) is still short of the guaranteed complementary set if
+    another leg got zero — the group must still void, not silently keep
+    the partial fill as if it were complete."""
+    executor = _paper_limit_executor()
+    executor.paper = _mock_paper_limit_orders({"A": 1.5, "B": 0.0})  # A partially filled, B never touched
+    legs = [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
+        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES"},
+    ]
+
+    result = asyncio.run(executor.execute_arbitrage_group(
+        legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
+    ))
+
+    assert result["success"] is False
+    assert result["arb_sets"] == 0
+    assert result["unfilled"] == ["B"]
+    assert result["fills"]["A"] == 1.5  # the partial fill is preserved in the data, not discarded
+
+
+def test_paper_limit_arbitrage_group_uneven_fills_computes_surplus():
+    executor = _paper_limit_executor()
+    executor.paper = _mock_paper_limit_orders({"A": 3.0, "B": 10.0, "C": 5.0})
+    legs = [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
+        {"token_id": "B", "price": 0.30, "shares": 10.0, "side": "YES"},
+        {"token_id": "C", "price": 0.30, "shares": 5.0, "side": "YES"},
+    ]
+
+    result = asyncio.run(executor.execute_arbitrage_group(
+        legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
+    ))
+
+    assert result["success"] is True
+    assert result["arb_sets"] == 3.0
+    assert result["surplus"] == {"B": 7.0, "C": 2.0}
+
+
+def test_execute_arbitrage_group_routes_to_paper_limit_when_paper_available():
+    """execute_arbitrage_group()'s dispatch: dry_run + a real (mocked)
+    PaperAdapter must route through the limit-order path, not the
+    log-only market-order simulation."""
+    executor = _paper_limit_executor()
+    executor.paper = _mock_paper_limit_orders({"A": 1.0})
+    legs = [{"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"}]
+
+    asyncio.run(executor.execute_arbitrage_group(
+        legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
+    ))
+
+    executor.paper.place_limit_buy.assert_called_once()
+
+
+def test_execute_arbitrage_group_falls_back_to_simulation_when_no_paper_adapter():
+    """dry_run with no PaperAdapter at all (pm_trader not installed) must
+    still fall back to the log-only simulation, not the limit-order path
+    (which has nothing real to place orders against in that mode)."""
+    executor = _make_executor()  # dry_run=True, paper=None
+    legs = [{"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 1.0}]
+
+    result = asyncio.run(executor.execute_arbitrage_group(
+        legs=legs, timeout_seconds=60.0, log_func=lambda *a, **kw: None,
+    ))
+
+    assert result["success"] is True
+    assert result["fills"] == {"A": 3.0}

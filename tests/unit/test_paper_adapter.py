@@ -2,6 +2,7 @@
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -120,6 +121,53 @@ class TestPaperAdapterBuySell:
         assert "tok_no" in adapter._token_map
         assert adapter._token_map["tok_no"] == ("test-market", "no")
 
+    def test_place_limit_buy_tags_token_as_arbitrage(self, tmp_path):
+        """place_limit_buy() is arbitrage's sole paper-fill path -- every
+        token it records must end up in self._arbitrage_tokens so
+        resolve_closed_markets() can identify it later."""
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=10000.0)
+        adapter.engine.place_limit_order = MagicMock(return_value={"id": 1})
+
+        order = adapter.place_limit_buy(
+            slug="arb-market", condition_id=None,
+            token_id="arb_tok", side="YES", amount_usd=25.0, limit_price=0.40,
+        )
+
+        assert order == {"id": 1}
+        assert adapter._token_map.get("arb_tok") == ("arb-market", "yes")
+        assert "arb_tok" in adapter._arbitrage_tokens
+
+    def test_execute_buy_does_not_tag_token_as_arbitrage(self, tmp_path):
+        """The crypto/model path's entry point (execute_buy) must never mark
+        its own tokens as arbitrage."""
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=10000.0)
+        mock_trade = MagicMock()
+        mock_trade.trade.shares = 10.0
+        mock_trade.trade.avg_price = 0.50
+        mock_trade.trade.fee = 0.01
+        mock_trade.trade.slippage = 5.0
+        adapter.engine.buy = MagicMock(return_value=mock_trade)
+
+        adapter.execute_buy(
+            slug="crypto-market", condition_id=None,
+            token_id="crypto_tok", side="YES", amount_usd=50.0,
+        )
+
+        assert "crypto_tok" not in adapter._arbitrage_tokens
+
+    def test_arbitrage_tag_persists_across_reload(self, tmp_path):
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=10000.0)
+        adapter.engine.place_limit_order = MagicMock(return_value={"id": 1})
+        adapter.place_limit_buy(
+            slug="arb-market", condition_id=None,
+            token_id="arb_tok", side="YES", amount_usd=25.0, limit_price=0.40,
+        )
+
+        reloaded = PaperAdapter(data_dir=str(tmp_path), initial_balance=10000.0)
+
+        assert reloaded._token_map.get("arb_tok") == ("arb-market", "yes")
+        assert "arb_tok" in reloaded._arbitrage_tokens
+
 
 class TestPaperAdapterPositions:
     def test_get_positions_returns_empty_when_no_engine(self):
@@ -151,6 +199,160 @@ class TestPaperAdapterPositions:
         assert pos.shares == pytest.approx(10.0)
         assert pos.side == "YES"
         assert pos.token_id == "tok1"
+
+    def test_get_positions_does_not_use_slug_as_token_id_when_unmapped(self, tmp_path, caplog):
+        """A real, genuinely-open engine position whose _token_map entry is
+        missing (e.g. lost across a restart — see execute_buy's
+        _save_token_map()) must not be given the market slug as a fake
+        token_id: execute_sell()'s own _token_map lookup can never match a
+        slug (only real token_ids are ever stored as keys), so that
+        fallback made the position look normal everywhere downstream while
+        actually being permanently unsellable. The reconstructed token_id
+        must be a distinct, obviously-broken sentinel instead."""
+        import logging
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=10000.0)
+        # Deliberately no _token_map entry for "orphaned-market"/"yes".
+
+        adapter.engine.get_portfolio = MagicMock(return_value=[{
+            "market_slug": "orphaned-market",
+            "outcome": "yes",
+            "shares": 95.83,
+            "avg_entry_price": 0.01,
+            "live_price": 0.01,
+            "current_value": 0.96,
+        }])
+
+        with caplog.at_level(logging.WARNING, logger="trading.paper_adapter"):
+            positions = adapter.get_positions()
+
+        assert len(positions) == 1
+        pos = positions[0]
+        assert pos.market_id == "orphaned-market"
+        assert pos.token_id != "orphaned-market"
+        assert "orphaned-market" in pos.token_id  # still identifiable, just not passable as a real id
+        assert pos.shares == pytest.approx(95.83)
+
+        # A sell attempt against the reconstructed id must fail cleanly
+        # (not silently "succeed"), since _token_map has no entry keyed by
+        # this sentinel or by the raw slug.
+        assert adapter.execute_sell(pos.token_id, pos.shares) is False
+
+        assert any("no _token_map entry" in r.message for r in caplog.records)
+
+    def test_execute_sell_invalidates_positions_cache(self, tmp_path):
+        """get_positions() caches for _positions_cache_ttl seconds (30s).
+        Without invalidating that cache on a successful sell, a caller that
+        reads positions again right after (e.g. PortfolioManager.
+        manage_portfolio()'s trailing _refresh_portfolio()) still sees the
+        pre-sell snapshot and re-attempts to sell the same, already-closed
+        position on every tick until the cache naturally expires — the
+        observed "phantom repeated sell" symptom. Immediately re-querying
+        positions after a successful sell must reflect the sale, not the
+        stale cache."""
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=10000.0)
+        adapter._token_map["tok1"] = ("test-market", "yes")
+
+        adapter.engine.get_portfolio = MagicMock(return_value=[{
+            "market_slug": "test-market",
+            "outcome": "yes",
+            "shares": 10.0,
+            "avg_entry_price": 0.40,
+            "live_price": 0.55,
+            "current_value": 5.50,
+        }])
+
+        # Prime the cache with the pre-sell snapshot.
+        positions = adapter.get_positions()
+        assert len(positions) == 1
+
+        # The engine's own sell succeeds and now reports the position gone —
+        # but adapter.get_positions() would still return the cached,
+        # pre-sell snapshot for up to 30s if the cache isn't invalidated.
+        adapter.engine.sell = MagicMock(
+            return_value=SimpleNamespace(trade=SimpleNamespace(amount_usd=5.50, avg_price=0.55))
+        )
+        adapter.engine.get_portfolio = MagicMock(return_value=[])
+
+        assert adapter.execute_sell("tok1", 10.0) is True
+
+        positions_after_sell = adapter.get_positions()
+        assert positions_after_sell == []
+
+
+class TestResolveClosedMarketsArbitrageGate:
+    """resolve_closed_markets(resolve_arbitrage=...) -- the ENABLE_ARBITRAGE
+    kill switch's coverage of the periodic resolve-check, not just new-trade
+    entry. A position is "arbitrage" here purely by having been recorded via
+    place_limit_buy() (arbitrage's sole paper-fill path) -- see
+    self._arbitrage_tokens."""
+
+    @staticmethod
+    def _fake_position(condition_id, slug, outcome):
+        return SimpleNamespace(market_condition_id=condition_id, market_slug=slug, outcome=outcome)
+
+    @staticmethod
+    def _fake_resolve_result(slug, outcome, payout=1.0):
+        return SimpleNamespace(position=SimpleNamespace(market_slug=slug, outcome=outcome), payout=payout)
+
+    def test_resolve_arbitrage_false_skips_arbitrage_market_entirely(self, tmp_path):
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=100.0)
+        adapter._token_map = {
+            "arb_tok": ("arb-slug", "yes"),
+            "crypto_tok": ("crypto-slug", "yes"),
+        }
+        adapter._arbitrage_tokens = {"arb_tok"}
+
+        mock_engine = MagicMock()
+        mock_engine.db.get_open_positions.return_value = [
+            self._fake_position("cond_arb", "arb-slug", "yes"),
+            self._fake_position("cond_crypto", "crypto-slug", "yes"),
+        ]
+        mock_engine.api.get_market.return_value = SimpleNamespace(closed=True)
+        mock_engine.resolve_market.return_value = [self._fake_resolve_result("crypto-slug", "yes")]
+        adapter.engine = mock_engine
+
+        count = adapter.resolve_closed_markets(resolve_arbitrage=False)
+
+        assert count == 1
+        mock_engine.resolve_all.assert_not_called()
+        # The arbitrage market's slug never even reached get_market/resolve_market --
+        # confirms the arbitrage-specific branch was never entered, not just that
+        # its result was discarded.
+        mock_engine.api.get_market.assert_called_once_with("crypto-slug")
+        mock_engine.resolve_market.assert_called_once_with("crypto-slug")
+
+    def test_resolve_arbitrage_true_uses_engine_resolve_all(self, tmp_path):
+        """Sanity check: with the flag on, the original resolve_all() path
+        (which makes no arbitrage/crypto distinction) still runs unchanged."""
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=100.0)
+        mock_engine = MagicMock()
+        mock_engine.resolve_all.return_value = [self._fake_resolve_result("crypto-slug", "yes")]
+        adapter.engine = mock_engine
+
+        count = adapter.resolve_closed_markets(resolve_arbitrage=True)
+
+        assert count == 1
+        mock_engine.resolve_all.assert_called_once()
+
+    def test_resolve_arbitrage_false_still_resolves_crypto_when_no_arbitrage_open(self, tmp_path):
+        """No arbitrage positions in the book at all -- the crypto-only case
+        must resolve exactly as it always has."""
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=100.0)
+        adapter._token_map = {"crypto_tok": ("crypto-slug", "yes")}
+        adapter._arbitrage_tokens = set()
+
+        mock_engine = MagicMock()
+        mock_engine.db.get_open_positions.return_value = [
+            self._fake_position("cond_crypto", "crypto-slug", "yes"),
+        ]
+        mock_engine.api.get_market.return_value = SimpleNamespace(closed=True)
+        mock_engine.resolve_market.return_value = [self._fake_resolve_result("crypto-slug", "yes")]
+        adapter.engine = mock_engine
+
+        count = adapter.resolve_closed_markets(resolve_arbitrage=False)
+
+        assert count == 1
+        mock_engine.resolve_market.assert_called_once_with("crypto-slug")
 
 
 class TestPaperAdapterBalance:

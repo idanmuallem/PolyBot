@@ -20,6 +20,7 @@ from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
 from polymarket import PolymarketClient
 from trading.strategies import EventSumStrategy, Strategy
+from ui import data_manager
 
 
 # Minimum guaranteed edge (as a fraction of the guaranteed payout) an
@@ -1143,17 +1144,48 @@ class SequentialTradingPipeline:
                             # _get_order_filled_shares()/_cancel_order() accept
                             # blocking calls elsewhere in this sequential loop —
                             # this only runs once per 15 minutes.
-                            paper.resolve_closed_markets()
+                            #
+                            # resolve_arbitrage=config.enable_arbitrage: the
+                            # ENABLE_ARBITRAGE kill switch also covers this
+                            # cleanup path, not just new-trade entry — see
+                            # PaperAdapter.resolve_closed_markets().
+                            paper.resolve_closed_markets(resolve_arbitrage=self.config.enable_arbitrage)
                         except Exception as e:
                             self.log_func("PAPER-ERROR", "Engine", "resolve_all", {"error": str(e)})
 
-            requested_live = bool(getattr(self.bridge, "live_trading", False))
+            # Polled from engine_control (DB) rather than read off self.bridge
+            # directly: the dashboard that sets this now runs as a separate
+            # OS process (see run_engine.py) and can no longer write straight
+            # into this process's in-memory bridge. Defaults to False
+            # (dry-run) when no control row exists yet — see
+            # data_manager.read_live_trading_requested()'s docstring.
+            requested_live = data_manager.read_live_trading_requested(self.db_path)
             self.executor.dry_run = not requested_live
 
             sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
             self.portfolio_manager.manage_portfolio(self.log_func)  # exits always run, even while paused
             sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
             self._update_drawdown_guard()
+
+            # Flush this tick's live state to the DB for the dashboard
+            # process to read — every iteration, unconditionally, before any
+            # of the early `continue`s below, so it doesn't skip ticks where
+            # hunting finds nothing or a candidate gets rejected (the common
+            # case). See ui/data_manager.py's engine_status/open_positions
+            # tables and run_engine.py.
+            data_manager.write_engine_status(
+                db_path=self.db_path,
+                balance=float(self.bridge.current_balance),
+                starting_balance=float(self.bridge.starting_balance),
+                position_value=float(self.bridge.open_position_value),
+                unrealized_pnl=float(getattr(self.bridge, "unrealized_pnl", 0.0) or 0.0),
+                watch_only=bool(getattr(self.bridge, "watch_only", False)),
+            )
+            data_manager.write_open_positions(
+                db_path=self.db_path,
+                positions=list(getattr(self.bridge, "current_portfolio", None) or []),
+                position_analytics=dict(getattr(self.bridge, "position_analytics", None) or {}),
+            )
 
             if self.ctx.drawdown_paused:
                 continue  # circuit breaker: skip new-entry scanning/execution below
