@@ -805,11 +805,24 @@ class SequentialTradingPipeline:
             self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_held_simulated"})
             return None
 
-        # Prevent buying a market already in the portfolio.
+        # Prevent buying a market already in the portfolio. A NO-side paper
+        # fill is recorded under the NO token's own id, not this market's
+        # YES-canonical token_id used above for hunting/evaluation -- see
+        # PaperAdapter.execute_buy()'s `outcome == "no"` branch in
+        # trading/paper_adapter.py, which maps the fill to no_token_id.
+        # Matching only token_id here meant this check silently never fired
+        # for any NO-side holding (confirmed in production: every held
+        # position was a NO-side paper fill, so the restart-proof check
+        # never caught any of them -- only the in-memory
+        # _simulated_positions backstop above did, which resets to empty on
+        # every process restart while the real paper positions persist to
+        # disk, so a restart let every held position get re-bought). Also
+        # matching no_market_id closes that gap.
+        no_token_id = str(getattr(market, "no_market_id", "") or "")
         if hasattr(self.bridge, "current_portfolio") and self.bridge.current_portfolio:
             for position in self.bridge.current_portfolio:
                 pos_token = str(getattr(position, "asset_id", getattr(position, "token_id", "")))
-                if pos_token == token_id:
+                if pos_token == token_id or (no_token_id and pos_token == no_token_id):
                     self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_owned_in_portfolio"})
                     return None
 
