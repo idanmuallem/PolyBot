@@ -38,12 +38,12 @@ PolyBot scans Polymarket's prediction markets for mispriced contracts using real
 
 ## Architecture
 
-Each wallet runs as a fully isolated unit — its own `TradingConfig`, its own live state (`DataBridge`), its own SQLite trade history — bundled into a `WalletContext`. The shipped Streamlit dashboard currently drives exactly one `WalletContext` (built from `config/.env` or a wallet `config.json`); `WalletManager` is the multi-wallet orchestrator that runs several `WalletContext`s concurrently as asyncio tasks, for callers that need more than one wallet at a time.
+Each wallet runs as a fully isolated unit — its own `TradingConfig`, its own live state (`DataBridge`), its own SQLite trade history — bundled into a `WalletContext`. The trading engine (`run_engine.py`) and the Streamlit dashboard (`ui/dashboard.py`) run as two separate OS processes in the same container, sharing state only through `trades.db` (WAL mode) — the engine writes, the dashboard reads. `core/wallet_manager.py`'s `build_wallet_runtime()` is the shared step that wires one `WalletContext`'s runtime components (executor, scanner, portfolio manager, budget manager); `run_engine.py` is currently its only caller. There is no multi-wallet orchestrator today — an earlier `WalletManager` class that registered and ran several `WalletContext`s concurrently was removed as dead code (zero callers); reintroducing multi-wallet support would mean rebuilding that registry/orchestration layer on top of `build_wallet_runtime()`.
 
 ```
 ┌────────────────────────────────┐    ┌────────────────────────────────┐
-│ Streamlit Dashboard            │    │ WalletManager                  │
-│ (one WalletContext)            │    │ (many, via asyncio)            │
+│ Streamlit Dashboard            │    │ run_engine.py                  │
+│ (reads trades.db)              │    │ (writes trades.db)             │
 └────────────────────────────────┘    └────────────────────────────────┘
                  │                                    │
                  └────────────────────┬────────────────┘
@@ -72,7 +72,7 @@ Each wallet runs as a fully isolated unit — its own `TradingConfig`, its own l
 | Pattern | Where |
 |---|---|
 | Template Method | `BaseBrain.evaluate()` orchestrates; subclasses override `_calculate_probability()` |
-| Strategy | `BaseHunter` interface; `CryptoHunter`, `WeatherHunter`, `EconomyHunter`. Also `trading/strategies/Strategy` for model-free arbitrage (`EventSumStrategy`) |
+| Strategy | `BaseHunter` interface; `CryptoHunter` is the only hunter wired into the default `PolymarketScannerHunter` — `WeatherHunter`/`EconomyHunter` implement the same interface but aren't instantiated anywhere in production yet (see below). Also `trading/strategies/Strategy` for model-free arbitrage (`EventSumStrategy`) |
 | Constructor DI | `WalletContext` bundles a wallet's config/state/db_path; most components take their dependencies through `__init__` rather than reading globals |
 | Sequential Pipeline | Hunt → Evaluate (Brain + PricingEngine) → Risk-check → Execute in `SequentialTradingPipeline` |
 | Factory | `get_brain_for_asset_type()` returns the right pricing model by asset class |
@@ -98,7 +98,7 @@ PolyBot/
 │   ├── trading_config.py       # TradingConfig: from_env() (config/.env) or from_file() (wallet config.json)
 │   ├── bridge.py               # DataBridge: per-wallet live state (dashboard <-> engine)
 │   ├── wallet_context.py       # WalletContext: bundles a wallet's config + bridge + db_path
-│   └── wallet_manager.py       # WalletManager: runs multiple WalletContexts concurrently (asyncio)
+│   └── wallet_manager.py       # build_wallet_runtime(): wires one WalletContext's components (used by run_engine.py)
 │
 ├── hunters/                    # Market discovery and reference-data fetching
 │   ├── base.py                 # BaseHunter interface + Polymarket pagination logic
@@ -155,11 +155,11 @@ PolyBot/
 
 Each hunter queries the Polymarket Gamma API for open markets matching its asset class. It then fetches a real-world **anchor value** from an external source:
 
-| Hunter | Markets | Anchor Source |
-|---|---|---|
-| `CryptoHunter` | BTC/ETH/SOL price markets | Spot price, realized vol, funding rate via CCXT (`CCXTDataClient`) |
-| `WeatherHunter` | Temperature prediction markets | OpenWeather API |
-| `EconomyHunter` | Fed Rate, CPI, GDP markets | FRED API |
+| Hunter | Markets | Anchor Source | Active by default? |
+|---|---|---|---|
+| `CryptoHunter` | BTC/ETH/SOL price markets | Spot price, realized vol, funding rate via CCXT (`CCXTDataClient`) | Yes — `PolymarketScannerHunter` defaults to `[CryptoHunter()]` |
+| `WeatherHunter` | Temperature prediction markets | OpenWeather API | No — implemented, but never instantiated in production; would need to be passed explicitly via `PolymarketScannerHunter(hunters=[...])` |
+| `EconomyHunter` | Fed Rate, CPI, GDP markets | FRED API | No — same as above |
 
 A separate, model-free path runs alongside the hunters: **strategies** (`trading/strategies/`) scan for arithmetic mispricings directly in market prices — no anchor value or brain involved. `EventSumStrategy` looks for multi-outcome events whose YES prices don't sum to $1.00.
 
@@ -245,7 +245,7 @@ cp config/.env config/.env.local   # or edit config/.env directly
 The dashboard supports two ways to configure a wallet:
 
 1. **`config/.env`** (default, single-wallet) — process environment variables, loaded via `TradingConfig.from_env()`.
-2. **A wallet `config.json`** (multi-wallet) — set `WALLET_CONFIG_PATH` to a JSON file (e.g. `data/wallet_alpha/config.json`) matching `TradingConfig`'s fields; loaded via `TradingConfig.from_file()`. This is what `WalletManager` uses to run several wallets concurrently, each isolated in its own `data/{wallet_id}/` directory with its own trade history.
+2. **A wallet `config.json`** — set `WALLET_CONFIG_PATH` to a JSON file (e.g. `data/wallet_alpha/config.json`) matching `TradingConfig`'s fields; loaded via `TradingConfig.from_file()`, isolated in its own `data/{wallet_id}/` directory with its own trade history. Both `ui/dashboard.py` and `run_engine.py` resolve config the same way (see `core/runtime_env.py`).
 
 For the single-wallet `.env` path, copy the template and fill in your values:
 
@@ -441,5 +441,5 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `CRYPTO_MAX_DAILY_TRADES` | `50` | Daily trade-count cap for the crypto/model-driven strategy path |
 | `ARBITRAGE_ORDER_TIMEOUT_SECONDS` | `60` | Seconds to wait for each arbitrage leg's limit order to fill before cancelling the whole group |
 | `ARBITRAGE_CRYPTO_FIRST` | `True` | Scan crypto event groups before general ones, so crypto gets first claim on the arbitrage budget |
-| `OPENWEATHER_API_KEY` | — | Required for WeatherHunter |
-| `FRED_API_KEY` | — | Required for EconomyHunter |
+| `OPENWEATHER_API_KEY` | — | Only takes effect if `WeatherHunter` is wired into `PolymarketScannerHunter`'s `hunters=` list — not active in the default deployment (see "Market Discovery" above) |
+| `FRED_API_KEY` | — | Only takes effect if `EconomyHunter` is wired into `PolymarketScannerHunter`'s `hunters=` list — not active in the default deployment (see "Market Discovery" above) |

@@ -1224,10 +1224,12 @@ class SequentialTradingPipeline:
 def _default_log_func(ctx: WalletContext):
     """Bare log_func that just persists events to this wallet's own DB.
 
-    Callers that want richer behavior (e.g. the dashboard's terminal-log
-    formatting) build and pass their own log_func instead — this default only
-    exists so a caller like WalletManager can drive a wallet from nothing more
-    than its WalletContext.
+    This is what run_engine.py actually uses today (it calls
+    run_market_monitor(ctx) with no log_func) — the dashboard no longer
+    builds a richer one of its own; it now reads the same hunt_history rows
+    back out via ui/data_manager.py's query functions instead (see
+    get_terminal_feed(), get_level_counts(), etc.). A future caller that
+    wants different logging behavior can still pass its own log_func here.
     """
     import ui.data_manager as data_manager
 

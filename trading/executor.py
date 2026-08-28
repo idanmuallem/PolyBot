@@ -971,11 +971,3 @@ class TradeExecutor:
     def reset_daily_count(self):
         self.trade_count_today = 0
         self.trades_by_strategy = {}
-
-    def get_execution_stats(self) -> Dict[str, Any]:
-        return {
-            "trades_today": self.trade_count_today,
-            "daily_limit": self.config.max_daily_trades,
-            "ev_threshold": self.config.min_ev,
-            "trades_by_strategy": dict(self.trades_by_strategy),
-        }

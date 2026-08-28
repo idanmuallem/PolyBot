@@ -34,30 +34,6 @@ class PolymarketClient:
 
     BASE_URL = "https://gamma-api.polymarket.com/events"
 
-    def search_events(
-        self,
-        query: str,
-        limit: int = 100,
-        offset: int = 0,
-        order: str = "volume",
-        ascending: str = "false",
-    ) -> List[Dict[str, Any]]:
-        """Fetch a page of events matching the query."""
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": limit,
-            "offset": offset,
-            "query": query,
-            "order": order,
-            "ascending": ascending,
-        }
-        resp = crequests.get(self.BASE_URL, params=params, impersonate="chrome120", timeout=15)
-        if resp.status_code != 200:
-            return []
-        events = resp.json()
-        return events if events else []
-
     def get_multi_outcome_events(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """Fetch active events with no keyword filter, for strategies (e.g.
         EventSumStrategy) that need to see whole events — including all of
@@ -150,14 +126,6 @@ class PolymarketScannerHunter:
         self.hunters = hunters or [CryptoHunter()]
         self.min_ev = float(config.min_ev)
         self.seen_markets: dict = {}
-
-    def get_hunter_for_asset_type(self, asset_type: str):
-        """Return the sub-hunter whose topic matches asset_type, or None."""
-        prefix = asset_type.split("::")[0].strip().lower()
-        for h in self.hunters:
-            if h.get_topic_type().lower() == prefix:
-                return h
-        return None
 
     # ------------------------------------------------------------------
     # Cooldown cache
