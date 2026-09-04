@@ -120,6 +120,30 @@ def test_log_event_opportunity_map_omits_missing_wang_fields(db):
     assert "wang_edge" not in entry
 
 
+def test_log_event_caps_opportunity_map(db):
+    bridge = DataBridge()
+    for i in range(dm.OPPORTUNITY_MAP_CAP + 50):
+        dm.log_event(bridge, "REJECTED", "Crypto::BTC", f"tok{i}", {"ev": 0.1}, db_path=db)
+
+    assert len(bridge.opportunity_map) == dm.OPPORTUNITY_MAP_CAP
+    # oldest tokens were evicted, most recent one is still present
+    assert "tok0" not in bridge.opportunity_map
+    assert f"tok{dm.OPPORTUNITY_MAP_CAP + 49}" in bridge.opportunity_map
+
+
+def test_log_event_re_touching_a_token_protects_it_from_eviction(db):
+    bridge = DataBridge()
+    dm.log_event(bridge, "TRACK", "Crypto::BTC", "keep-me", {"ev": 0.1}, db_path=db)
+    for i in range(dm.OPPORTUNITY_MAP_CAP):
+        dm.log_event(bridge, "REJECTED", "Crypto::BTC", f"tok{i}", {"ev": 0.1}, db_path=db)
+        if i == dm.OPPORTUNITY_MAP_CAP // 2:
+            # re-touch partway through the flood — should move to the back
+            # of the eviction order and survive
+            dm.log_event(bridge, "TRACK", "Crypto::BTC", "keep-me", {"ev": 0.2}, db_path=db)
+
+    assert "keep-me" in bridge.opportunity_map
+
+
 def test_log_event_non_dict_payload_does_not_crash(db):
     bridge = DataBridge()
     dm.log_event(bridge, "INFO", "Crypto::BTC", "tok1", "plain string payload", db_path=db)

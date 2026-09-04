@@ -12,6 +12,7 @@ for _s in (sys.stdout, sys.stderr):
 
 import threading
 import time
+from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -104,6 +105,46 @@ def _bootstrap() -> None:
 bridge: DataBridge = None
 wallet_ctx: WalletContext = None
 _bootstrap()
+
+
+# ---------------------------------------------------------------------------
+# Engine health
+# ---------------------------------------------------------------------------
+
+# No supervisor restarts run_engine.py if it dies on its own (see
+# config/Docker/entrypoint.sh) — by design, per its own docstring. That
+# means a dead engine is otherwise silent: the container stays "Up", this
+# Streamlit process keeps serving, and only trades.db stops changing. This
+# is what would have caught the Aug 29 2026 OOM (engine killed ~29h in,
+# dashboard-only for the 5 days after) as it happened instead of days later.
+ENGINE_STALE_AFTER = timedelta(minutes=5)
+
+
+def _render_engine_health_banner() -> None:
+    """Warn loudly, right on the dashboard, when the engine hasn't written
+    engine_status in over ENGINE_STALE_AFTER. The engine updates this row on
+    every loop tick (~2s — see run_forever() in trading/decision_pipeline.py),
+    so a multi-minute gap means the process is gone, not just busy."""
+    status = data_manager.read_engine_status(wallet_ctx.db_path)
+    updated_at_raw = status.get("updated_at") if status else None
+
+    if not updated_at_raw:
+        st.error("⚠️ ENGINE DOWN — no engine activity has ever been recorded for this wallet.")
+        return
+
+    try:
+        updated_at = datetime.strptime(str(updated_at_raw), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        st.error(f"⚠️ ENGINE STATUS UNREADABLE — updated_at={updated_at_raw!r}")
+        return
+
+    age = datetime.now() - updated_at
+    if age > ENGINE_STALE_AFTER:
+        st.error(
+            f"⚠️ ENGINE DOWN — last activity {updated_at_raw} "
+            f"({int(age.total_seconds() // 60)} min ago). The dashboard is still "
+            "up, but run_engine.py has stopped writing to the database."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +396,7 @@ def _render_dashboard_snapshot(view_name: str):
         # the real Polymarket API for it every 15s.
         bridge.last_balance_sync_at = now_ts
 
+    _render_engine_health_banner()
     _render_global_kpis()
     st.divider()
     _render_active_view(view_name)

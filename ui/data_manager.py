@@ -386,6 +386,19 @@ def get_terminal_feed(db_path: str, limit: int = 20) -> list[str]:
 # Event logging
 # ---------------------------------------------------------------------------
 
+# bridge.opportunity_map keeps one entry per token_id ever seen with an "ev"
+# in its payload (REJECTED/TRACK/AUTO-TRADE/...), and — unlike the hunter's
+# own cooldown cache (PolymarketScannerHunter.seen_markets, pruned by age
+# every scan) — nothing ever removed an entry. Over a long-running engine
+# process that's an unbounded, ever-growing dict: the confirmed cause of the
+# Aug 29 2026 OOM (run_engine.py's RSS reached ~416MB on a 916MB host after
+# ~29h). Cap it the same way ev_samples below is capped, evicting the
+# least-recently-touched token first. risk_manager's opportunity_map lookups
+# already fall back to a DB query on a miss, so evicting a still-open
+# position's entry only costs a slower lookup, not correctness.
+OPPORTUNITY_MAP_CAP = 500
+
+
 def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -433,7 +446,14 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
             ):
                 if payload.get(key) is not None:
                     entry[key] = payload[key]
-            bridge.opportunity_map[str(token_id)] = entry
+            token_key = str(token_id)
+            # Pop-then-set moves this key to the end of the dict's insertion
+            # order (Python dicts preserve it) so eviction below always drops
+            # the least-recently-touched token, not an arbitrary one.
+            bridge.opportunity_map.pop(token_key, None)
+            bridge.opportunity_map[token_key] = entry
+            if len(bridge.opportunity_map) > OPPORTUNITY_MAP_CAP:
+                del bridge.opportunity_map[next(iter(bridge.opportunity_map))]
         except Exception:
             pass
 
