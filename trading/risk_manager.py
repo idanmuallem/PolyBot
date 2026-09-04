@@ -57,6 +57,17 @@ class PortfolioManager:
         self.correlation_tracker = CorrelationTracker(config=config)
         self._last_snapshot_at: float = 0.0
 
+        # A position whose market has disappeared (resolved/closed on
+        # Polymarket while we still hold it) can never actually sell —
+        # sell_position() keeps returning False forever. Without a cap,
+        # manage_portfolio() re-triggers _exit_position() for it every loop
+        # tick (~2s) indefinitely: one real incident retried a single dead
+        # position ~2,000 times over 15+ hours with no backoff. After
+        # MAX_EXIT_ATTEMPTS consecutive failures for one token, stop
+        # retrying it every cycle — see _exit_position().
+        self.MAX_EXIT_ATTEMPTS = 5
+        self._exit_attempt_counts: dict = {}
+
     def _refresh_portfolio(self):
         positions = self.executor.get_open_positions()
         self.bridge.current_portfolio = positions
@@ -324,8 +335,17 @@ class PortfolioManager:
         self.bridge.cash = float(updated_cash)
 
     def _exit_position(self, position, level: str, threshold: float, extra: dict, log_func) -> bool:
-        """Sell a position and log the exit. Returns True if sold."""
+        """Sell a position and log the exit. Returns True if sold.
+
+        Gives up silently after MAX_EXIT_ATTEMPTS consecutive failures for
+        the same token_id (see __init__) — a position that can't sell isn't
+        going to start succeeding on attempt 2,001.
+        """
         token_id = str(self._position_field(position, "token_id", "") or "")
+
+        if token_id and self._exit_attempt_counts.get(token_id, 0) >= self.MAX_EXIT_ATTEMPTS:
+            return False
+
         shares = float(self._position_field(position, "shares", 0.0) or 0.0)
         current_price = float(self._position_field(position, "current_price", 0.0) or 0.0)
         # Entry price — needed (alongside the exit "price" above) so the
@@ -337,6 +357,16 @@ class PortfolioManager:
         position_value = float(self._position_field(position, "value", shares * current_price) or 0.0)
 
         sold = self.executor.sell_position(token_id, shares, current_price, log_func)
+
+        gave_up = False
+        if token_id:
+            if sold:
+                self._exit_attempt_counts.pop(token_id, None)
+            else:
+                attempts = self._exit_attempt_counts.get(token_id, 0) + 1
+                self._exit_attempt_counts[token_id] = attempts
+                gave_up = attempts >= self.MAX_EXIT_ATTEMPTS
+
         if sold:
             self._apply_sale_to_bridge(position_value)
         log_func(level, "Portfolio", token_id, {
@@ -345,6 +375,7 @@ class PortfolioManager:
             "price": current_price,
             "initial_price": initial_price,
             "sold": sold,
+            **({"gave_up_after_max_attempts": True} if gave_up else {}),
             **extra,
         })
         return bool(sold)

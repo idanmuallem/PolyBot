@@ -87,6 +87,42 @@ def test_stop_loss_triggered():
     assert "STOP-LOSS" in log_levels
 
 
+def test_exit_position_stops_retrying_after_max_attempts():
+    """A position whose sell keeps failing (e.g. its market resolved and
+    vanished) must stop being retried every cycle after MAX_EXIT_ATTEMPTS
+    failures — not hammer sell_position()/the log forever (a real incident
+    retried one dead position ~2,000 times over 15+ hours with no backoff)."""
+    pm, bridge, executor = _make_pm()
+    pos = _pos(pnl_ratio=-1.0, token_id="dead_tok")
+    executor.sell_position.return_value = False
+
+    log_calls = []
+    log_func = lambda level, asset_type, token_id, payload: log_calls.append(payload)
+
+    for _ in range(pm.MAX_EXIT_ATTEMPTS + 5):
+        pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
+
+    assert executor.sell_position.call_count == pm.MAX_EXIT_ATTEMPTS
+    assert len(log_calls) == pm.MAX_EXIT_ATTEMPTS
+    assert log_calls[-1]["gave_up_after_max_attempts"] is True
+    assert "gave_up_after_max_attempts" not in log_calls[0]
+
+
+def test_exit_position_retry_count_resets_after_a_successful_sell():
+    pm, bridge, executor = _make_pm()
+    pos = _pos(pnl_ratio=-1.0, token_id="flaky_tok")
+    log_func = lambda *a, **kw: None
+
+    executor.sell_position.return_value = False
+    pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
+    pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
+    assert pm._exit_attempt_counts["flaky_tok"] == 2
+
+    executor.sell_position.return_value = True
+    pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
+    assert "flaky_tok" not in pm._exit_attempt_counts
+
+
 def test_ev_convergence_triggered():
     pm, bridge, executor = _make_pm()
     # pnl within bounds but live_ev below min_hold_ev
