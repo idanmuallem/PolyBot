@@ -35,7 +35,7 @@ def _make_pipeline(balance=100.0):
     bridge.open_positions_value = 0.0
 
     config = TradingConfig(
-        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=15.0, max_bet_size_usd=3.0,
         max_daily_trades=10, min_trading_balance=1.0,
         loop_delay_seconds=0.01,

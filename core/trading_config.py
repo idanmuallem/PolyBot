@@ -77,8 +77,7 @@ class TradingConfig:
 
     bankroll_usd: float = 1000.0
     min_trading_balance: float = 5.0
-    dry_run: bool = True
-    paper_trade_mode: bool = False
+    trading_mode: str = "dry_run"
     paper_balance_usd: float = 1000.0
 
     take_profit_pct: float = 0.20
@@ -111,6 +110,20 @@ class TradingConfig:
     # Risk management (see trading/budget_manager.py, trading/risk_manager.py).
     kelly_fraction: float = 0.25  # quarter-Kelly — full Kelly is optimal in expectation but has extreme variance
     max_drawdown_pct: float = 0.20  # equity drop from peak that pauses new entries (position exits still allowed)
+
+    def __post_init__(self):
+        if self.trading_mode not in ("dry_run", "live_run"):
+            raise ValueError(
+                f"TRADING_MODE must be 'dry_run' or 'live_run', got '{self.trading_mode}'"
+            )
+
+    @property
+    def is_dry_run(self) -> bool:
+        return self.trading_mode == "dry_run"
+
+    @property
+    def is_live_run(self) -> bool:
+        return self.trading_mode == "live_run"
 
     def _warn_if_strategy_budgets_exceed_ceiling(self) -> None:
         """Per-strategy budgets are independent allocations, not a hard sum
@@ -154,8 +167,7 @@ class TradingConfig:
             min_hold_ev=float(os.getenv("MIN_HOLD_EV", "-0.10")),
             loop_delay_seconds=float(os.getenv("ENGINE_LOOP_DELAY", "2.0")),
             max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "10")),
-            dry_run=_env_bool("DRY_RUN", "True"),
-            paper_trade_mode=_env_bool("PAPER_TRADE_MODE", "False"),
+            trading_mode=os.getenv("TRADING_MODE", "dry_run").strip().lower(),
             paper_balance_usd=float(os.getenv("PAPER_BALANCE_USD", "1000.0")),
             private_key=_env_first("POLYMARKET_PRIVATE_KEY", "POLYGON_PRIVATE_KEY"),
             proxy_address=_env_first("POLYMARKET_PROXY_ADDRESS", "POLY_ADDRESS"),

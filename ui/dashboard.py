@@ -424,14 +424,14 @@ with st.sidebar:
     # as a separate process (see run_engine.py) and polls it once per loop
     # tick instead of reading bridge.live_trading directly (see
     # run_forever() in trading/decision_pipeline.py). The in-memory write
-    # above is kept too — other renders on this process (the DRY_RUN
+    # above is kept too — other renders on this process (the trading-mode
     # indicator dot right below, _compute_balance_snapshot's paper-mode
     # branch) still read it directly.
     data_manager.write_live_trading_requested(wallet_ctx.db_path, bool(mode))
     st.caption("Live Trading" if bridge.live_trading else "Dry Run")
 
     dot_color = "#16a34a" if not bridge.live_trading else "#dc2626"
-    dot_label = "DRY_RUN ENABLED" if not bridge.live_trading else "DRY_RUN DISABLED"
+    dot_label = "DRY RUN" if not bridge.live_trading else "LIVE RUN"
     st.markdown(
         f"<div style='display:flex;align-items:center;gap:8px;'>"
         f"<span style='height:10px;width:10px;border-radius:50%;background:{dot_color};display:inline-block;'></span>"

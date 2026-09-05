@@ -25,7 +25,7 @@ def _make_manager(
         min_trading_balance=min_balance,
         max_bet_size_usd=max_bet_size_usd,
         kelly_fraction=kelly_fraction,
-        dry_run=True,
+        trading_mode="dry_run",
     )
     mgr = BudgetManager(bridge=bridge, config=config, initial_balance=initial_balance)
     return mgr, bridge

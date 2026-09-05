@@ -35,7 +35,7 @@ def _make_components(initial_balance=50.0, take_profit=0.20, stop_loss=-0.50):
         take_profit_pct=take_profit,
         stop_loss_pct=stop_loss,
         min_hold_ev=-0.10,
-        dry_run=True,
+        trading_mode="dry_run",
         bankroll_usd=1000.0,
         daily_limit_usd=15.0,
     )

@@ -57,7 +57,7 @@ def _make_pipeline(balance=100.0, config=None):
 
     if config is None:
         config = TradingConfig(
-            dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+            trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
             daily_limit_usd=15.0, max_bet_size_usd=3.0,
             max_daily_trades=10, min_trading_balance=1.0,
         )
@@ -280,7 +280,7 @@ async def test_global_daily_trade_limit_rejects_group_even_within_strategy_allow
     must not let a single group blow past the account-wide max_daily_trades
     ceiling."""
     config = TradingConfig(
-        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=1500.0, max_bet_size_usd=3.0,
         max_daily_trades=2,               # global ceiling: only 2 trades/day
         arbitrage_max_daily_trades=200,   # strategy's own bucket allows way more
@@ -301,7 +301,7 @@ async def test_global_daily_trade_limit_rejects_group_even_within_strategy_allow
 @pytest.mark.asyncio
 async def test_daily_trade_limit_rejects_whole_group():
     config = TradingConfig(
-        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=1500.0, max_bet_size_usd=3.0,
         max_daily_trades=2, arbitrage_max_daily_trades=2,
         min_trading_balance=1.0,  # fewer than the 3 legs
@@ -323,7 +323,7 @@ async def test_daily_trade_limit_rejects_whole_group():
 @pytest.mark.asyncio
 async def test_tte_filter_skips_group_with_long_dated_leg():
     config = TradingConfig(
-        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=15.0, max_bet_size_usd=3.0,
         max_daily_trades=10, min_trading_balance=1.0,
         max_tte_days=90,
@@ -347,7 +347,7 @@ async def test_tte_filter_skips_group_with_long_dated_leg():
 @pytest.mark.asyncio
 async def test_tte_filter_allows_group_within_max_tte():
     config = TradingConfig(
-        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=15.0, max_bet_size_usd=3.0,
         max_daily_trades=10, min_trading_balance=1.0,
         max_tte_days=90,
@@ -369,7 +369,7 @@ async def test_tte_filter_allows_group_within_max_tte():
 @pytest.mark.asyncio
 async def test_crypto_events_execute_before_general_events():
     config = TradingConfig(
-        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=15.0, max_bet_size_usd=3.0,
         max_daily_trades=10, min_trading_balance=1.0,
         arbitrage_crypto_first=True,
@@ -393,7 +393,7 @@ async def test_crypto_events_execute_before_general_events():
 @pytest.mark.asyncio
 async def test_crypto_first_disabled_preserves_scanner_order():
     config = TradingConfig(
-        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=15.0, max_bet_size_usd=3.0,
         max_daily_trades=10, min_trading_balance=1.0,
         arbitrage_crypto_first=False,
@@ -469,7 +469,7 @@ async def test_enable_arbitrage_false_skips_scan_entirely_no_api_call():
     reject every signal downstream (that's what ARBITRAGE_MAX_DAILY_TRADES=0
     already does, and is explicitly NOT what this flag is for)."""
     config = TradingConfig(
-        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=15.0, max_bet_size_usd=3.0,
         max_daily_trades=10, min_trading_balance=1.0,
         enable_arbitrage=False,

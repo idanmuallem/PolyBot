@@ -95,7 +95,7 @@ def restore_wallet_state(ctx: WalletContext) -> dict:
     # operator's own choice on restart), and seeds this process's own
     # bridge.live_trading the same way the dashboard's toggle widget did
     # before the split (its `value=` argument only matters on first render).
-    initial_live = not (bool(ctx.config.dry_run) or bool(ctx.config.paper_trade_mode))
+    initial_live = ctx.config.is_live_run
     data_manager.seed_live_trading_requested_if_absent(ctx.db_path, initial_live)
     ctx.bridge.live_trading = initial_live
 

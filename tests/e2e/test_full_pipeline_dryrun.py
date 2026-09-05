@@ -48,7 +48,7 @@ def _wire_ctx(ctx: WalletContext, log_func) -> None:
 
 
 _DRY_CONFIG = TradingConfig(
-    dry_run=True,
+    trading_mode="dry_run",
     min_ev=0.30,
     bankroll_usd=1000.0,
     daily_limit_usd=15.0,
@@ -162,7 +162,7 @@ async def test_single_pipeline_loop_dry_run(tmp_path):
 
 
 _WANG_DRY_CONFIG = TradingConfig(
-    dry_run=True,
+    trading_mode="dry_run",
     min_ev=0.50,  # the real default (DEFAULT_MIN_EV) - not lowered for this test
     bankroll_usd=1000.0,
     daily_limit_usd=15.0,

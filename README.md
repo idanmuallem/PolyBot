@@ -39,7 +39,7 @@ PolyBot scans Polymarket's prediction markets for mispriced contracts using real
 - Market discovery across crypto, weather, and macro asset classes
 - Domain-specific fair-value models (Black-Scholes for crypto, normal-distribution for weather/economy)
 - Kelly-criterion-based position sizing with hard budget caps
-- Dry-run, paper-trading, and live-trading modes
+- Dry-run (virtual balance) and live-trading modes via a single `TRADING_MODE` switch
 - Real-time dashboard with equity curve, open positions, and EV distribution
 - Docker-based deployment to AWS EC2 via GitHub Actions CI/CD
 
@@ -47,7 +47,7 @@ PolyBot scans Polymarket's prediction markets for mispriced contracts using real
 
 ## Screenshots
 
-Captured from the live dashboard running in `DRY_RUN` mode. Balance, P&L, and position-size figures are redacted (blurred) — everything else (scan log, EV charts, market names, activity breakdown) is the real, unedited UI.
+Captured from the live dashboard running in `TRADING_MODE=dry_run`. Balance, P&L, and position-size figures are redacted (blurred) — everything else (scan log, EV charts, market names, activity breakdown) is the real, unedited UI.
 
 **Hunter** — live scan log with EV/Wang-edge coloring, rejection reasons, and the raw terminal feed:
 
@@ -328,9 +328,8 @@ POLYMARKET_PRIVATE_KEY=0x...
 POLYMARKET_PROXY_ADDRESS=0x...
 SIGNATURE_TYPE=2
 
-# Trading mode (safe defaults — see Trading Modes section)
-DRY_RUN=True
-PAPER_TRADE_MODE=False
+# Trading mode (safe default — see Trading Modes section)
+TRADING_MODE=dry_run
 
 # Risk parameters
 MIN_EV=0.30
@@ -386,17 +385,16 @@ The dashboard will attempt to start the trading engine immediately on load. Ensu
 
 ## Trading Modes
 
-The bot supports three trading modes controlled by environment variables:
+The bot supports two trading modes controlled by a single environment variable:
 
-| Mode | `DRY_RUN` | `PAPER_TRADE_MODE` | Behaviour |
-|---|---|---|---|
-| **Dry Run** | `True` | `False` | Scans and evaluates markets, logs decisions, submits no orders |
-| **Paper Trade** | `False` | `True` | Simulates trades using a virtual balance (`PAPER_BALANCE_USD`) |
-| **Live** | `False` | `False` | Submits real orders to Polymarket CLOB |
+| `TRADING_MODE` | Behaviour |
+|---|---|
+| `dry_run` (default) | Simulates trades with virtual balance (`PAPER_BALANCE_USD`), real fee rates, full position tracking — no real orders submitted |
+| `live_run` | Submits real orders to Polymarket CLOB with real funds |
 
-The sidebar toggle in the dashboard also switches between Dry Run and Live at runtime without a restart.
+The sidebar toggle in the dashboard switches between Dry Run and Live Run at runtime without a restart.
 
-> Start with `DRY_RUN=True` to observe the engine's decisions before committing real funds.
+> Start with `TRADING_MODE=dry_run` to observe and validate the engine's decisions before committing real funds.
 
 ---
 
@@ -465,8 +463,7 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `POLYGON_PRIVATE_KEY` | — | Alias for `POLYMARKET_PRIVATE_KEY` |
 | `POLY_ADDRESS` | — | Alias for `POLYMARKET_PROXY_ADDRESS` |
 | `SIGNATURE_TYPE` | `2` | Polymarket signature scheme (2 = proxy/funder) |
-| `DRY_RUN` | `True` | Disable order submission |
-| `PAPER_TRADE_MODE` | `False` | Simulate trades with virtual balance |
+| `TRADING_MODE` | `dry_run` | Trading mode: `dry_run` (simulate) or `live_run` (real orders) |
 | `PAPER_BALANCE_USD` | `1000.0` | Starting virtual balance for paper trading |
 | `MIN_EV` | `0.50` | Minimum expected value (off the calibrated fair value) to enter a trade |
 | `MIN_TTE_MINUTES` | `60` | Minimum time-to-expiry in minutes |

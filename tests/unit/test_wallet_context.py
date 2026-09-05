@@ -51,8 +51,7 @@ def test_config_from_file_matches_expected_values(tmp_path):
         "private_key": "0xabc",
         "proxy_address": "0xdef",
         "signature_type": 2,
-        "dry_run": True,
-        "paper_trade_mode": False,
+        "trading_mode": "dry_run",
         "min_ev": 0.35,
         "daily_limit_usd": 20.0,
         "max_bet_size_usd": 4.0,
@@ -80,7 +79,7 @@ def test_config_from_file_matches_expected_values(tmp_path):
     assert ctx.config.max_daily_trades == 12
     assert ctx.config.private_key == "0xabc"
     assert ctx.config.proxy_address == "0xdef"
-    assert ctx.config.dry_run is True
+    assert ctx.config.is_dry_run is True
 
 
 def test_two_contexts_loaded_from_different_files_keep_independent_config(tmp_path):

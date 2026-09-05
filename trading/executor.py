@@ -2,7 +2,7 @@
 Trade execution engine: order submission, position tracking, and balance fetching.
 
 Wraps the Polymarket CLOB client. Execution is gated by EV threshold, daily
-trade count, and price bounds. Supports dry-run, paper-trade, and live modes.
+trade count, and price bounds. Supports dry_run and live_run modes.
 """
 
 import asyncio
@@ -43,15 +43,14 @@ except ImportError:
 class TradeExecutor:
     """Handles trade execution with risk management.
 
-    Modes: dry_run (simulate only), paper_trade (log only), live (real orders).
+    Modes: dry_run (simulate with virtual balance), live_run (real CLOB orders).
     """
 
     def __init__(self, config: TradingConfig):
         self.config = config
         self.trade_count_today = 0
         self.trades_by_strategy: Dict[str, int] = {}
-        self.dry_run = self.config.dry_run
-        self.paper_trade_mode = self.config.paper_trade_mode
+        self.dry_run = self.config.is_dry_run
         self.proxy_address = self.config.proxy_address
         self.client = None
         self.paper: Optional[object] = None  # set below; stays None outside dry-run

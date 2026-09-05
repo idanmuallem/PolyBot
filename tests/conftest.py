@@ -38,7 +38,7 @@ def bridge():
 @pytest.fixture
 def dry_run_config():
     return TradingConfig(
-        dry_run=True,
+        trading_mode="dry_run",
         min_ev=0.30,
         bankroll_usd=1000.0,
         daily_limit_usd=15.0,

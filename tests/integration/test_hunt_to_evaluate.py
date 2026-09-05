@@ -115,7 +115,7 @@ def test_scanner_rejects_market_with_tte_too_short():
 
     bridge = DataBridge()
     bridge.current_balance = 100.0
-    config = TradingConfig(dry_run=True, min_tte_minutes=60, max_tte_days=180)
+    config = TradingConfig(trading_mode="dry_run", min_tte_minutes=60, max_tte_days=180)
     executor = MagicMock()
 
     # Market expires in 10 minutes
@@ -146,7 +146,7 @@ def test_scanner_rejects_market_with_tte_too_long():
     from core.bridge import DataBridge
 
     bridge = DataBridge()
-    config = TradingConfig(dry_run=True, min_tte_minutes=60, max_tte_days=180)
+    config = TradingConfig(trading_mode="dry_run", min_tte_minutes=60, max_tte_days=180)
     executor = MagicMock()
 
     # Market expires in 365 days (> max_tte_days=180)

@@ -7,7 +7,7 @@ from core.trading_config import TradingConfig
 
 def _dry_config(**overrides):
     defaults = dict(
-        dry_run=True,
+        trading_mode="dry_run",
         min_ev=0.30,
         max_daily_trades=10,
         # Per-strategy trade caps default to 50 each (core/trading_config.py);
@@ -30,8 +30,8 @@ def _make_executor(**config_overrides):
     """Create a TradeExecutor with a controlled TradingConfig (no real CLOB).
 
     TradeExecutor.__init__ unconditionally tries to construct a real
-    PaperAdapter whenever dry_run=True and pm_trader is importable — which it
-    is in this environment. Most tests here are about evaluate_and_execute's
+    PaperAdapter whenever trading_mode="dry_run" and pm_trader is importable —
+    which it is in this environment. Most tests here are about evaluate_and_execute's
     own gating logic (EV/price/budget/daily-limit), not paper-engine
     fidelity, and now that sell_position()/execute_trade() honestly
     propagate the paper adapter's real success/failure (see
@@ -345,7 +345,7 @@ def test_dry_run_paper_adapter_failure_does_not_raise_but_reports_failure():
     cash-crediting both key off this return value; a hardcoded True here
     previously let a market whose paper fill kept failing get "traded"
     forever without ever having a real position to show for it."""
-    executor = _make_executor()  # dry_run=True
+    executor = _make_executor()  # trading_mode="dry_run"
 
     # Inject a paper adapter whose execute_buy always raises
     mock_paper = MagicMock()
@@ -372,7 +372,7 @@ def test_dry_run_paper_adapter_failure_does_not_raise_but_reports_failure():
 def test_dry_run_no_paper_adapter_configured_still_returns_true():
     """No paper adapter at all (pm_trader not installed) is the original
     log-only DRY-RUN mode, working as designed — not a failure to report."""
-    executor = _make_executor()  # dry_run=True
+    executor = _make_executor()  # trading_mode="dry_run"
     executor.paper = None
     market = _valid_market()
 
@@ -458,7 +458,7 @@ def _live_executor(**config_overrides):
     """A TradeExecutor wired for the "live" branch of execute_arbitrage_group
     without a real ClobClient — client is a bare MagicMock so _submit_order/
     _get_order_filled_shares/cancel can be patched directly."""
-    executor = _make_executor(dry_run=False, **config_overrides)
+    executor = _make_executor(trading_mode="live_run", **config_overrides)
     executor.client = MagicMock()
     return executor
 
@@ -541,7 +541,7 @@ def test_execute_arbitrage_group_uneven_fills_computes_surplus():
 
 
 def test_execute_arbitrage_group_dry_run_simulates_full_fill_no_real_orders():
-    executor = _make_executor()  # default dry_run=True, client stays None
+    executor = _make_executor()  # default trading_mode="dry_run", client stays None
     assert executor.client is None
 
     legs = [
@@ -577,8 +577,8 @@ def test_execute_arbitrage_group_dry_run_simulates_full_fill_no_real_orders():
 
 def _paper_limit_executor(**config_overrides):
     """A TradeExecutor wired for the paper-limit-order branch of
-    execute_arbitrage_group — dry_run=True with a mocked PaperAdapter."""
-    executor = _make_executor(**config_overrides)  # dry_run=True, paper=None by default
+    execute_arbitrage_group — trading_mode="dry_run" with a mocked PaperAdapter."""
+    executor = _make_executor(**config_overrides)  # trading_mode="dry_run", paper=None by default
     executor.paper = MagicMock()
     return executor
 
@@ -710,7 +710,7 @@ def test_execute_arbitrage_group_falls_back_to_simulation_when_no_paper_adapter(
     """dry_run with no PaperAdapter at all (pm_trader not installed) must
     still fall back to the log-only simulation, not the limit-order path
     (which has nothing real to place orders against in that mode)."""
-    executor = _make_executor()  # dry_run=True, paper=None
+    executor = _make_executor()  # trading_mode="dry_run", paper=None
     legs = [{"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 1.0}]
 
     result = asyncio.run(executor.execute_arbitrage_group(

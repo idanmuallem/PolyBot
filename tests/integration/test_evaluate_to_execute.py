@@ -32,7 +32,7 @@ def _make_pipeline(config=None, balance=100.0):
         # brain's raw fair value directly — see test_pipeline_wang_mode.py
         # for Wang-adjustment-specific coverage.
         config = TradingConfig(
-            dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+            trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
             daily_limit_usd=15.0, max_bet_size_usd=3.0,
             max_daily_trades=10, min_trading_balance=1.0,
             pricing_mode="legacy",
@@ -284,7 +284,7 @@ def _wang_pipeline(balance=100.0, wang_base_lambda=0.183, wang_min_edge=0.0, min
     # itself) pass an edge floor low enough not to incidentally trip it.
     # test_wang_mode_skips_market_below_min_edge exercises the gate directly.
     config = TradingConfig(
-        dry_run=True, min_ev=min_ev, bankroll_usd=1000.0,
+        trading_mode="dry_run", min_ev=min_ev, bankroll_usd=1000.0,
         daily_limit_usd=15.0, max_bet_size_usd=3.0,
         max_daily_trades=10, min_trading_balance=1.0,
         pricing_mode="wang", wang_base_lambda=wang_base_lambda, wang_min_edge=wang_min_edge,
@@ -410,7 +410,7 @@ def test_model_driven_candidate_tagged_strategy_type_model():
 @freeze_time("2026-06-02T00:00:00+00:00")
 def test_candidate_kelly_fraction_used_matches_config():
     config = TradingConfig(
-        dry_run=True, min_ev=0.30, bankroll_usd=1000.0,
+        trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
         daily_limit_usd=15.0, max_bet_size_usd=3.0,
         max_daily_trades=10, min_trading_balance=1.0,
         pricing_mode="wang", kelly_fraction=0.10, wang_min_edge=0.0,

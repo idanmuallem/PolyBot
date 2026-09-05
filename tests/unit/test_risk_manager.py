@@ -20,7 +20,7 @@ def _make_pm(take_profit=0.20, stop_loss=-0.50, min_hold_ev=-0.10):
         take_profit_pct=take_profit,
         stop_loss_pct=stop_loss,
         min_hold_ev=min_hold_ev,
-        dry_run=True,
+        trading_mode="dry_run",
     )
     ctx = WalletContext(wallet_id="test_wallet", config=config, bridge=bridge, db_path="test_wallet_trades.db")
     executor = MagicMock()

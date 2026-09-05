@@ -165,7 +165,7 @@ def test_cooldown_cache_expires_after_cooldown_window():
     from core.bridge import DataBridge
 
     bridge = DataBridge()
-    config = TradingConfig(dry_run=True)
+    config = TradingConfig(trading_mode="dry_run")
     executor = MagicMock()
 
     scanner = PolymarketScannerHunter(bridge=bridge, executor=executor, config=config)
@@ -181,7 +181,7 @@ def test_add_to_cooldown():
     from core.bridge import DataBridge
 
     bridge = DataBridge()
-    config = TradingConfig(dry_run=True)
+    config = TradingConfig(trading_mode="dry_run")
     executor = MagicMock()
 
     scanner = PolymarketScannerHunter(bridge=bridge, executor=executor, config=config)
