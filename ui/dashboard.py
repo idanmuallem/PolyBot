@@ -153,17 +153,24 @@ def _render_engine_health_banner() -> None:
 
 def _render_global_kpis() -> None:
     c1, c2 = st.columns(2)
-    # cash comes from engine_status (DB) via _compute_balance_snapshot() —
-    # accurate in both modes, since the engine process syncs its own live
-    # balance every loop tick regardless of dry-run/live. balance_connection_error
-    # stays a dashboard-local diagnostic: it's only ever set True by this
-    # process's own live-mode Polymarket balance poll (_fetch_live_balance),
-    # unrelated to the split.
-    cash, _, balance, total_deposits = _compute_balance_snapshot()
+    # balance = cash + holdings, from engine_status (DB) via
+    # _compute_balance_snapshot() — accurate in both modes, since the engine
+    # process syncs its own live balance every loop tick regardless of
+    # dry-run/live. balance_connection_error stays a dashboard-local
+    # diagnostic: it's only ever set True by this process's own live-mode
+    # Polymarket balance poll (_fetch_live_balance), unrelated to the split.
+    #
+    # This is the true total account value (cash on hand + current market
+    # value of open positions) — NOT cash alone. The Balance view's "Cash"
+    # stat is the cash-only figure; this header used to conflate the two
+    # under the same "Current Balance" label, which read as a discrepancy
+    # (it silently matched "Cash" instead of "Balance" whenever positions
+    # were open).
+    _, _, balance, total_deposits = _compute_balance_snapshot()
     balance_label = (
         "$0.00 (Connection Error)"
         if bool(getattr(bridge, "balance_connection_error", False))
-        else fmt_dollars(cash)
+        else fmt_dollars(balance)
     )
     c1.metric("Current Balance", balance_label)
 
@@ -173,7 +180,7 @@ def _render_global_kpis() -> None:
     # PortfolioManager._refresh_portfolio() for anything that wants the
     # narrower figure). Shares _compute_balance_snapshot() with the Balance
     # view's own stats row so this KPI is numerically guaranteed to equal
-    # "Balance - Total Deposits" as shown there.
+    # "Current Balance - Total Deposits".
     c2.metric("Total PnL", fmt_dollars(balance - total_deposits))
 
 
@@ -306,7 +313,11 @@ def _compute_balance_snapshot() -> tuple[float, float, float, float]:
 
 
 def _render_balance_stats_row() -> None:
-    cash, holdings, balance, total_deposits = _compute_balance_snapshot()
+    # "Balance" (cash + holdings) itself is not repeated here — it's the
+    # header's "Current Balance" KPI (_render_global_kpis()), always visible
+    # regardless of which view is active. Showing it again in this row would
+    # just duplicate that number under a second label.
+    cash, holdings, _, total_deposits = _compute_balance_snapshot()
 
     stats = data_manager.get_trade_stats(wallet_ctx.db_path)
     closed_deltas = data_manager.get_closed_trade_deltas(wallet_ctx.db_path)
@@ -315,11 +326,10 @@ def _render_balance_stats_row() -> None:
         for p in data_manager.read_open_positions(wallet_ctx.db_path)
     ]
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Cash",           fmt_dollars(cash))
     c2.metric("Total Deposits", fmt_dollars(total_deposits))
     c3.metric("Holdings",       fmt_dollars(holdings))
-    c4.metric("Balance",        fmt_dollars(balance))
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Total Trades",             f"{int(stats.get('total_trades', 0))}")
