@@ -140,6 +140,8 @@ def render_activity_chart(level_counts: dict):
         "TAKE-PROFIT":    "#3b82f6",
         "STOP-LOSS":      "#ef4444",
         "EV-CONVERGENCE": "#8b5cf6",
+        "WANG-EDGE-DECAY": "#a78bfa",
+        "EXPIRED":        "#f59e0b",
         "REJECTED":       "#f59e0b",
         "FILTERED":       "#fb923c",
         "SCAN-SKIP":      "#94a3b8",
@@ -242,6 +244,51 @@ def render_positions(positions: list[dict], opportunity_map: dict | None = None)
         lambda v: "color: #16a34a" if v > 0 else ("color: #dc2626" if v < 0 else ""),
         subset=["P&L"],
     ).map(
+        lambda v: "color: #16a34a; font-weight: 700;" if v == "YES"
+        else ("color: #f59e0b; font-weight: 700;" if v == "NO" else ""),
+        subset=["Side"],
+    )
+
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+
+def render_transactions_table(df: pd.DataFrame):
+    """`df` is data_manager.fetch_transactions()'s result — one row per buy
+    (entry) or sell/expiry (exit), newest first."""
+    st.subheader("Transactions")
+    if df is None or df.empty:
+        st.info("No closed transactions yet.")
+        return
+
+    display_df = df.copy()
+
+    def _type_color(value):
+        if value == "BUY":
+            return "color: #38bdf8; font-weight: 700;"
+        if value == "EXPIRED":
+            return "color: #f59e0b; font-weight: 700;"
+        if isinstance(value, str) and value.startswith("SELL"):
+            return "color: #a78bfa; font-weight: 700;"
+        return ""
+
+    def _pnl_color(value):
+        if pd.isna(value):
+            return ""
+        return "color: #16a34a" if value > 0 else ("color: #dc2626" if value < 0 else "")
+
+    def _status_color(value):
+        if value == "Unconfirmed":
+            return "color: #dc2626;"
+        return ""
+
+    styled = display_df.style.format({
+        "Price": "${:,.4f}",
+        "Shares": "{:,.4f}",
+        "Amount ($)": "${:,.2f}",
+        "P&L ($/share)": lambda v: "-" if pd.isna(v) else f"{v:+.4f}",
+    }, na_rep="-").map(_type_color, subset=["Type"]).map(
+        _pnl_color, subset=["P&L ($/share)"]
+    ).map(_status_color, subset=["Status"]).map(
         lambda v: "color: #16a34a; font-weight: 700;" if v == "YES"
         else ("color: #f59e0b; font-weight: 700;" if v == "NO" else ""),
         subset=["Side"],

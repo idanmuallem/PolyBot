@@ -123,6 +123,60 @@ def test_exit_position_retry_count_resets_after_a_successful_sell():
     assert "flaky_tok" not in pm._exit_attempt_counts
 
 
+def test_gave_up_in_live_mode_logs_expired_flag():
+    """Live mode's gave-up signal (unsellable — see __init__'s comment on
+    what a resolved/closed market looks like via the positions API) should
+    surface as a visible EXPIRED row, not just silently stop retrying."""
+    pm, bridge, executor = _make_pm()
+    executor.dry_run = False  # live mode
+    pos = _pos(pnl_ratio=-1.0, token_id="dead_tok")
+    executor.sell_position.return_value = False
+
+    log_calls = []
+    log_func = lambda level, asset_type, token_id, payload: log_calls.append((level, payload))
+
+    for _ in range(pm.MAX_EXIT_ATTEMPTS):
+        pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
+
+    expired_calls = [p for level, p in log_calls if level == "EXPIRED"]
+    assert len(expired_calls) == 1  # fires exactly once, on the attempt that hits the cap
+    assert expired_calls[0]["sold"] is False
+    assert expired_calls[0]["shares"] == pytest.approx(10.0)
+    assert expired_calls[0]["initial_price"] == pytest.approx(0.40)
+
+
+def test_gave_up_in_dry_run_mode_does_not_log_expired():
+    """Paper mode's real resolutions are logged separately by
+    PaperAdapter.resolve_closed_markets(); a paper position that's merely
+    unsellable (e.g. a broken token mapping — not a market resolution)
+    should not be mislabeled EXPIRED here."""
+    pm, bridge, executor = _make_pm()
+    executor.dry_run = True
+    pos = _pos(pnl_ratio=-1.0, token_id="dead_tok")
+    executor.sell_position.return_value = False
+
+    log_levels = []
+    log_func = lambda level, *a, **kw: log_levels.append(level)
+
+    for _ in range(pm.MAX_EXIT_ATTEMPTS):
+        pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
+
+    assert "EXPIRED" not in log_levels
+
+
+def test_successful_live_exit_never_logs_expired():
+    pm, bridge, executor = _make_pm()
+    executor.dry_run = False
+    pos = _pos(pnl_ratio=-0.60, token_id="stop_tok")
+    executor.sell_position.return_value = True
+
+    log_levels = []
+    log_func = lambda level, *a, **kw: log_levels.append(level)
+    pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -0.60}, log_func)
+
+    assert log_levels == ["STOP-LOSS"]
+
+
 def test_ev_convergence_triggered():
     pm, bridge, executor = _make_pm()
     # pnl within bounds but live_ev below min_hold_ev

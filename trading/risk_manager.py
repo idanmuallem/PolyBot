@@ -378,6 +378,37 @@ class PortfolioManager:
             **({"gave_up_after_max_attempts": True} if gave_up else {}),
             **extra,
         })
+
+        # Live-mode-only: giving up after MAX_EXIT_ATTEMPTS is the existing
+        # signal for "this position's market has no live order book left" —
+        # per the __init__ comment above, that's what a resolved/closed
+        # Polymarket market looks like from here (it doesn't disappear from
+        # the positions API, it just stops being sellable). Fires exactly
+        # once per token (the attempt that pushes the counter to the cap;
+        # every attempt after that short-circuits before reaching this
+        # point), so this can't spam the ledger. sold stays False — there's
+        # no confirmed on-chain payout (this bot doesn't automate
+        # redemption), so it's excluded from get_trade_stats()/
+        # get_closed_trade_deltas()'s P&L aggregation, just surfaced as a
+        # visibility flag in the Transactions ledger. Paper mode's
+        # equivalent (PaperAdapter.resolve_closed_markets) already logs a
+        # sold=True EXPIRED row with a real payout, so this branch would
+        # only ever double up on that — hence live-mode only.
+        if gave_up and not getattr(self.executor, "dry_run", True):
+            log_func("EXPIRED", "Portfolio", token_id, {
+                "shares": shares,
+                "price": current_price,
+                "initial_price": initial_price,
+                "side": str(self._position_field(position, "side", "") or ""),
+                "market_name": str(self._position_field(position, "market_id", "") or ""),
+                "sold": False,
+                "reason": (
+                    f"Gave up selling after {self.MAX_EXIT_ATTEMPTS} failed attempts — "
+                    "market most likely resolved/closed on Polymarket. On-chain "
+                    "redemption is not automated by this bot."
+                ),
+            })
+
         return bool(sold)
 
     def optimize_for_candidate(self, new_candidate_ev: float, min_improvement: float = 0.10, log_func=None) -> float:

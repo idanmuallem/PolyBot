@@ -587,16 +587,19 @@ def get_trade_stats(db_path: str) -> dict:
     }
     # EXEC_LEVELS (entries) and CLOSE_LEVELS (exits) together are every level
     # a real trade action can be logged under — CLOSE_LEVELS matches every
-    # exit reason PortfolioManager._exit_position() can produce (see
-    # get_closed_trade_deltas()'s docstring for the same list).
+    # exit reason PortfolioManager._exit_position() can produce, plus
+    # EXPIRED (market resolution — see PaperAdapter.resolve_closed_markets()
+    # for paper mode and PortfolioManager._exit_position()'s gave-up branch
+    # for live mode; see get_closed_trade_deltas()'s docstring for the same
+    # list).
     EXEC_LEVELS = {"LIVE-TRADE", "DRY-RUN", "PAPER-TRADE"}
-    CLOSE_LEVELS = {"TAKE-PROFIT", "STOP-LOSS", "WANG-EDGE-DECAY", "EV-CONVERGENCE"}
+    CLOSE_LEVELS = {"TAKE-PROFIT", "STOP-LOSS", "WANG-EDGE-DECAY", "EV-CONVERGENCE", "EXPIRED"}
 
     try:
         with _open_db(db_path) as conn:
             df = pd.read_sql_query(
                 "SELECT level, payload FROM hunt_history WHERE level IN "
-                "('LIVE-TRADE','DRY-RUN','PAPER-TRADE','TAKE-PROFIT','STOP-LOSS','WANG-EDGE-DECAY','EV-CONVERGENCE')",
+                "('LIVE-TRADE','DRY-RUN','PAPER-TRADE','TAKE-PROFIT','STOP-LOSS','WANG-EDGE-DECAY','EV-CONVERGENCE','EXPIRED')",
                 conn,
             )
     except Exception:
@@ -701,8 +704,9 @@ def get_trade_stats(db_path: str) -> dict:
 def get_closed_trade_deltas(db_path: str) -> list:
     """Per-share $ P&L (exit price - entry price) for every closed position,
     across every exit reason PortfolioManager._exit_position() logs
-    (TAKE-PROFIT, STOP-LOSS, WANG-EDGE-DECAY, EV-CONVERGENCE) — not just the
-    take-profit/stop-loss subset get_trade_stats() uses for win/loss counts.
+    (TAKE-PROFIT, STOP-LOSS, WANG-EDGE-DECAY, EV-CONVERGENCE) plus EXPIRED
+    (market resolution) — not just the take-profit/stop-loss subset
+    get_trade_stats() uses for win/loss counts.
 
     Needs both "price" (exit) and "initial_price" (entry) in the payload;
     rows logged before initial_price was added to that payload won't have
@@ -722,7 +726,7 @@ def get_closed_trade_deltas(db_path: str) -> list:
         with _open_db(db_path) as conn:
             rows = conn.execute(
                 "SELECT payload FROM hunt_history WHERE level IN "
-                "('TAKE-PROFIT','STOP-LOSS','WANG-EDGE-DECAY','EV-CONVERGENCE')"
+                "('TAKE-PROFIT','STOP-LOSS','WANG-EDGE-DECAY','EV-CONVERGENCE','EXPIRED')"
             ).fetchall()
     except Exception:
         return []
@@ -743,6 +747,98 @@ def get_closed_trade_deltas(db_path: str) -> list:
         except (TypeError, ValueError):
             continue
     return deltas
+
+
+_TRANSACTION_TYPE_LABELS = {
+    "LIVE-TRADE": "BUY", "DRY-RUN": "BUY", "PAPER-TRADE": "BUY",
+    "TAKE-PROFIT": "SELL (Take-Profit)", "STOP-LOSS": "SELL (Stop-Loss)",
+    "WANG-EDGE-DECAY": "SELL (Edge Decay)", "EV-CONVERGENCE": "SELL (EV Converged)",
+    "EXPIRED": "EXPIRED",
+}
+
+_TRANSACTIONS_COLUMNS = [
+    "Time", "Type", "Side", "Market Name", "Price", "Shares",
+    "Amount ($)", "P&L ($/share)", "Status",
+]
+
+
+def fetch_transactions(db_path: str, limit: int = 100) -> pd.DataFrame:
+    """Every buy (entry) and sell/expiry (exit) row as one ledger, newest
+    first — backs the "Transactions" table folded into the Portfolio view.
+
+    Buys are EXEC_LEVELS (LIVE-TRADE/DRY-RUN/PAPER-TRADE); exits are
+    CLOSE_LEVELS (see get_trade_stats()) plus EXPIRED market resolutions
+    (PaperAdapter.resolve_closed_markets() in paper mode,
+    PortfolioManager._exit_position()'s gave-up branch in live mode).
+
+    A non-EXPIRED exit row without payload["sold"] is a failed sell retry,
+    not a real closed trade — dropped, same filter get_closed_trade_deltas()
+    applies. EXPIRED rows are always kept even when sold is False: that's
+    the live-mode "gave up, likely resolved, no confirmed payout" flag,
+    which is a one-time event (not a retry loop) worth surfacing even
+    without a known P&L (see _exit_position()'s EXPIRED branch).
+    """
+    levels_sql = "'" + "','".join(_TRANSACTION_TYPE_LABELS.keys()) + "'"
+    try:
+        with _open_db(db_path) as conn:
+            rows = conn.execute(
+                f"SELECT timestamp, level, token_id, payload FROM hunt_history "
+                f"WHERE level IN ({levels_sql}) ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    except Exception:
+        return pd.DataFrame(columns=_TRANSACTIONS_COLUMNS)
+
+    records = []
+    for timestamp, level, token_id, payload_raw in rows:
+        payload = _parse_payload_value(payload_raw)
+        if not isinstance(payload, dict):
+            continue
+
+        is_buy = level in ("LIVE-TRADE", "DRY-RUN", "PAPER-TRADE")
+        if not is_buy and level != "EXPIRED" and not payload.get("sold"):
+            continue
+
+        shares = payload.get("shares")
+        price = payload.get("price")
+        initial_price = payload.get("initial_price")
+        amount = payload.get("bet_amount_usd", payload.get("bet_usd"))
+        if amount is None and price is not None and shares is not None:
+            try:
+                amount = float(price) * float(shares)
+            except (TypeError, ValueError):
+                amount = None
+
+        pnl_per_share = None
+        if not is_buy and price is not None and initial_price is not None:
+            try:
+                pnl_per_share = float(price) - float(initial_price)
+            except (TypeError, ValueError):
+                pnl_per_share = None
+
+        if is_buy:
+            status = "Confirmed"
+        else:
+            status = "Sold" if payload.get("sold") else "Unconfirmed"
+
+        records.append({
+            "Time": timestamp,
+            "Type": _TRANSACTION_TYPE_LABELS.get(level, level),
+            "Side": str(payload.get("side", "-") or "-").upper(),
+            "Market Name": payload.get("market_name") or str(token_id),
+            "Price": price,
+            "Shares": shares,
+            "Amount ($)": amount,
+            "P&L ($/share)": pnl_per_share,
+            "Status": status,
+        })
+
+    df = pd.DataFrame(records, columns=_TRANSACTIONS_COLUMNS)
+    if df.empty:
+        return df
+    for col in ("Price", "Shares", "Amount ($)", "P&L ($/share)"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 
 def get_equity_curve(db_path: str) -> pd.DataFrame:

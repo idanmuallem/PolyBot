@@ -235,6 +235,36 @@ def test_get_trade_stats_excludes_failed_sell_attempts_from_win_loss(db):
     assert stats["avg_loss"] == 0.0
 
 
+def test_get_trade_stats_counts_expired_market_resolutions(db):
+    """EXPIRED (market resolution — see PaperAdapter.resolve_closed_markets()
+    and PortfolioManager._exit_position()'s gave-up branch) is a real closed
+    trade like any other exit reason, win/loss derived from price vs
+    initial_price the same way EV-CONVERGENCE/WANG-EDGE-DECAY are."""
+    bridge = DataBridge()
+    dm.log_event(bridge, "EXPIRED", "Crypto::BTC", "tok1",
+                 {"side": "YES", "price": 1.0, "initial_price": 0.40, "shares": 10.0,
+                  "sold": True, "payout": 10.0}, db_path=db)
+
+    stats = dm.get_trade_stats(db_path=db)
+
+    assert stats["total_trades"] == 1
+    assert stats["win_rate"] == pytest.approx(100.0)
+    assert stats["avg_win"] == pytest.approx(10.0)  # price(1.0) * shares(10.0)
+
+
+def test_get_trade_stats_excludes_unconfirmed_expired_rows(db):
+    """Live mode's gave-up EXPIRED flag logs sold=False (no confirmed
+    on-chain payout) — must not be counted, same as any other failed exit."""
+    bridge = DataBridge()
+    dm.log_event(bridge, "EXPIRED", "Crypto::BTC", "tok1",
+                 {"side": "YES", "price": 0.001, "initial_price": 0.40, "shares": 10.0,
+                  "sold": False}, db_path=db)
+
+    stats = dm.get_trade_stats(db_path=db)
+
+    assert stats["total_trades"] == 0
+
+
 # ── get_closed_trade_deltas ───────────────────────────────────────────────────
 
 def test_get_closed_trade_deltas_empty_db(db):
@@ -302,6 +332,57 @@ def test_get_closed_trade_deltas_excludes_failed_sell_attempts(db):
     deltas = dm.get_closed_trade_deltas(db_path=db)
 
     assert deltas == pytest.approx([0.10])
+
+
+def test_get_closed_trade_deltas_includes_expired(db):
+    bridge = DataBridge()
+    dm.log_event(bridge, "EXPIRED", "Crypto::BTC", "tok1",
+                 {"price": 1.0, "initial_price": 0.40, "sold": True}, db_path=db)
+
+    deltas = dm.get_closed_trade_deltas(db_path=db)
+
+    assert deltas == pytest.approx([0.60])
+
+
+# ── fetch_transactions ────────────────────────────────────────────────────────
+
+def test_fetch_transactions_empty_db(db):
+    df = dm.fetch_transactions(db_path=db)
+    assert df.empty
+    assert list(df.columns) == dm._TRANSACTIONS_COLUMNS
+
+
+def test_fetch_transactions_includes_buys_and_sells(db):
+    bridge = DataBridge()
+    dm.log_event(bridge, "PAPER-TRADE", "Crypto::BTC", "tok1",
+                 {"price": 0.40, "shares": 10.0, "bet_amount_usd": 4.0, "side": "YES"}, db_path=db)
+    dm.log_event(bridge, "TAKE-PROFIT", "Crypto::BTC", "tok1",
+                 {"price": 0.65, "initial_price": 0.40, "shares": 10.0, "sold": True,
+                  "side": "YES", "market_name": "Will BTC hit 100k?"}, db_path=db)
+
+    df = dm.fetch_transactions(db_path=db)
+
+    assert len(df) == 2
+    types = set(df["Type"])
+    assert types == {"BUY", "SELL (Take-Profit)"}
+    sell_row = df[df["Type"] == "SELL (Take-Profit)"].iloc[0]
+    assert sell_row["P&L ($/share)"] == pytest.approx(0.25)
+    assert sell_row["Market Name"] == "Will BTC hit 100k?"
+
+
+def test_fetch_transactions_excludes_failed_retries_but_keeps_expired(db):
+    bridge = DataBridge()
+    dm.log_event(bridge, "STOP-LOSS", "Crypto::BTC", "stuck_tok",
+                 {"price": 0.001, "initial_price": 0.10, "shares": 100.0, "sold": False}, db_path=db)
+    dm.log_event(bridge, "EXPIRED", "Crypto::BTC", "dead_tok",
+                 {"price": 0.02, "initial_price": 0.30, "shares": 5.0, "sold": False,
+                  "reason": "gave up"}, db_path=db)
+
+    df = dm.fetch_transactions(db_path=db)
+
+    assert len(df) == 1
+    assert df.iloc[0]["Type"] == "EXPIRED"
+    assert df.iloc[0]["Status"] == "Unconfirmed"
 
 
 # ── process_logs_for_display: Phase 7 analytics columns ──────────────────────

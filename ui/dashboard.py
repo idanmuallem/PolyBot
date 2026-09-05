@@ -24,7 +24,7 @@ from core.runtime_env import get_env as _get_env, restore_wallet_state, validate
 from core.wallet_context import WalletContext
 from ui.components import (
     fmt_dollars, render_activity_chart, render_equity_curve,
-    render_ev_chart, render_positions,
+    render_ev_chart, render_positions, render_transactions_table,
 )
 
 st.set_page_config(page_title="PolyBot Quant Pro", page_icon="🛰️", layout="wide")
@@ -260,6 +260,8 @@ def _render_portfolio_view() -> None:
     render_positions(positions, opportunity_map)
     st.markdown("#### EV by Market")
     render_ev_chart(data_manager.get_latest_ev_by_token(wallet_ctx.db_path, limit=15))
+    st.markdown("#### Transactions")
+    render_transactions_table(data_manager.fetch_transactions(wallet_ctx.db_path, limit=100))
 
 
 # ---------------------------------------------------------------------------

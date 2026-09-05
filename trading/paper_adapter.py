@@ -431,7 +431,7 @@ class PaperAdapter:
             logger.warning(f"[PAPER] Failed to fetch total value: {exc}")
             return 0.0
 
-    def resolve_closed_markets(self, resolve_arbitrage: bool = True) -> int:
+    def resolve_closed_markets(self, resolve_arbitrage: bool = True, log_func=None) -> int:
         """Resolve any paper positions in markets that have closed. Returns count resolved.
 
         resolve_arbitrage=False is the ENABLE_ARBITRAGE kill switch: while
@@ -442,6 +442,16 @@ class PaperAdapter:
         paper-fill path — see self._arbitrage_tokens) are skipped entirely
         in that case; non-arbitrage (crypto) positions resolve exactly as
         they always have, either way.
+
+        log_func, when given, gets one "EXPIRED" hunt_history row per
+        resolved position (see ui/data_manager.log_event) — this used to be
+        a stdout-only logger.info, invisible to the dashboard, so a market
+        expiring/resolving never showed up as a closed trade anywhere.
+        Payload shape mirrors PortfolioManager._exit_position()'s exit rows
+        (price/initial_price/shares/sold) so it flows through the same
+        get_trade_stats()/get_closed_trade_deltas() aggregation — "price"
+        here is the effective per-share payout (1.0 for a winning share,
+        0.0 for a losing one), not a market quote.
         """
         if not self.is_ready:
             return 0
@@ -457,10 +467,37 @@ class PaperAdapter:
                         f"[PAPER] RESOLVED {r.position.market_slug} "
                         f"{r.position.outcome} → payout=${r.payout:.2f}"
                     )
+                    if log_func is not None:
+                        self._log_resolved_position(r, log_func)
             return len(results)
         except Exception as exc:
             logger.warning(f"[PAPER] resolve_all failed: {exc}")
             return 0
+
+    def _log_resolved_position(self, resolve_result, log_func) -> None:
+        position = resolve_result.position
+        shares = float(position.shares or 0.0)
+        payout_price = (float(resolve_result.payout) / shares) if shares else 0.0
+
+        token_id = self._find_token_for_slug(position.market_slug, position.outcome)
+        if not token_id:
+            # Same "make an unmappable position visible instead of silently
+            # dropping it" fallback get_positions() uses above.
+            token_id = f"__unmapped__:{position.market_slug}:{position.outcome}"
+
+        try:
+            log_func("EXPIRED", "Portfolio", token_id, {
+                "shares": shares,
+                "price": round(payout_price, 4),
+                "initial_price": round(float(position.avg_entry_price or 0.0), 4),
+                "side": str(position.outcome or "").upper(),
+                "market_name": position.market_question or position.market_slug,
+                "payout": round(float(resolve_result.payout), 2),
+                "realized_pnl": round(float(position.realized_pnl or 0.0), 4),
+                "sold": True,
+            })
+        except Exception as exc:
+            logger.warning(f"[PAPER] Failed to log resolved position {token_id}: {exc}")
 
     def _resolve_non_arbitrage_closed_markets(self) -> list:
         """Mirrors Engine.resolve_all()'s own closed-market loop, but skips

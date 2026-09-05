@@ -1162,7 +1162,10 @@ class SequentialTradingPipeline:
                             # ENABLE_ARBITRAGE kill switch also covers this
                             # cleanup path, not just new-trade entry — see
                             # PaperAdapter.resolve_closed_markets().
-                            paper.resolve_closed_markets(resolve_arbitrage=self.config.enable_arbitrage)
+                            paper.resolve_closed_markets(
+                                resolve_arbitrage=self.config.enable_arbitrage,
+                                log_func=self.log_func,
+                            )
                         except Exception as e:
                             self.log_func("PAPER-ERROR", "Engine", "resolve_all", {"error": str(e)})
 

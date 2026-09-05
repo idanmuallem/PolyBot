@@ -355,6 +355,72 @@ class TestResolveClosedMarketsArbitrageGate:
         mock_engine.resolve_market.assert_called_once_with("crypto-slug")
 
 
+class TestResolveClosedMarketsLogging:
+    """resolve_closed_markets(log_func=...) — the EXPIRED hunt_history row
+    that makes a market resolution visible on the dashboard (previously
+    logger.info-only, invisible outside stdout)."""
+
+    @staticmethod
+    def _fake_resolve_result(slug, outcome, payout=7.5, shares=10.0, avg_entry_price=0.4,
+                              question="Will it happen?", realized_pnl=3.5):
+        position = SimpleNamespace(
+            market_slug=slug, outcome=outcome, shares=shares,
+            avg_entry_price=avg_entry_price, market_question=question,
+            realized_pnl=realized_pnl,
+        )
+        return SimpleNamespace(position=position, payout=payout)
+
+    def test_logs_expired_row_per_resolved_position(self, tmp_path):
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=100.0)
+        adapter._token_map = {"tok1": ("crypto-slug", "yes")}
+        mock_engine = MagicMock()
+        mock_engine.resolve_all.return_value = [
+            self._fake_resolve_result("crypto-slug", "yes", payout=10.0, shares=10.0, avg_entry_price=0.4)
+        ]
+        adapter.engine = mock_engine
+
+        log_func = MagicMock()
+        count = adapter.resolve_closed_markets(resolve_arbitrage=True, log_func=log_func)
+
+        assert count == 1
+        log_func.assert_called_once()
+        level, asset_type, token_id, payload = log_func.call_args[0]
+        assert level == "EXPIRED"
+        assert token_id == "tok1"
+        assert payload["sold"] is True
+        assert payload["shares"] == 10.0
+        assert payload["price"] == pytest.approx(1.0)  # payout/shares = 10.0/10.0
+        assert payload["initial_price"] == pytest.approx(0.4)
+        assert payload["side"] == "YES"
+        assert payload["payout"] == pytest.approx(10.0)
+
+    def test_unmapped_token_falls_back_to_explicit_marker(self, tmp_path):
+        """No _token_map entry for the resolved slug/outcome — same
+        '__unmapped__' convention get_positions() uses, so a broken mapping
+        is obvious in the dashboard rather than silently dropped."""
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=100.0)
+        adapter._token_map = {}
+        mock_engine = MagicMock()
+        mock_engine.resolve_all.return_value = [self._fake_resolve_result("mystery-slug", "no")]
+        adapter.engine = mock_engine
+
+        log_func = MagicMock()
+        adapter.resolve_closed_markets(resolve_arbitrage=True, log_func=log_func)
+
+        _, _, token_id, _ = log_func.call_args[0]
+        assert token_id == "__unmapped__:mystery-slug:no"
+
+    def test_no_log_func_still_works(self, tmp_path):
+        """log_func is optional — omitting it must not break the existing
+        count-returning behavior other callers rely on."""
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=100.0)
+        mock_engine = MagicMock()
+        mock_engine.resolve_all.return_value = [self._fake_resolve_result("crypto-slug", "yes")]
+        adapter.engine = mock_engine
+
+        assert adapter.resolve_closed_markets(resolve_arbitrage=True) == 1
+
+
 class TestPaperAdapterBalance:
     def test_get_cash_balance(self, tmp_path):
         adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=750.0)
