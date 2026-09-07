@@ -8,7 +8,7 @@ from freezegun import freeze_time
 
 from brains.pricing_engine import wang_transform
 from core.bridge import DataBridge
-from core.models import MarketData
+from core.models import MarketData, Position
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
@@ -204,6 +204,81 @@ def test_already_held_simulated_skip_still_works_during_normal_operation():
 
     assert candidate is None
     assert "SCAN-SKIP" in log_calls
+
+
+# ── Stage 2: post-exit cooldown (prevents same-market buy/exit/re-buy churn) ──
+
+def _exit_position(pipeline, level, pnl_ratio, live_ev, token_id="tok1"):
+    """Drive a real exit through PortfolioManager.manage_portfolio() so the
+    production cooldown-recording path in PortfolioManager._exit_position()
+    runs, not a hand-rolled shortcut."""
+    pos = Position(
+        market_id="tok1", token_id=token_id, initial_price=0.40,
+        current_price=0.40, shares=10.0, value=4.0,
+        pnl_ratio=pnl_ratio, side="YES", live_ev=live_ev,
+    )
+    pipeline.executor.get_open_positions = MagicMock(side_effect=[[pos], []])
+    pipeline.executor.sell_position = MagicMock(return_value=True)
+    log_calls = []
+    pipeline.portfolio_manager.manage_portfolio(
+        lambda lvl, asset_type, tok, payload: log_calls.append((lvl, payload))
+    )
+    return log_calls
+
+
+@freeze_time("2026-06-02T00:00:00+00:00")
+def test_exit_cooldown_blocks_immediate_rescan_after_ev_convergence():
+    pipeline, bridge, _ = _make_pipeline()
+    market = _market(price=0.40)  # market_id="tok1"
+
+    exit_log = _exit_position(pipeline, "EV-CONVERGENCE", pnl_ratio=0.05, live_ev=-0.50)
+    assert any(lvl == "EV-CONVERGENCE" for lvl, _ in exit_log)
+
+    captured = []
+    pipeline.log_func = lambda lvl, asset_type, tok, payload: captured.append((lvl, payload))
+    mock_hunter = MagicMock()
+    mock_hunter.get_live_truth.return_value = 97_000.0
+
+    with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.70):
+        candidate = pipeline._stage_evaluate_ev(market, mock_hunter)
+
+    assert candidate is None
+    skip_payload = next(p for lvl, p in captured if lvl == "SCAN-SKIP")
+    assert skip_payload["reason"] == "exit_cooldown"
+
+
+@freeze_time("2026-06-02T00:00:00+00:00")
+def test_take_profit_exit_allows_immediate_rescan():
+    """A profitable exit is not churn -- re-entry must not be blocked."""
+    pipeline, bridge, _ = _make_pipeline()
+    market = _market(price=0.40)
+
+    exit_log = _exit_position(pipeline, "TAKE-PROFIT", pnl_ratio=0.25, live_ev=0.0)
+    assert any(lvl == "TAKE-PROFIT" for lvl, _ in exit_log)
+
+    mock_hunter = MagicMock()
+    mock_hunter.get_live_truth.return_value = 97_000.0
+    with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.70):
+        candidate = pipeline._stage_evaluate_ev(market, mock_hunter)
+
+    assert candidate is not None
+
+
+def test_exit_cooldown_expires_after_window():
+    pipeline, bridge, _ = _make_pipeline()
+    market = _market(price=0.40)
+
+    with freeze_time("2026-06-02T00:00:00+00:00"):
+        exit_log = _exit_position(pipeline, "EV-CONVERGENCE", pnl_ratio=0.05, live_ev=-0.50)
+        assert any(lvl == "EV-CONVERGENCE" for lvl, _ in exit_log)
+
+    with freeze_time("2026-06-03T01:00:00+00:00"):  # 25h later, past the 24h cooldown
+        mock_hunter = MagicMock()
+        mock_hunter.get_live_truth.return_value = 97_000.0
+        with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.70):
+            candidate = pipeline._stage_evaluate_ev(market, mock_hunter)
+
+    assert candidate is not None
 
 
 # ── Stage 3: _stage_risk_and_budget ──────────────────────────────────────────

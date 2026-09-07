@@ -826,6 +826,21 @@ class SequentialTradingPipeline:
                     self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_owned_in_portfolio"})
                     return None
 
+        # Post-exit cooldown (see PortfolioManager.__init__/_exit_position):
+        # a loss-type exit (EV-CONVERGENCE, WANG-EDGE-DECAY, STOP-LOSS) blocks
+        # re-entry on that token for a while, to stop the buy/exit/re-buy
+        # churn an oscillating EV estimate can otherwise cause. A closed
+        # NO-side position is recorded under no_market_id, not this market's
+        # YES-canonical token_id -- same dual check as already_owned above.
+        cooldown_until = self.portfolio_manager.exit_cooldown_until(token_id)
+        if cooldown_until is None and no_token_id:
+            cooldown_until = self.portfolio_manager.exit_cooldown_until(no_token_id)
+        if cooldown_until is not None:
+            self.log_func("SCAN-SKIP", asset_type, token_id, {
+                "reason": "exit_cooldown", "until": str(cooldown_until),
+            })
+            return None
+
         self.bridge.status = f"Scanning {asset_type}: {question[:60]}..."
         self.bridge.market_question = question
         self.bridge.market_asset_type = asset_type

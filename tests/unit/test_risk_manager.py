@@ -1,6 +1,8 @@
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
+from freezegun import freeze_time
 
 from core.bridge import DataBridge
 from core.models import Position
@@ -175,6 +177,69 @@ def test_successful_live_exit_never_logs_expired():
     pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -0.60}, log_func)
 
     assert log_levels == ["STOP-LOSS"]
+
+
+# ── Post-exit cooldown (prevents same-market buy/exit/re-buy churn) ──────────
+
+@freeze_time("2026-06-02T00:00:00+00:00")
+@pytest.mark.parametrize("level", ["EV-CONVERGENCE", "WANG-EDGE-DECAY", "STOP-LOSS"])
+def test_loss_type_exit_sets_cooldown(level):
+    pm, bridge, executor = _make_pm()
+    pos = _pos(pnl_ratio=-0.30, token_id="churny_tok")
+    executor.sell_position.return_value = True
+
+    assert pm.exit_cooldown_until("churny_tok") is None
+    pm._exit_position(pos, level, -0.5, {}, lambda *a, **kw: None)
+
+    cooldown_until = pm.exit_cooldown_until("churny_tok")
+    # frozen "now" (2026-06-02T00:00:00Z) plus the default 24h cooldown window
+    assert cooldown_until == datetime(2026, 6, 3, 0, 0, tzinfo=timezone.utc)
+
+
+@freeze_time("2026-06-02T00:00:00+00:00")
+def test_take_profit_exit_does_not_set_cooldown():
+    """A profitable exit means the model was right about the market --
+    re-entering it afterward is a legitimate trade, not churn."""
+    pm, bridge, executor = _make_pm()
+    pos = _pos(pnl_ratio=0.25, token_id="tp_tok")
+    executor.sell_position.return_value = True
+
+    pm._exit_position(pos, "TAKE-PROFIT", 0.20, {}, lambda *a, **kw: None)
+
+    assert pm.exit_cooldown_until("tp_tok") is None
+
+
+@freeze_time("2026-06-02T00:00:00+00:00")
+def test_failed_sell_does_not_set_cooldown():
+    """Nothing actually closed -- the position is still open, so a cooldown
+    (which is about blocking re-entry after a close) doesn't apply."""
+    pm, bridge, executor = _make_pm()
+    pos = _pos(pnl_ratio=-0.60, token_id="unsellable_tok")
+    executor.sell_position.return_value = False
+
+    pm._exit_position(pos, "STOP-LOSS", -0.5, {}, lambda *a, **kw: None)
+
+    assert pm.exit_cooldown_until("unsellable_tok") is None
+
+
+def test_exit_cooldown_expires_and_is_pruned():
+    pm, bridge, executor = _make_pm()
+    pos = _pos(pnl_ratio=-0.30, token_id="churny_tok")
+    executor.sell_position.return_value = True
+
+    with freeze_time("2026-06-02T00:00:00+00:00"):
+        pm._exit_position(pos, "EV-CONVERGENCE", -0.10, {}, lambda *a, **kw: None)
+        assert pm.exit_cooldown_until("churny_tok") is not None
+        assert "churny_tok" in pm._exit_cooldowns
+
+    # Just under the 24h window: still blocked.
+    with freeze_time("2026-06-02T23:59:00+00:00"):
+        assert pm.exit_cooldown_until("churny_tok") is not None
+
+    # Past the 24h window: expired, and pruned from the dict on access.
+    with freeze_time("2026-06-03T01:00:00+00:00"):
+        assert pm.exit_cooldown_until("churny_tok") is None
+        assert "churny_tok" not in pm._exit_cooldowns
 
 
 def test_ev_convergence_triggered():
