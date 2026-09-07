@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 import ui.data_manager as data_manager
-from polymarket import PolymarketClient
+from core.polymarket_client import PolymarketClient
 from core.bridge import get_bridge, DataBridge
 from core.runtime_env import get_env as _get_env, restore_wallet_state, validate_runtime_env
 from core.wallet_context import WalletContext

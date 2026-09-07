@@ -152,7 +152,8 @@ PolyBot/
 │   ├── trading_config.py       # TradingConfig: from_env() (config/.env) or from_file() (wallet config.json)
 │   ├── bridge.py               # DataBridge: per-wallet live state (dashboard <-> engine)
 │   ├── wallet_context.py       # WalletContext: bundles a wallet's config + bridge + db_path
-│   └── wallet_manager.py       # build_wallet_runtime(): wires one WalletContext's components (used by run_engine.py)
+│   ├── wallet_manager.py       # build_wallet_runtime(): wires one WalletContext's components (used by run_engine.py)
+│   └── polymarket_client.py    # PolymarketClient: Gamma API + CLOB balance fetch (split out of polymarket.py so the dashboard doesn't import ccxt/scipy)
 │
 ├── hunters/                    # Market discovery and reference-data fetching
 │   ├── base.py                 # BaseHunter interface + Polymarket pagination logic
@@ -197,7 +198,7 @@ PolyBot/
 │       ├── deploy.yml          # Build → ECR push → EC2 deploy on push to main
 │       └── claude.yml          # Claude Code bot for PR/issue automation
 │
-├── polymarket.py               # PolymarketClient (Gamma API + CLOB balance) + PolymarketScannerHunter
+├── polymarket.py               # PolymarketScannerHunter (discovery + pricing coordinator)
 └── pytest.ini
 ```
 

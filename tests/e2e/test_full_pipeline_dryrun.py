@@ -15,7 +15,8 @@ from core.models import MarketData
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
 from hunters.crypto import CryptoHunter
-from polymarket import PolymarketClient, PolymarketScannerHunter
+from core.polymarket_client import PolymarketClient
+from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.decision_pipeline import sync_live_account_state
 from trading.executor import TradeExecutor

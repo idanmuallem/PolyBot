@@ -18,7 +18,7 @@ from brains import get_brain_for_asset_type
 from brains.base import calculate_tte
 from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
-from polymarket import PolymarketClient
+from core.polymarket_client import PolymarketClient
 from trading.strategies import EventSumStrategy, Strategy
 from ui import data_manager
 
