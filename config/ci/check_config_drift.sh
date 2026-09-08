@@ -62,10 +62,4 @@ check_key KELLY_FRACTION kelly_fraction
 check_key MAX_DRAWDOWN_PCT max_drawdown_pct
 check_key ENABLE_ARBITRAGE enable_arbitrage
 
-# CI VERIFICATION (deliberate failure): forces a mismatch to prove this
-# check actually fails and is reported clearly. Will revert immediately
-# after confirming. See .github/workflows/deploy.yml.
-echo "MISMATCH CI_VERIFICATION: forced mismatch to prove this check fails and is caught"
-FAIL=1
-
 exit "$FAIL"
