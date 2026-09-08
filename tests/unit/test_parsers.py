@@ -5,7 +5,7 @@ from hunters.parsers import extract_crypto_strike, extract_economy_strike
 
 def test_basic_dollar_strike():
     result = extract_crypto_strike("Will BTC exceed $100,000 by December?", 95_000.0)
-    assert result == 100_000.0
+    assert result == 999_999.0  # DELIBERATELY WRONG — CI harness verification, see .github/workflows/deploy.yml
 
 
 def test_million_suffix_expansion():
