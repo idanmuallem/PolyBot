@@ -419,6 +419,14 @@ async def test_crypto_first_disabled_preserves_scanner_order():
 async def test_scan_is_throttled_within_interval():
     pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
     pipeline.strategy_scan_interval = 999.0  # effectively "don't rescan"
+    # _last_strategy_scan starts at 0.0 (see SequentialTradingPipeline.__init__),
+    # and the throttle check compares it against time.monotonic() — which is
+    # time since some origin (often host/VM boot), not time since process
+    # start. On a freshly-booted CI runner that can be well under 999s,
+    # which would throttle even this test's FIRST scan below. Force it
+    # explicitly far in the past so the first call is never throttled
+    # regardless of how long the real clock's origin has been running.
+    pipeline._last_strategy_scan = -1_000_000.0
 
     with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[]) as mock_fetch:
         await pipeline._stage_strategy_scan()
