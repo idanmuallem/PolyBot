@@ -103,6 +103,14 @@ jobs:
         echo "Pre-deploy hunt_history rows: $COUNT"
         echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
+    # The wal_checkpoint.py line below (before `docker stop`) flushes
+    # trades.db's WAL sidecar to the host-visible file while the old
+    # container can still reach it — trades.db is bind-mounted as a single
+    # file (not a directory), so the *-wal holding not-yet-checkpointed
+    # writes lives only in the old container's own filesystem and would
+    # otherwise be destroyed, unflushed, by `docker rm`. Discovered via the
+    # meta-harness's "Trade history not wiped" check catching a real
+    # hunt_history row-count drop on an ordinary deploy.
     - name: Deploy to EC2 via AWS SSM
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -113,6 +121,7 @@ jobs:
           --comment "Deploying PolyBot to Stockholm" \
           --parameters 'commands=[
             "aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}",
+            "docker exec polybot python3 config/ci/wal_checkpoint.py || true",
             "docker stop polybot || true",
             "docker rm polybot || true",
             "docker system prune -a -f",
