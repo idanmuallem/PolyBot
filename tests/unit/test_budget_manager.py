@@ -156,6 +156,48 @@ def test_kelly_fraction_defaults_to_quarter_kelly():
     assert mgr.kelly_fraction == 0.25
 
 
+# ── Real-trade clustering regression (see investigation: all 7 live trades
+# clamped to a flat $25, then a flat $100, regardless of EV 0.35-0.78 —
+# because quarter-Kelly (0.25) at bankroll_usd=10000 produces raw suggestions
+# of $670-$850 for every trade that clears MIN_EV=0.35, dwarfing any
+# reasonable dollar cap) ──────────────────────────────────────────────────────
+
+def test_quarter_kelly_at_prod_bankroll_clamps_every_real_historical_trade():
+    """Reproduces the clustering bug: at kelly_fraction=0.25 (the old
+    default) and bankroll_usd=10000, a real logged trade (price=0.49,
+    ev=0.3527, side=NO -> edge=0.172823, odds=0.51) raw-sizes to ~$847,
+    which clamps to max_bet_size_usd regardless of what the cap is set to.
+    This is the mechanism that made every trade cost exactly $25, then
+    exactly $100 -- the cap, not Kelly, was setting every trade's size."""
+    mgr, _ = _make_manager(bankroll=10000.0, max_bet_size_usd=100.0, kelly_fraction=0.25)
+    bet = mgr.compute_kelly_bet_size(edge=0.172823, odds=0.51, confidence=1.0)
+    assert bet == 100.0  # clamped, same as every real trade under this config
+
+
+def test_realistic_kelly_fraction_produces_unclamped_size_that_varies_across_real_trades():
+    """At kelly_fraction=0.015 (the calibrated fix) and bankroll_usd=10000,
+    real historical edge/odds pairs should size well clear of both the old
+    flat $25 and the new flat $100 -- proof the dollar amount is actually
+    coming from Kelly's edge/odds inputs, not just hitting the ceiling."""
+    mgr, _ = _make_manager(bankroll=10000.0, max_bet_size_usd=100.0, kelly_fraction=0.015)
+
+    # price=0.49, ev=0.3527, side=NO -> edge=0.172823, odds=0.51
+    trade_a = mgr.compute_kelly_bet_size(edge=0.172823, odds=0.51, confidence=1.0)
+    # price=0.42, ev=0.3719, side=NO -> edge=0.156198, odds=0.58 (the
+    # smallest raw_fraction of the 7 real trades logged so far)
+    trade_b = mgr.compute_kelly_bet_size(edge=0.156198, odds=0.58, confidence=1.0)
+
+    for bet in (trade_a, trade_b):
+        assert bet != 25.0
+        assert bet != 100.0
+        assert 0.0 < bet < 100.0
+
+    assert trade_a == pytest.approx(50.83, abs=0.01)
+    assert trade_b == pytest.approx(40.40, abs=0.01)
+    # Real variation between two real trades, not identical flat sizing.
+    assert trade_a != pytest.approx(trade_b)
+
+
 # ── cap_to_remaining_budget ────────────────────────────────────────────────────
 
 def test_cap_to_remaining_budget_under_limit():
