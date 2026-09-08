@@ -16,7 +16,7 @@ env:
   AWS_REGION: eu-north-1
   ECR_REPOSITORY: polybot/main
   EC2_INSTANCE_ID: i-0180454c9417597f9 # Your verified Stockholm Instance ID
-  DASHBOARD_URL: http://127.0.0.1:9 # CI VERIFICATION: deliberately unreachable, will revert immediately
+  DASHBOARD_URL: http://16.171.179.213 # Elastic IP on the EC2 instance above
 
 jobs:
   test:
