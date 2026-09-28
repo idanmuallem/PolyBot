@@ -214,6 +214,7 @@ class BasePolymarketHunter(BaseHunter):
                                 no_market_id=no_market_id,
                                 condition_id=market.get("conditionId") or market.get("condition_id"),
                                 slug=market.get("slug") or event.get("slug"),
+                                description=market.get("description") or event.get("description") or "",
                             )
                             print(
                                 f"[{tag}] SELECT | {market_name} | "

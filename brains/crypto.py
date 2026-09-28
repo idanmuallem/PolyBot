@@ -12,6 +12,44 @@ from core.models import MarketData
 from .base import BaseBrain, calculate_tte
 
 
+# Resolution-type classifier — decides whether a market resolves on first
+# touch (any point before the deadline) or only at expiry (terminal price).
+#
+# Verified against every resolution-criteria string actually observed on
+# Polymarket's BTC/ETH price-threshold markets (see the "What price will
+# Bitcoin/Ethereum hit in [month/year]?" series and its "all time high by"
+# sibling) — all of them state, in slightly varying wording, that the
+# market resolves the moment a 1-minute Binance candle's High/Low crosses
+# the listed price. Requiring several signals to co-occur (a candle/
+# monitoring reference, an explicit "final ... price" trigger, and a High/
+# Low + price mention) keeps this from false-positiving on an unrelated
+# description while still tolerating the wording drift already seen across
+# markets (different date phrasing, "immediately resolve" vs "resolve",
+# encoding-mangled quote characters).
+#
+# No expiry-style crypto market has been observed yet to test a true
+# negative against real data — every crypto market reachable by the
+# hunter's current filters happens to be touch-style (see the market-
+# discovery trace). Anything that doesn't match this pattern — including
+# a genuinely different, not-yet-seen expiry-style wording — falls back to
+# "unknown", which routes to the pre-existing (correct-for-expiry) terminal
+# Black-Scholes path. That's the safe default: a market this classifier
+# fails to recognize gets today's existing behavior, never a worse one.
+_TOUCH_RESOLUTION_MARKERS = ("1 minute candle", "1-minute candle")
+
+
+def classify_resolution_type(description: str) -> str:
+    """Return "touch" if *description* states first-touch/barrier
+    resolution, else "unknown" (caller should treat as expiry/terminal)."""
+    text = (description or "").lower()
+    has_candle = any(marker in text for marker in _TOUCH_RESOLUTION_MARKERS)
+    has_final_trigger = "has a final" in text
+    has_high_low_price = ("high" in text or "low" in text) and "price" in text
+    if has_candle and has_final_trigger and has_high_low_price:
+        return "touch"
+    return "unknown"
+
+
 class HybridCryptoBrain(BaseBrain):
     """Calculate fair value for cryptocurrency prediction markets.
 
@@ -119,6 +157,16 @@ class HybridCryptoBrain(BaseBrain):
             volatility=vol,
         )
 
+        # The first-passage path (see evaluate_fair_value/_price_first_passage)
+        # already returns P(the stated condition holds) directly — it picks
+        # up-touch vs down-touch from where the strike sits relative to spot,
+        # not from question wording. "P(touches up)" and "P(touches down)"
+        # aren't complements of each other the way terminal's "ends above" /
+        # "ends below" are, so applying the keyword-driven inversion below
+        # to it would silently invert an already-correct answer.
+        if self.last_model_used == "first_passage":
+            return base_prob
+
         question = str(getattr(market, "market_name", "") or getattr(market, "question", "")).lower()
         invert_keywords = ["↓", "below", "under", "less", "down", "lower"]
 
@@ -128,7 +176,22 @@ class HybridCryptoBrain(BaseBrain):
         return base_prob
 
     def evaluate_fair_value(self, market: MarketData, live_truth: float, volatility: float) -> float:
-        """Select pricing model based on time-to-expiry (TTE) with safe fallback.
+        """Select pricing model based on time-to-expiry (TTE) and, for
+        TTE >= 1 day, the market's actual resolution mechanism — with safe
+        fallback.
+
+        Polymarket's BTC/ETH price-threshold markets resolve on first touch
+        (any 1-minute candle crossing the strike before the deadline), not
+        on the terminal price at expiry — confirmed directly from each
+        market's own resolution-criteria text (see classify_resolution_type
+        above). Plain Black-Scholes answers "where does price end up",
+        which is the wrong question for a market that pays out the moment
+        price is EVER seen past the strike; a first-passage/barrier
+        probability answers the right one. Markets this classifier can't
+        positively identify as touch-style (including a genuinely
+        different, not-yet-seen expiry-style market) keep using the
+        existing terminal calculation — see classify_resolution_type's
+        docstring for why that's the safe default.
 
         If the selected primary model fails, we explicitly fall back to
         Black-Scholes.
@@ -146,6 +209,9 @@ class HybridCryptoBrain(BaseBrain):
             if tte_days < 1.0:
                 self.last_model_used = "short_term"
                 fair_value = self._price_short_term(live_truth, market.strike_price)
+            elif classify_resolution_type(getattr(market, "description", "")) == "touch":
+                self.last_model_used = "first_passage"
+                fair_value = self._price_first_passage(live_truth, market.strike_price, tte_days, volatility)
             else:
                 self.last_model_used = "standard_bs"
                 fair_value = self._price_standard_bs(live_truth, market.strike_price, tte_days, volatility)
@@ -183,6 +249,81 @@ class HybridCryptoBrain(BaseBrain):
         volatility: float,
     ) -> float:
         return self._calculate_prob(current_price, strike_price, time_to_expiry_days, volatility)
+
+    def _price_first_passage(
+        self,
+        current_price: float,
+        strike_price: float,
+        time_to_expiry_days: float,
+        volatility: float,
+    ) -> float:
+        """First-passage (barrier) probability: P(price ever crosses
+        strike_price before expiry), for touch-resolving markets — see
+        evaluate_fair_value's docstring for why this differs from
+        _price_standard_bs's terminal P(price > strike at expiry).
+
+        Direction (crossing up through the strike, vs. down through it) is
+        taken directly from whether the strike sits above or below the
+        current price — not from the question's wording — so this is
+        correct regardless of "reach $X" vs "dip to $X" phrasing, and
+        doesn't depend on a keyword match the way the terminal path's
+        up/down inversion does. _calculate_probability skips that
+        keyword-based inversion whenever this path was used (see there):
+        "P(touches up)" and "P(touches down)" aren't complements of each
+        other the way "ends above K" / "ends below K" are, so this method
+        returns P(the stated condition holds) directly, already correctly
+        signed — inverting it again would silently be wrong.
+
+        Closed-form reflection-principle solution for a driftless
+        geometric Brownian motion's running maximum/minimum (Shreve,
+        Stochastic Calculus for Finance II, ch. 7) — the same zero-drift
+        convention _calculate_prob already uses (its d2 formula has no
+        risk-free-rate term), so this needs no new free parameter. Verified
+        numerically against Monte Carlo simulation of the same process
+        before landing this.
+
+        This is the continuous-monitoring solution; these markets actually
+        resolve off discrete 1-minute candles. The standard discrete-
+        monitoring correction (Broadie-Glasserman-Kou) shifts the effective
+        barrier by volatility * 0.5826 * sqrt(dt) in log-space — with dt on
+        the order of 1 minute against strikes/TTEs measured in days to
+        months, that shift is on the order of 1e-4 to 1e-3 in log-price,
+        utterly negligible next to the barrier distances actually seen
+        here (0.01-1.0+). Not applied — the continuous formula is already
+        an excellent approximation at this monitoring frequency.
+        """
+        if strike_price <= 0 or current_price <= 0:
+            return 0.5
+        if time_to_expiry_days <= 0:
+            return 1.0 if current_price >= strike_price else 0.0
+
+        t_years = time_to_expiry_days / 365.0
+        # Zero log-drift, matching _calculate_prob's own convention (no r term).
+        nu = -0.5 * volatility * volatility
+        sigma_sqrt_t = volatility * math.sqrt(t_years)
+        if sigma_sqrt_t <= 0:
+            return 1.0 if current_price >= strike_price else 0.0
+
+        if strike_price >= current_price:
+            # Barrier above spot: P(running max ever >= strike).
+            b = math.log(strike_price / current_price)
+            if b <= 0:
+                return 1.0
+            term1 = norm.cdf((nu * t_years - b) / sigma_sqrt_t)
+            term2 = math.exp(2.0 * nu * b / (volatility * volatility)) * norm.cdf(
+                (-nu * t_years - b) / sigma_sqrt_t
+            )
+        else:
+            # Barrier below spot: P(running min ever <= strike).
+            b = math.log(current_price / strike_price)
+            if b <= 0:
+                return 1.0
+            term1 = norm.cdf((-nu * t_years - b) / sigma_sqrt_t)
+            term2 = math.exp(-2.0 * nu * b / (volatility * volatility)) * norm.cdf(
+                (nu * t_years - b) / sigma_sqrt_t
+            )
+
+        return float(max(0.0, min(1.0, term1 + term2)))
 
     @staticmethod
     def _calculate_prob(

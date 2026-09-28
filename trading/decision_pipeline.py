@@ -871,7 +871,6 @@ class SequentialTradingPipeline:
             float(live_truth.get("spot_price") or 0.0) if isinstance(live_truth, dict) else float(live_truth)
         )
         brain = get_brain_for_asset_type(asset_type)
-        model_used = getattr(brain, "last_model_used", "unknown")
 
         # Pricing (Wang Transform -> market blend) is all computed inside
         # evaluate() — see brains/base.py. "legacy" mode asks for both layers
@@ -888,6 +887,13 @@ class SequentialTradingPipeline:
                 wang_lambda=self.config.wang_lambda,
                 model_weight=self.config.model_weight,
             )
+
+        # Read AFTER evaluate() — get_brain_for_asset_type() constructs a
+        # fresh brain every call, so last_model_used only reflects this
+        # scan's actual choice (short_term/standard_bs/first_passage/...)
+        # once evaluate() -> _calculate_probability() has set it. Reading it
+        # any earlier just captures __init__'s default, permanently.
+        model_used = getattr(brain, "last_model_used", "unknown")
 
         pre_prob = signal.pre_prob
         post_prob = signal.post_prob

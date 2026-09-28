@@ -18,6 +18,8 @@ class MarketData:
     no_market_id: Optional[str] = None
     condition_id: Optional[str] = None   # Polymarket conditionId (0x...)
     slug: Optional[str] = None           # Polymarket market slug
+    description: str = ""                # Gamma API's resolution-criteria text (see
+                                          # brains/crypto.py's touch-vs-expiry classifier)
 
 
 @dataclass
