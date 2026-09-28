@@ -32,8 +32,6 @@ if TYPE_CHECKING:
     from trading.risk_manager import PortfolioManager
     from trading.budget_manager import BudgetManager
 
-DATA_ROOT = "data"
-
 
 @dataclass
 class WalletContext:

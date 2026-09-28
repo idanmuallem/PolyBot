@@ -29,12 +29,17 @@ N=13,274 Polymarket contracts) when volume and time-to-expiry are known:
 Falls back to oracle3's pooled prior (291K contracts, lambda = 0.183) when
 that metadata isn't available.
 
-NOTE: the above (PricingEngine, wang_transform) is the EXIT-side mechanism
-only (trading/risk_manager.py). Entry-side pricing (BaseBrain.evaluate())
-uses logit_shrink() below instead, a provably monotonic logit-space
-shrink - see that function's docstring for why the two sides no longer
-share the probit-shift design. See PHASE1_FINDINGS.md and PROGRESS.md for
-the calibration evidence (or lack thereof) behind entry_k's default.
+NOTE: `PricingEngine` is the EXIT-side mechanism (trading/risk_manager.py);
+it inlines its own probit shift in `wang_fair_value()` and does not call the
+standalone `wang_transform()` below. `wang_transform()` itself is no longer
+called by any production path as of the entry-side redesign - it is retained
+only as the reference implementation of the old entry-side transform, used by
+the characterization tests (test_pricing_engine.py, test_brains_base.py) and
+scripts/phase3_validation.py to document the crossover bug it exhibited.
+Entry-side pricing (BaseBrain.evaluate()) uses logit_shrink() below instead,
+a provably monotonic logit-space shrink. See PHASE1_FINDINGS.md and
+PROGRESS.md for the calibration evidence (or lack thereof) behind entry_k's
+default.
 """
 import math
 
@@ -56,14 +61,15 @@ def _clamp_prob(p: float) -> float:
 def wang_transform(p_true: float, lam: float) -> float:
     """Flat-lambda Wang Transform: Phi(Phi^-1(p_true) + lam).
 
-    HISTORICAL / EXIT-SIDE ONLY as of the entry-side redesign below. Kept
-    for PricingEngine's own documentation and tests, and as the reference
-    implementation of the bug that motivated logit_shrink(): a constant
-    probit-space shift is only "toward 0.5" on one side of a lambda-
-    dependent crossover point. For lam < 0, inputs with
-    p_true > Phi(-lam) actually get pushed AWAY from 0.5, not toward it -
-    see test_pricing_engine.py's characterization test. BaseBrain.evaluate()
-    no longer calls this for entry-side pricing (see logit_shrink() below).
+    REFERENCE / TEST-ONLY as of the entry-side redesign below - no
+    production path calls this function any more (the exit-side PricingEngine
+    inlines its own probit shift; entry-side uses logit_shrink()). Retained as
+    the reference implementation of the bug that motivated logit_shrink(): a
+    constant probit-space shift is only "toward 0.5" on one side of a lambda-
+    dependent crossover point. For lam < 0, inputs with p_true > Phi(-lam)
+    actually get pushed AWAY from 0.5, not toward it - see
+    test_pricing_engine.py's characterization test and
+    scripts/phase3_validation.py.
 
     lam < 0 pulls p_true toward 0.5 for most of [0, 1] (risk-averse); lam > 0
     pushes it away for most of [0, 1]; lam == 0.0 is an exact passthrough.
