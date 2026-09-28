@@ -1,9 +1,10 @@
 import math
 
+import numpy as np
 import pytest
 from scipy.stats import norm
 
-from brains.pricing_engine import PricingEngine, _clamp_prob, wang_transform
+from brains.pricing_engine import PricingEngine, _clamp_prob, logit_shrink, wang_transform
 
 
 # ── wang_fair_value: known values ───────────────────────────────────────────
@@ -217,3 +218,109 @@ def test_wang_transform_penalizes_uncertainty_more():
 
 def test_wang_lambda_zero_is_passthrough():
     assert wang_transform(0.70, 0.0) == 0.70
+
+
+# ── wang_transform: characterization of the crossover-point bug ────────────
+#
+# This documents the actual bug that motivated logit_shrink() (see below):
+# a constant probit-space shift is only "toward 0.5" on one side of a
+# lambda-dependent crossover point. wang_transform() itself is UNCHANGED and
+# still used on the exit side (PricingEngine, trading/risk_manager.py, whose
+# lambda is a real fitted hierarchical model, not a flat guess - see
+# brains/pricing_engine.py's module docstring for why entry and exit no
+# longer share a design). These tests exist purely to document, with a
+# runnable proof, the specific failure that entry-side pricing no longer has.
+
+def test_wang_transform_crossover_bug_at_entry_lambda():
+    # lambda=-0.75 was the crypto brain's old entry-side constant. Its
+    # crossover point (the p above which the shift flips from "toward 0.5"
+    # to "away from 0.5") sits around p ~= 0.62-0.65. Every raw probability
+    # the crypto brain has ever actually produced sat in 0.25-0.45 - i.e.
+    # entirely on the wrong side of the crossover - so in practice this
+    # transform moved every real input AWAY from 0.5, the opposite of its
+    # own docstring's claim ("pulls toward 0.5"). See PHASE1_FINDINGS.md.
+    for p in (0.25, 0.30, 0.35, 0.40, 0.45):
+        shifted = wang_transform(p, -0.75)
+        assert shifted < p, (
+            f"expected wang_transform({p}, -0.75) to move further from 0.5 "
+            f"(the documented bug), got {shifted} which moved toward 0.5"
+        )
+
+    # By contrast, for p above the crossover (empirically ~0.62-0.65 for
+    # this lambda), the same lambda genuinely moves the result closer to
+    # 0.5 than p was, exactly as documented - which is what made the bug
+    # easy to miss: the transform behaves correctly for inputs the crypto
+    # brain never actually produces. Note this can still overshoot past 0.5
+    # to the other side (e.g. p=0.70 -> ~0.41): "moved toward 0.5" and
+    # "landed between p and 0.5" are not the same claim, and only the
+    # former is documented/promised.
+    for p in (0.70, 0.80, 0.90):
+        shifted = wang_transform(p, -0.75)
+        assert abs(shifted - 0.5) < abs(p - 0.5), (
+            f"expected wang_transform({p}, -0.75) to move closer to 0.5, "
+            f"got {shifted}"
+        )
+
+
+# ── logit_shrink: property-based monotonicity proof ─────────────────────────
+#
+# The actual regression test for the crossover bug above. logit_shrink must
+# be monotonic toward 0.5 for EVERY p in (0, 1) and EVERY k in [0, 1] - not
+# just the range the crypto brain happens to produce today - because that
+# was exactly the blind spot that let the old bug ship unnoticed.
+
+_P_GRID = np.concatenate([
+    np.array([1e-6, 1e-4, 1e-3]),
+    np.linspace(0.01, 0.99, 99),
+    np.array([1 - 1e-3, 1 - 1e-4, 1 - 1e-6]),
+])
+_K_GRID = np.linspace(0.0, 1.0, 21)
+
+
+def test_logit_shrink_monotonic_toward_half_full_sweep():
+    for k in _K_GRID:
+        for p in _P_GRID:
+            shrunk = logit_shrink(float(p), float(k))
+            assert 0.0 <= shrunk <= 1.0, f"out of range at p={p}, k={k}: {shrunk}"
+            if p < 0.5:
+                assert p - 1e-9 <= shrunk <= 0.5 + 1e-9, (
+                    f"p={p} k={k}: expected p <= shrunk <= 0.5, got {shrunk}"
+                )
+            elif p > 0.5:
+                assert 0.5 - 1e-9 <= shrunk <= p + 1e-9, (
+                    f"p={p} k={k}: expected 0.5 <= shrunk <= p, got {shrunk}"
+                )
+
+
+def test_logit_shrink_half_is_fixed_point():
+    for k in _K_GRID:
+        assert logit_shrink(0.5, float(k)) == pytest.approx(0.5, abs=1e-9)
+
+
+def test_logit_shrink_k_one_is_identity():
+    for p in _P_GRID:
+        assert logit_shrink(float(p), 1.0) == pytest.approx(float(p), abs=1e-9)
+
+
+def test_logit_shrink_k_zero_is_always_half():
+    for p in _P_GRID:
+        assert logit_shrink(float(p), 0.0) == pytest.approx(0.5, abs=1e-9)
+
+
+def test_logit_shrink_order_preserving_in_p():
+    # For a fixed k, shrinking must not reorder inputs (no crossing lines).
+    for k in (0.0, 0.25, 0.5, 0.75, 1.0):
+        outputs = [logit_shrink(float(p), k) for p in _P_GRID]
+        assert all(a <= b + 1e-9 for a, b in zip(outputs, outputs[1:])), (
+            f"logit_shrink not order-preserving at k={k}"
+        )
+
+
+def test_logit_shrink_never_reproduces_crossover_bug():
+    # The direct contrast with test_wang_transform_crossover_bug_at_entry_lambda
+    # above: over the same p range where the old transform moved values away
+    # from 0.5, logit_shrink always moves them toward (or leaves them at) 0.5.
+    for p in (0.25, 0.30, 0.35, 0.40, 0.45):
+        for k in (0.1, 0.3, 0.5, 0.7, 0.9):
+            shrunk = logit_shrink(p, k)
+            assert shrunk >= p, f"p={p} k={k}: expected shrunk >= p (toward 0.5), got {shrunk}"

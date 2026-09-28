@@ -32,8 +32,10 @@ class TradeSignal:
     # Pricing diagnostics (see BaseBrain.evaluate() in brains/base.py) -
     # populated even when is_tradable is False, so callers can log why.
     pre_prob: float = 0.0            # the brain's unadjusted model output
-    wang_fair_value: float = 0.0     # after Wang Transform only, before market blending
-    wang_lambda: float = 0.0         # distortion parameter actually applied
+    wang_fair_value: float = 0.0     # after entry-side logit_shrink only, before market blending
+    wang_lambda: float = 0.0         # field name kept for storage/dashboard continuity;
+    # holds entry_k (logit-shrink strength, [0,1]) as of the entry-side
+    # redesign, not a probit Wang lambda. See brains/pricing_engine.py.
     wang_edge: float = 0.0           # post_prob - market_price (post blend)
     confidence: float = 1.0          # [0, 1] scale applied to Kelly sizing downstream
     side: str = "YES"                # YES or NO - whichever side has the larger EV

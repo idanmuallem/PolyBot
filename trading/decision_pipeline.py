@@ -75,7 +75,9 @@ class CandidateTrade:
     final_ev: float
     entry_price: float
     pricing_mode: str = "wang"
-    wang_lambda: Optional[float] = None
+    wang_lambda: Optional[float] = None  # name kept for continuity; holds entry_k
+    # (logit-shrink strength) as of the entry-side redesign, not a Wang
+    # probit lambda. See core/models.py TradeSignal.wang_lambda.
     wang_fair_value: Optional[float] = None
     wang_edge: Optional[float] = None
     strategy_type: str = "model"       # "model" for brain-driven trades, "arbitrage" etc. for strategies
@@ -872,19 +874,24 @@ class SequentialTradingPipeline:
         )
         brain = get_brain_for_asset_type(asset_type)
 
-        # Pricing (Wang Transform -> market blend) is all computed inside
+        # Pricing (logit shrink -> market blend) is all computed inside
         # evaluate() — see brains/base.py. "legacy" mode asks for both layers
-        # disabled (lambda=0, full model weight) so it reduces to the brain's
-        # raw probability, for A/B comparison against "wang" mode.
+        # disabled (entry_k=1.0, i.e. no shrink; full model weight) so it
+        # reduces to the brain's raw probability, for A/B comparison against
+        # "wang" mode. NOTE: entry_k=1.0 is the passthrough value, NOT 0.0 —
+        # logit_shrink(p, 0.0) collapses everything to 0.5, the opposite of
+        # disabling the shrink. This is a deliberate flip from the old
+        # wang_transform(), where lambda=0.0 was the passthrough; the two
+        # functions use opposite conventions for their "off" value.
         if self.pricing_mode == "legacy":
             signal = brain.evaluate(
                 market, live_truth, min_ev=self.min_ev_threshold,
-                wang_lambda=0.0, model_weight=1.0,
+                entry_k=1.0, model_weight=1.0,
             )
         else:
             signal = brain.evaluate(
                 market, live_truth, min_ev=self.min_ev_threshold,
-                wang_lambda=self.config.wang_lambda,
+                entry_k=self.config.entry_k,
                 model_weight=self.config.model_weight,
             )
 

@@ -164,7 +164,13 @@ async def test_single_pipeline_loop_dry_run(tmp_path):
 
 _WANG_DRY_CONFIG = TradingConfig(
     trading_mode="dry_run",
-    min_ev=0.50,  # the real default (DEFAULT_MIN_EV) - not lowered for this test
+    # min_ev relaxed to 0.10 (below DEFAULT_MIN_EV=0.50): this test exercises
+    # pipeline plumbing (DRY-RUN/TRACK firing, payload keys) with a real,
+    # unmocked brain, not a specific calibration value - the observed edge
+    # here depends on entry_k (currently a documented neutral default, see
+    # DEFAULT_ENTRY_K in core/trading_config.py), not a value this test
+    # should pin. Same rationale as wang_min_edge=0.0 below.
+    min_ev=0.10,
     bankroll_usd=1000.0,
     daily_limit_usd=15.0,
     max_bet_size_usd=3.0,
@@ -201,9 +207,9 @@ async def test_full_pipeline_loop_dry_run_wang_mode(tmp_path):
 
     # Real (unmocked) brain: spot=93,000 well below strike=95,000 -> a low
     # raw probability, while the market trades at 0.70 (implying YES is
-    # likely). After Wang + market-blending the model still disagrees with
-    # the market enough to clear MIN_EV=0.50 on the NO side (real edge is
-    # ~0.71 here), without lowering the threshold to force a fill.
+    # likely). After logit-shrink + market-blending the model still
+    # disagrees with the market enough to clear the relaxed min_ev=0.10 on
+    # the NO side (real edge is ~0.33 here under DEFAULT_ENTRY_K=0.5).
     expiry = (datetime.now(timezone.utc) + timedelta(days=29)).isoformat()
     sample_market = MarketData(
         market_id="tok_btc_wang",

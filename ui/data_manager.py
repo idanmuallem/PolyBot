@@ -509,7 +509,9 @@ def _extract_payload_columns(parsed: pd.Series) -> dict:
         # expanded into the existing payload JSON rather than new DB columns,
         # matching how Phases 3-5 already log these fields per trade.
         "Raw Prob":    _get("pre_prob", "raw_probability"),
-        "Wang λ":      _get("wang_lambda"),
+        "Entry k":     _get("wang_lambda"),  # dict key kept for continuity; see
+        # core/models.py TradeSignal.wang_lambda — now holds entry_k, not a
+        # Wang lambda, hence the relabeled column.
         "Wang FV":     _get("wang_fair_value"),
         "Wang Edge":   _get("wang_edge"),
         "Strategy":    _get("strategy_type"),
@@ -520,7 +522,7 @@ def _extract_payload_columns(parsed: pd.Series) -> dict:
 
 _NUMERIC_DISPLAY_COLS = [
     "Price", "Fair Value", "EV", "Bet ($)", "Shares",
-    "Raw Prob", "Wang λ", "Wang FV", "Wang Edge", "Kelly Frac", "Correlation",
+    "Raw Prob", "Entry k", "Wang FV", "Wang Edge", "Kelly Frac", "Correlation",
 ]
 
 
@@ -551,7 +553,7 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
     desired = [
         "Time", "Action", "Asset", "Side", "Strategy", "Market Name", "Reject Reason", "Model Used",
-        "Price", "Fair Value", "EV", "Raw Prob", "Wang λ", "Wang FV", "Wang Edge",
+        "Price", "Fair Value", "EV", "Raw Prob", "Entry k", "Wang FV", "Wang Edge",
         "Bet ($)", "Kelly Frac", "Correlation", "Shares", "Token",
     ]
     out = out[[c for c in desired if c in out.columns]]

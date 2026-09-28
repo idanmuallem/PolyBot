@@ -14,8 +14,28 @@ DEFAULT_DAILY_LIMIT_USD = 15.0
 # from wang_base_lambda below, which is the oracle3-calibrated hierarchical
 # prior used only by the exit-side Wang-edge-decay check in
 # trading/risk_manager.py - changing that one would silently alter open-
-# position exit behavior, so entry calibration gets its own flat constant.
-DEFAULT_WANG_LAMBDA = -0.75          # risk-averse distortion; 0.0 disables Wang entirely
+# position exit behavior, so entry calibration gets its own constant.
+#
+# entry_k replaces the old DEFAULT_WANG_LAMBDA (-0.75, a probit-space shift
+# with no documented justification, and a math bug: it pushed this system's
+# actual output range, 0.25-0.45, AWAY from 0.5 rather than toward it - see
+# PHASE1_FINDINGS.md). entry_k feeds brains/pricing_engine.logit_shrink(),
+# a proportional shrink toward 0.5 in logit space: p' = sigmoid(logit(p)*k),
+# monotonic toward 0.5 for every p and every k in [0, 1] by construction.
+#
+# Default value (0.5) is a documented NEUTRAL PLACEHOLDER, not a fitted
+# calibration. A dedicated backtest (56 resolved markets, 164 snapshots;
+# see PHASE1_FINDINGS.md) found no significant relationship between how
+# much the brain's raw probability diverges from the market and which one
+# ends up closer to the real outcome (r=-0.103, p=0.189) - so there is no
+# evidence basis for picking a stronger or weaker k. At the same time, the
+# fixed brain's aggregate calibration (Brier ~0.047) is on par with or
+# better than the market's own (~0.057), which argues against defaulting
+# to near-total distrust (k close to 0) either. k=0.5 treats the brain's
+# raw signal and 0.5 symmetrically in log-odds space pending more resolved
+# dry-run trades to calibrate this properly with less confounded data than
+# the historical backtest's 94%-NO-outcome sample.
+DEFAULT_ENTRY_K = 0.5                # shrink strength in [0, 1]; 1.0 = no shrink, 0.0 = always 0.5
 DEFAULT_MODEL_WEIGHT = 0.40          # weight on the Wang-adjusted model vs. (1 - this) on market price
 
 
@@ -103,8 +123,8 @@ class TradingConfig:
     wang_min_edge: float = 0.05  # minimum |wang_edge| (probability points) to consider a trade
 
     # Entry-side pricing knobs consumed by BaseBrain.evaluate() (see
-    # DEFAULT_WANG_LAMBDA / DEFAULT_MODEL_WEIGHT above for what each does).
-    wang_lambda: float = DEFAULT_WANG_LAMBDA
+    # DEFAULT_ENTRY_K / DEFAULT_MODEL_WEIGHT above for what each does).
+    entry_k: float = DEFAULT_ENTRY_K
     model_weight: float = DEFAULT_MODEL_WEIGHT
 
     # Risk management (see trading/budget_manager.py, trading/risk_manager.py).
@@ -177,7 +197,7 @@ class TradingConfig:
             pricing_mode=_env_first("PRICING_MODE", default="wang"),
             wang_base_lambda=float(os.getenv("WANG_BASE_LAMBDA", "0.183")),
             wang_min_edge=float(os.getenv("WANG_MIN_EDGE", "0.05")),
-            wang_lambda=float(os.getenv("WANG_LAMBDA", str(DEFAULT_WANG_LAMBDA))),
+            entry_k=float(os.getenv("ENTRY_K", str(DEFAULT_ENTRY_K))),
             model_weight=float(os.getenv("MODEL_WEIGHT", str(DEFAULT_MODEL_WEIGHT))),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.20")),

@@ -399,7 +399,7 @@ def test_display_table_surfaces_wang_and_strategy_columns(db):
 
     table = dm.fetch_latest_history(db, limit=10)
 
-    for col in ("Strategy", "Raw Prob", "Wang λ", "Wang FV", "Wang Edge", "Kelly Frac", "Correlation"):
+    for col in ("Strategy", "Raw Prob", "Entry k", "Wang FV", "Wang Edge", "Kelly Frac", "Correlation"):
         assert col in table.columns
 
     row = table.iloc[0]

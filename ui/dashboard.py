@@ -196,7 +196,7 @@ def _render_hunter_history_table() -> None:
 
     keep_cols = [
         "Time", "Action", "Asset", "Side", "Strategy", "EV",
-        "Raw Prob", "Wang λ", "Wang Edge", "Market Name", "Reject Reason",
+        "Raw Prob", "Entry k", "Wang Edge", "Market Name", "Reject Reason",
     ]
     compact_df = history_df[[col for col in keep_cols if col in history_df.columns]].copy()
 

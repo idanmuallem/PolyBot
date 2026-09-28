@@ -28,6 +28,13 @@ N=13,274 Polymarket contracts) when volume and time-to-expiry are known:
 
 Falls back to oracle3's pooled prior (291K contracts, lambda = 0.183) when
 that metadata isn't available.
+
+NOTE: the above (PricingEngine, wang_transform) is the EXIT-side mechanism
+only (trading/risk_manager.py). Entry-side pricing (BaseBrain.evaluate())
+uses logit_shrink() below instead, a provably monotonic logit-space
+shrink - see that function's docstring for why the two sides no longer
+share the probit-shift design. See PHASE1_FINDINGS.md and PROGRESS.md for
+the calibration evidence (or lack thereof) behind entry_k's default.
 """
 import math
 
@@ -49,21 +56,50 @@ def _clamp_prob(p: float) -> float:
 def wang_transform(p_true: float, lam: float) -> float:
     """Flat-lambda Wang Transform: Phi(Phi^-1(p_true) + lam).
 
-    Used directly by BaseBrain.evaluate() (brains/base.py) for entry-side
-    pricing, where lam is a fixed risk-aversion constant (config.wang_lambda)
-    rather than PricingEngine's hierarchical, metadata-driven lambda below.
-    lam < 0 pulls p_true toward 0.5 (risk-averse); lam > 0 pushes it away;
-    lam == 0.0 is an exact passthrough.
+    HISTORICAL / EXIT-SIDE ONLY as of the entry-side redesign below. Kept
+    for PricingEngine's own documentation and tests, and as the reference
+    implementation of the bug that motivated logit_shrink(): a constant
+    probit-space shift is only "toward 0.5" on one side of a lambda-
+    dependent crossover point. For lam < 0, inputs with
+    p_true > Phi(-lam) actually get pushed AWAY from 0.5, not toward it -
+    see test_pricing_engine.py's characterization test. BaseBrain.evaluate()
+    no longer calls this for entry-side pricing (see logit_shrink() below).
 
-    The shift shrinks as p_true approaches 0 or 1 (see wang_fair_value's
-    delta_lambda) - by itself this transform cannot fully correct a raw
-    probability that's already saturated near an extreme. That's what
-    evaluate()'s market-blending step (after this one) is for.
+    lam < 0 pulls p_true toward 0.5 for most of [0, 1] (risk-averse); lam > 0
+    pushes it away for most of [0, 1]; lam == 0.0 is an exact passthrough.
+    Neither claim holds near the crossover point noted above.
     """
     if lam == 0.0:
         return float(p_true)
     p = _clamp_prob(p_true)
     return float(norm.cdf(norm.ppf(p) + lam))
+
+
+def logit_shrink(p_true: float, k: float) -> float:
+    """Proportional shrink toward 0.5 in log-odds (logit) space.
+
+        p' = sigmoid(logit(p_true) * k),  k in [0, 1]
+
+    Replaces the old probit-space Wang shift (wang_transform() above) for
+    entry-side pricing (BaseBrain.evaluate(), config.entry_k). Unlike that
+    transform, this one is monotonic toward 0.5 for EVERY p_true in (0, 1)
+    and every k in [0, 1], by construction - there is no crossover point
+    where it reverses direction. See test_pricing_engine.py's property test
+    for the proof-by-sweep.
+
+    k = 1.0 is an exact passthrough (p_true unchanged). k = 0.0 collapses
+    every input to exactly 0.5 (total distrust of the raw probability).
+    k in between shrinks proportionally: p_true = 0.3 with k = 0.5 lands
+    halfway (in logit space) between 0.3 and 0.5.
+    """
+    if k >= 1.0:
+        return float(p_true)
+    if k <= 0.0:
+        return 0.5
+    p = _clamp_prob(p_true)
+    logit_p = math.log(p / (1.0 - p))
+    shrunk_logit = logit_p * k
+    return float(1.0 / (1.0 + math.exp(-shrunk_logit)))
 
 
 class PricingEngine:

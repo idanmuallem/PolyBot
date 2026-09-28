@@ -8,10 +8,10 @@ from abc import ABC, abstractmethod
 import logging
 import re
 from datetime import datetime, timezone
-from brains.pricing_engine import wang_transform
+from brains.pricing_engine import logit_shrink
 from core.trading_config import (
     DEFAULT_MIN_EV,
-    DEFAULT_WANG_LAMBDA,
+    DEFAULT_ENTRY_K,
     DEFAULT_MODEL_WEIGHT,
 )
 from core.models import MarketData, TradeSignal
@@ -99,7 +99,7 @@ class BaseBrain(ABC):
         market: MarketData,
         live_truth: float,
         min_ev: float = DEFAULT_MIN_EV,
-        wang_lambda: float = DEFAULT_WANG_LAMBDA,
+        entry_k: float = DEFAULT_ENTRY_K,
         model_weight: float = DEFAULT_MODEL_WEIGHT,
     ) -> TradeSignal:
         """Compute fair value, EV, Kelly size, and tradability for *market*.
@@ -108,18 +108,21 @@ class BaseBrain(ABC):
         which calls this directly rather than re-deriving fair value itself).
         Two layers run in order, each correcting what the last couldn't:
 
-        1. Wang Transform — risk-adjusts the raw model probability. Shrinks
-           toward a no-op as pre_prob approaches 0 or 1, so on its own it
-           barely dents an already-overconfident (near-certain) model output.
-        2. Market blending — pulls the Wang-adjusted value toward the
-           market's own price by (1 - model_weight), which is what actually
-           reins in a saturated raw probability the Wang step alone can't.
+        1. Logit shrink — proportionally shrinks the raw model probability
+           toward 0.5 in log-odds space (brains/pricing_engine.logit_shrink),
+           strength controlled by entry_k in [0, 1]. Monotonic toward 0.5 for
+           every input by construction (replaces the old probit-space Wang
+           Transform, which was only "toward 0.5" for part of the input
+           range - see PHASE1_FINDINGS.md for the bug this fixed).
+        2. Market blending — pulls the shrunk value toward the market's own
+           price by (1 - model_weight), which is what actually reins in a
+           saturated raw probability the shrink step alone can't.
         """
         pre_prob = self.get_raw_probability(market, live_truth)
         market_price = float(market.initial_price) if market.initial_price > 0 else 0.5
 
-        # Step 1: Wang Transform.
-        wang_fair = wang_transform(pre_prob, wang_lambda)
+        # Step 1: logit shrink toward 0.5.
+        wang_fair = logit_shrink(pre_prob, entry_k)
 
         # Step 2: Market blending. model_weight is a caller-supplied knob
         # (ultimately from config/env - see MODEL_WEIGHT in core/trading_config.py),
@@ -158,7 +161,9 @@ class BaseBrain(ABC):
             is_tradable=is_tradable,
             pre_prob=pre_prob,
             wang_fair_value=wang_fair,
-            wang_lambda=wang_lambda,
+            wang_lambda=entry_k,  # field name kept for storage/dashboard continuity;
+            # holds entry_k (logit-shrink strength) as of this redesign, not a
+            # probit Wang lambda. See brains/pricing_engine.logit_shrink().
             wang_edge=post_prob - market_price,
             confidence=1.0,
             side=side,

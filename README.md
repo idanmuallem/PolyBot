@@ -222,16 +222,16 @@ A separate, model-free path runs alongside the hunters: **strategies** (`trading
 
 Each discovered market is passed to the matching `Brain`, which produces a **raw probability** the market resolves YES from the anchor value and a domain-specific statistical model:
 
-- **Crypto**: Black-Scholes for every TTE (a Heston/FFT model previously handled >90-day contracts but was dropped — its output wasn't actually a CDF probability, just a normalized option value; see `HybridCryptoBrain`'s docstring). Uses per-asset implied volatility (BTC 50%, ETH 70%, SOL 90%).
+- **Crypto**: routes per-market on resolution type (`classify_resolution_type` in `brains/crypto.py`, parsed from the market's own resolution-criteria text). Touch-resolving markets (any 1-minute candle crossing the strike before the deadline — currently 100% of live-traded crypto markets) use a first-passage/barrier probability formula; markets of unknown or expiry-only type fall back to the original Black-Scholes terminal-probability model (correct for that case). The touch-resolution router replaced a period where Black-Scholes terminal probability was used for all TTEs, which caused severe underconfidence specifically in the 10-50% predicted range the live strategy trades — see `PHASE1_FINDINGS.md`. Uses per-asset implied volatility (BTC 50%, ETH 70%, SOL 90%).
 - **Weather**: Normal distribution around the forecast with a configurable standard deviation.
 - **Economy**: Normal distribution around the current macro reading with historical volatility.
 
 These raw models are often overconfident — near-certain probabilities on deep in-the-money markets that don't survive contact with the live market price. `BaseBrain.evaluate()` (`brains/base.py`) runs every raw probability through two calibration layers, in order, before computing EV:
 
-1. **Wang Transform** (`WANG_LAMBDA`, default `-0.75`) — a probit-space risk distortion, `Φ(Φ⁻¹(p) + λ)`, that pulls extreme probabilities back toward uncertainty. The shift shrinks as `p` approaches 0 or 1, so a genuinely near-certain outcome is barely touched while a shaky "0.95" gets meaningfully discounted.
-2. **Market blending** (`MODEL_WEIGHT`, default `0.40`) — blends the Wang-adjusted probability with the market's own price (`model_weight * wang_fair + (1 - model_weight) * market_price`), treating the market price as a second opinion the model doesn't get to override on its own.
+1. **Logit shrink** (`ENTRY_K`, default `0.5`) — a proportional shrink toward 0.5 in log-odds space, `p' = sigmoid(logit(p) * k)`, monotonic toward 0.5 for every input by construction. `k=1.0` is a passthrough (no shrink); `k=0.0` collapses everything to 0.5 (total distrust). Replaced the old probit-space Wang Transform (`Φ(Φ⁻¹(p) + λ)`, λ=-0.75), which was only "toward 0.5" on one side of a lambda-dependent crossover point — for this system's actual output range it pushed probabilities *away* from 0.5, the opposite of its own stated intent. See `PHASE1_FINDINGS.md` for the calibration evidence behind the 0.5 default (a documented neutral placeholder, not a fitted value — no significant relationship was found between brain-market divergence and correctness in the available backtest data).
+2. **Market blending** (`MODEL_WEIGHT`, default `0.40`) — blends the shrunk probability with the market's own price (`model_weight * wang_fair + (1 - model_weight) * market_price`), treating the market price as a second opinion the model doesn't get to override on its own.
 
-Setting `WANG_LAMBDA=0.0` and `MODEL_WEIGHT=1.0` is the escape hatch — it disables both layers and reproduces the brain's raw, uncalibrated probability exactly (`PRICING_MODE=legacy` does the same at the pipeline level, for A/B comparison).
+Setting `ENTRY_K=1.0` and `MODEL_WEIGHT=1.0` is the escape hatch — it disables both layers and reproduces the brain's raw, uncalibrated probability exactly (`PRICING_MODE=legacy` does the same at the pipeline level, for A/B comparison). Note `ENTRY_K=1.0` is the passthrough value, not `0.0` — the opposite convention from the old `WANG_LAMBDA=0.0`.
 
 This entry-side calibration is distinct from `PricingEngine`'s hierarchical Wang Transform (`WANG_BASE_LAMBDA`), which is used only on the **exit** side — see `trading/risk_manager.py`'s Wang-edge-decay check in Position Management below.
 
@@ -349,11 +349,11 @@ MIN_TTE_MINUTES=60
 MAX_TTE_DAYS=180
 
 # Entry-side calibration (see BaseBrain.evaluate() in brains/base.py):
-# Wang Transform -> market blending, applied to every brain's raw
+# logit shrink -> market blending, applied to every brain's raw
 # probability before EV is computed.
 PRICING_MODE=wang            # "wang" or "legacy" (legacy = brain's raw probability, no calibration)
-WANG_LAMBDA=-0.75            # risk-averse distortion; 0.0 disables the Wang step
-MODEL_WEIGHT=0.40            # weight on the Wang-adjusted model vs. (1 - this) on market price
+ENTRY_K=0.5                  # shrink strength [0,1]; 1.0 = no shrink, 0.0 = always 0.5 (neutral placeholder, not fitted - see PHASE1_FINDINGS.md)
+MODEL_WEIGHT=0.40            # weight on the shrunk model vs. (1 - this) on market price
 
 # Exit-side pricing (see PricingEngine in brains/pricing_engine.py, used only
 # by trading/risk_manager.py's Wang-edge-decay check on open positions)
@@ -480,8 +480,8 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `TRADES_DB_PATH` | `/app/trades.db` | SQLite database path (single-wallet mode). Also derives the paper trading data directory as `<parent of this path>/paper_trading` (e.g. `/app/paper_trading`) — must line up with whatever host directory is volume-mounted to that container path, or paper positions/balance/token map won't survive a redeploy |
 | `WALLET_CONFIG_PATH` | — | Path to a wallet `config.json`; if set, overrides `.env`-based config for that wallet |
 | `PRICING_MODE` | `wang` | `wang` (calibrated fair value) or `legacy` (brain's raw probability, no calibration) |
-| `WANG_LAMBDA` | `-0.75` | Entry-side Wang Transform distortion (`BaseBrain.evaluate()`); negative = risk-averse, `0.0` disables it |
-| `MODEL_WEIGHT` | `0.40` | Entry-side blend weight on the Wang-adjusted model vs. `(1 - this)` on market price; `1.0` disables blending |
+| `ENTRY_K` | `0.5` | Entry-side logit-shrink strength (`BaseBrain.evaluate()`), `[0,1]`; `1.0` = no shrink (passthrough), `0.0` = always 0.5. Neutral placeholder, not a fitted value — see `PHASE1_FINDINGS.md` |
+| `MODEL_WEIGHT` | `0.40` | Entry-side blend weight on the shrunk model vs. `(1 - this)` on market price; `1.0` disables blending |
 | `WANG_BASE_LAMBDA` | `0.183` | Exit-side hierarchical Wang Transform base risk-premium (`PricingEngine`, position-decay check only) |
 | `WANG_MIN_EDGE` | `0.05` | Minimum \|Wang edge\| (probability points) for the exit-side decay check |
 | `KELLY_FRACTION` | `0.25` | Fraction of full Kelly used for position sizing |

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from freezegun import freeze_time
 
-from brains.pricing_engine import wang_transform
+from brains.pricing_engine import logit_shrink
 from core.bridge import DataBridge
 from core.models import MarketData, Position
 from core.trading_config import TradingConfig
@@ -383,7 +383,7 @@ def test_wang_mode_populates_pricing_fields():
     # post_prob is Wang-adjusted then market-blended, not the raw probability.
     assert candidate.post_prob != pytest.approx(0.70)
 
-    expected_wang_fair = wang_transform(0.70, pipeline.config.wang_lambda)
+    expected_wang_fair = logit_shrink(0.70, pipeline.config.entry_k)
     assert candidate.wang_fair_value == pytest.approx(expected_wang_fair)
     # post_prob (post market-blend) is distinct from wang_fair_value
     # (Wang-only, pre-blend) now that blending sits between the two.
@@ -405,7 +405,7 @@ def test_wang_mode_skips_market_below_min_edge():
     # Market price set exactly to the Wang-only fair value: blending a value
     # with itself is a no-op, so the final post_prob == market_price and
     # wang_edge == 0.0 exactly.
-    wang_fair = wang_transform(0.70, pipeline.config.wang_lambda)
+    wang_fair = logit_shrink(0.70, pipeline.config.entry_k)
     market = _market(price=wang_fair, expiry_days=10)
     mock_hunter = MagicMock()
     mock_hunter.get_live_truth.return_value = 97_000.0
