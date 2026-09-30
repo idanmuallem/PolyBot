@@ -44,12 +44,24 @@ obsolete and their tests should go with them, or they were meant to be wired
 in and aren't. I did not touch them. Triage each:
 
 - **`trading/budget_manager.py::check_and_cap_bet` (6 tests, 0 callers)** —
-  the most important one. It's a budget-cap safety method: caps a bet to the
-  remaining strategy budget. The pipeline currently sizes bets via
-  `compute_kelly_bet_size` instead. A tested budget cap that's never called is
-  either dead (superseded by Kelly + `max_bet_size_usd` clamp) or a safety net
-  that should be wired in. **Worth a deliberate decision before dry-run
-  conclusions, given it's about not over-betting a budget.**
+  CORRECTION to an earlier characterization: the budget safety cap IS wired
+  in, under a different method. The live crypto path is
+  `compute_kelly_bet_size()` -> `cap_to_remaining_budget()`
+  (decision_pipeline.py:953 and :1039), so "don't bet past the remaining
+  daily budget" is active. `check_and_cap_bet` is therefore a genuinely
+  SUPERSEDED, cruder method: it sizes as `fraction * bankroll` and caps to
+  remaining budget, but skips confidence scaling, the quarter-Kelly
+  (`config.kelly_fraction`) multiplier, AND the `max_bet_size_usd` clamp.
+  Not obsolete-to-delete, though: it is almost exactly a FLAT-STAKE sizer
+  (fixed % of bankroll per signal, budget-capped), which is a legitimate
+  non-Kelly sizing discipline and is thematically aligned with the Wang
+  redesign (if the edge estimate isn't trustworthy enough to shrink at
+  pricing time, it may not be trustworthy enough to drive bet size either).
+  If wired in — e.g. as a `SIZING_MODE=kelly|flat` A/B switch mirroring
+  `PRICING_MODE` — it MUST also clamp to `max_bet_size_usd`, which it
+  currently omits; otherwise `bankroll * fraction` can exceed the per-bet
+  ceiling, bounded only by the daily budget. See PRE_ACTIVATION_CHECKLIST.md
+  item E.
 - `trading/paper_adapter.py::get_total_value` (2 tests, 0 callers)
 - `hunters/clients/ccxt_client.py::clear_cache` (3 tests, 0 callers)
 - `ui/components.py::render_correlation_matrix` (4 tests, 0 callers) — a
