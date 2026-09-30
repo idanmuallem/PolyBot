@@ -130,7 +130,7 @@ jobs:
             "chmod 666 /home/ec2-user/trades.db",
             "mkdir -p /home/ec2-user/paper_trading",
             "chmod 777 /home/ec2-user/paper_trading",
-            "docker run -d --name polybot --restart always -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db -v /home/ec2-user/paper_trading:/app/paper_trading --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+            "docker run -d --name polybot --restart always --log-opt max-size=20m --log-opt max-file=3 -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db -v /home/ec2-user/paper_trading:/app/paper_trading --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
           ]' \
           --query 'Command.CommandId' --output text)
         echo "SSM command ID: $COMMAND_ID"
