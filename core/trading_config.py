@@ -137,6 +137,24 @@ class TradingConfig:
                 f"TRADING_MODE must be 'dry_run' or 'live_run', got '{self.trading_mode}'"
             )
 
+        # entry_k is a shrink strength that must live in [0, 1] (see
+        # brains/pricing_engine.logit_shrink). A value outside that range is
+        # almost always a mistake - most dangerously a leftover WANG_LAMBDA
+        # value (e.g. -0.75) mis-mapped onto entry_k, which logit_shrink would
+        # silently treat as k<=0, i.e. TOTAL distrust (every probability -> 0.5)
+        # rather than the intended behavior. Clamp loudly instead of failing
+        # closed, so a bad env var never silently neuters the model.
+        if not (0.0 <= self.entry_k <= 1.0):
+            clamped = max(0.0, min(1.0, self.entry_k))
+            logging.warning(
+                "entry_k=%.4f is outside [0.0, 1.0]; clamping to %.4f. If this "
+                "came from a leftover WANG_LAMBDA value, note the semantics "
+                "changed: ENTRY_K is a shrink strength in [0,1] (1.0 = no "
+                "shrink), not a probit lambda. See brains/pricing_engine.py.",
+                self.entry_k, clamped,
+            )
+            self.entry_k = clamped
+
     @property
     def is_dry_run(self) -> bool:
         return self.trading_mode == "dry_run"
@@ -173,6 +191,22 @@ class TradingConfig:
         # side effect, so it only fires when a caller actually asks for the
         # process-env config — not on import of this module.
         load_dotenv("config/.env")
+
+        # Deprecation guard: WANG_LAMBDA was the old entry-side env var. It is
+        # no longer read (replaced by ENTRY_K, with different semantics - see
+        # brains/pricing_engine.py). A deployment whose .env still sets it
+        # would otherwise get no signal that the line is dead. Warn loudly so
+        # the operator renames it; we deliberately do NOT translate the old
+        # value, because a probit lambda and a [0,1] shrink strength are not
+        # interchangeable.
+        if os.getenv("WANG_LAMBDA") is not None and os.getenv("ENTRY_K") is None:
+            logging.warning(
+                "WANG_LAMBDA is set in the environment but is no longer used; "
+                "it has been replaced by ENTRY_K (a shrink strength in [0,1], "
+                "not a probit lambda). Falling back to ENTRY_K default (%.2f). "
+                "Rename WANG_LAMBDA -> ENTRY_K in your .env to silence this.",
+                DEFAULT_ENTRY_K,
+            )
 
         cfg = cls(
             min_ev=float(os.getenv("MIN_EV", "0.50")),
