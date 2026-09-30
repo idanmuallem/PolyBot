@@ -31,15 +31,20 @@ that metadata isn't available.
 
 NOTE: `PricingEngine` is the EXIT-side mechanism (trading/risk_manager.py);
 it inlines its own probit shift in `wang_fair_value()` and does not call the
-standalone `wang_transform()` below. `wang_transform()` itself is no longer
-called by any production path as of the entry-side redesign - it is retained
-only as the reference implementation of the old entry-side transform, used by
-the characterization tests (test_pricing_engine.py, test_brains_base.py) and
-scripts/phase3_validation.py to document the crossover bug it exhibited.
-Entry-side pricing (BaseBrain.evaluate()) uses logit_shrink() below instead,
-a provably monotonic logit-space shrink. See PHASE1_FINDINGS.md and
-PROGRESS.md for the calibration evidence (or lack thereof) behind entry_k's
-default.
+standalone `wang_transform()` below.
+
+Entry-side pricing history (BaseBrain.evaluate()):
+  1. originally wang_transform() (probit shift toward 0.5) - had a crossover
+     bug that pushed the real output range AWAY from 0.5;
+  2. then logit_shrink() (proportional shrink toward 0.5) - fixed the
+     monotonicity bug but still manufactured a spurious YES edge on cheap
+     markets even when the brain agreed with the market (A1_TRADE_RATE_FINDINGS.md);
+  3. now market_anchored_shrink() - interpolates between market and brain in
+     logit space, so agreement yields zero edge and entry_k is a true
+     "trust the brain vs defer to market" dial.
+wang_transform() and logit_shrink() are retained only as reference/test
+implementations documenting (1) and (2); no production path calls them.
+See PHASE1_FINDINGS.md, A1_TRADE_RATE_FINDINGS.md and PROGRESS.md.
 """
 import math
 
@@ -106,6 +111,47 @@ def logit_shrink(p_true: float, k: float) -> float:
     logit_p = math.log(p / (1.0 - p))
     shrunk_logit = logit_p * k
     return float(1.0 / (1.0 + math.exp(-shrunk_logit)))
+
+
+def market_anchored_shrink(p_true: float, market_price: float, k: float) -> float:
+    """Trust-weighted interpolation between the market price and the brain's
+    raw probability, in log-odds (logit) space:
+
+        post = sigmoid( logit(market) + k * (logit(p_true) - logit(market)) )
+
+    This is the entry-side mechanism as of the market-anchored redesign
+    (BaseBrain.evaluate(), config.entry_k). It replaces BOTH the old
+    shrink-toward-0.5 step (logit_shrink) AND the separate model_weight
+    market blend - the interpolation IS the blend, with correct semantics:
+
+        k = 0.0  -> post = market_price   (defer fully to the market; the
+                                           brain is ignored)
+        k = 1.0  -> post = p_true         (trust the brain fully)
+        k in between -> trust that fraction of the brain's divergence from
+                        the market, in logit space.
+
+    Key property that fixes the shrink-toward-0.5 bug: when the brain AGREES
+    with the market (p_true == market_price), post == market_price for every
+    k, so no edge is manufactured. logit_shrink pulled toward 0.5 instead,
+    which on a cheap market lifted the blended value above the price and
+    manufactured a spurious YES edge even on agreement (see
+    A1_TRADE_RATE_FINDINGS.md). This function is monotonic in p_true and
+    always lands between market_price and p_true - see
+    test_pricing_engine.py's property sweep.
+
+    k is clamped to [0, 1] defensively (config validates it too).
+    """
+    k = max(0.0, min(1.0, float(k)))
+    if k <= 0.0:
+        return _clamp_prob(market_price)
+    if k >= 1.0:
+        return _clamp_prob(p_true)
+    p = _clamp_prob(p_true)
+    m = _clamp_prob(market_price)
+    logit_p = math.log(p / (1.0 - p))
+    logit_m = math.log(m / (1.0 - m))
+    blended_logit = logit_m + k * (logit_p - logit_m)
+    return float(1.0 / (1.0 + math.exp(-blended_logit)))
 
 
 class PricingEngine:

@@ -16,27 +16,33 @@ DEFAULT_DAILY_LIMIT_USD = 15.0
 # trading/risk_manager.py - changing that one would silently alter open-
 # position exit behavior, so entry calibration gets its own constant.
 #
-# entry_k replaces the old DEFAULT_WANG_LAMBDA (-0.75, a probit-space shift
-# with no documented justification, and a math bug: it pushed this system's
-# actual output range, 0.25-0.45, AWAY from 0.5 rather than toward it - see
-# PHASE1_FINDINGS.md). entry_k feeds brains/pricing_engine.logit_shrink(),
-# a proportional shrink toward 0.5 in logit space: p' = sigmoid(logit(p)*k),
-# monotonic toward 0.5 for every p and every k in [0, 1] by construction.
+# entry_k is the entry-side TRUST DIAL for brains/pricing_engine.
+# market_anchored_shrink(): post = sigmoid(logit(market) + k*(logit(brain) -
+# logit(market))), k in [0, 1]. k=0 defers fully to the market (brain
+# ignored); k=1 trusts the brain fully; in between trusts that fraction of
+# the brain's divergence from the market, in logit space. When brain ==
+# market, post == market for every k (no manufactured edge).
 #
-# Default value (0.5) is a documented NEUTRAL PLACEHOLDER, not a fitted
-# calibration. A dedicated backtest (56 resolved markets, 164 snapshots;
-# see PHASE1_FINDINGS.md) found no significant relationship between how
-# much the brain's raw probability diverges from the market and which one
-# ends up closer to the real outcome (r=-0.103, p=0.189) - so there is no
-# evidence basis for picking a stronger or weaker k. At the same time, the
-# fixed brain's aggregate calibration (Brier ~0.047) is on par with or
-# better than the market's own (~0.057), which argues against defaulting
-# to near-total distrust (k close to 0) either. k=0.5 treats the brain's
-# raw signal and 0.5 symmetrically in log-odds space pending more resolved
-# dry-run trades to calibrate this properly with less confounded data than
-# the historical backtest's 94%-NO-outcome sample.
-DEFAULT_ENTRY_K = 0.5                # shrink strength in [0, 1]; 1.0 = no shrink, 0.0 = always 0.5
-DEFAULT_MODEL_WEIGHT = 0.40          # weight on the Wang-adjusted model vs. (1 - this) on market price
+# This is the third entry-side design. It replaced (1) the old WANG_LAMBDA
+# probit shift (crossover bug) and (2) a shrink-toward-0.5 step + separate
+# model_weight blend, which manufactured a spurious YES edge on cheap markets
+# even on brain/market agreement (see A1_TRADE_RATE_FINDINGS.md). entry_k
+# now subsumes the old model_weight.
+#
+# Default (0.4) is a CONSERVATIVE, MARKET-LEANING starting value, not a fitted
+# calibration. Two independent analyses (PHASE1_FINDINGS.md: r=-0.103,
+# p=0.189; A1_TRADE_RATE_FINDINGS.md) found the brain's divergence from the
+# market carries no usable signal yet in the traded range - the market is at
+# least as well calibrated as the brain - so the model should only lightly
+# influence price (defer mostly to market) until forward dry-run data, via
+# scripts/forward_calibration.py, shows divergence predicts outcomes. Raise
+# entry_k toward 1.0 only when that evidence appears.
+DEFAULT_ENTRY_K = 0.4                # trust dial [0,1]; 0 = market only, 1 = brain only
+# DEPRECATED: model_weight is subsumed by entry_k (the market-anchored
+# interpolation is itself the market blend). Retained only so a deployed .env
+# setting MODEL_WEIGHT doesn't error; it no longer affects pricing. from_env()
+# warns if it is set. Remove after the next deploy renames the .env.
+DEFAULT_MODEL_WEIGHT = 0.40          # deprecated, unused by the entry path
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -122,10 +128,12 @@ class TradingConfig:
     wang_base_lambda: float = 0.183  # exit-side only - see trading/risk_manager.py
     wang_min_edge: float = 0.05  # minimum |wang_edge| (probability points) to consider a trade
 
-    # Entry-side pricing knobs consumed by BaseBrain.evaluate() (see
-    # DEFAULT_ENTRY_K / DEFAULT_MODEL_WEIGHT above for what each does).
+    # Entry-side trust dial consumed by BaseBrain.evaluate() (see
+    # DEFAULT_ENTRY_K above). model_weight is DEPRECATED (subsumed by entry_k)
+    # and kept only for .env backward compatibility; it no longer affects
+    # pricing.
     entry_k: float = DEFAULT_ENTRY_K
-    model_weight: float = DEFAULT_MODEL_WEIGHT
+    model_weight: float = DEFAULT_MODEL_WEIGHT  # deprecated, unused
 
     # Risk management (see trading/budget_manager.py, trading/risk_manager.py).
     kelly_fraction: float = 0.25  # quarter-Kelly — full Kelly is optimal in expectation but has extreme variance
@@ -202,10 +210,22 @@ class TradingConfig:
         if os.getenv("WANG_LAMBDA") is not None and os.getenv("ENTRY_K") is None:
             logging.warning(
                 "WANG_LAMBDA is set in the environment but is no longer used; "
-                "it has been replaced by ENTRY_K (a shrink strength in [0,1], "
-                "not a probit lambda). Falling back to ENTRY_K default (%.2f). "
-                "Rename WANG_LAMBDA -> ENTRY_K in your .env to silence this.",
+                "it has been replaced by ENTRY_K (a trust dial in [0,1], 0 = "
+                "market only, 1 = brain only, not a probit lambda). Falling "
+                "back to ENTRY_K default (%.2f). Rename WANG_LAMBDA -> ENTRY_K "
+                "in your .env to silence this.",
                 DEFAULT_ENTRY_K,
+            )
+
+        # MODEL_WEIGHT is deprecated: entry_k subsumes it under the
+        # market-anchored design (see brains/pricing_engine.py). Warn if a
+        # deployment still sets it, since it now has no effect on pricing.
+        if os.getenv("MODEL_WEIGHT") is not None:
+            logging.warning(
+                "MODEL_WEIGHT is set in the environment but is no longer used; "
+                "the entry-side market blend is now subsumed by ENTRY_K (the "
+                "market-anchored trust dial). This setting has no effect on "
+                "pricing; remove it from your .env."
             )
 
         cfg = cls(

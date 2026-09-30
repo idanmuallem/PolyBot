@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from freezegun import freeze_time
 
-from brains.pricing_engine import logit_shrink
+from brains.pricing_engine import market_anchored_shrink
 from core.bridge import DataBridge
 from core.models import MarketData, Position
 from core.trading_config import TradingConfig
@@ -380,18 +380,16 @@ def test_wang_mode_populates_pricing_fields():
     assert candidate is not None
     assert candidate.pricing_mode == "wang"
     assert candidate.pre_prob == pytest.approx(0.70)
-    # post_prob is Wang-adjusted then market-blended, not the raw probability.
+    # post_prob is the market-anchored interpolation between market and brain,
+    # not the raw probability (brain 0.70 diverges from market 0.30).
     assert candidate.post_prob != pytest.approx(0.70)
 
-    expected_wang_fair = logit_shrink(0.70, pipeline.config.entry_k)
-    assert candidate.wang_fair_value == pytest.approx(expected_wang_fair)
-    # post_prob (post market-blend) is distinct from wang_fair_value
-    # (Wang-only, pre-blend) now that blending sits between the two.
-    expected_blended = (
-        pipeline.config.model_weight * expected_wang_fair
-        + (1.0 - pipeline.config.model_weight) * 0.30
-    )
-    assert candidate.post_prob == pytest.approx(expected_blended)
+    expected_post = market_anchored_shrink(0.70, 0.30, pipeline.config.entry_k)
+    assert candidate.post_prob == pytest.approx(expected_post)
+    # wang_fair_value now equals post_prob (no separate pre-blend value).
+    assert candidate.wang_fair_value == pytest.approx(candidate.post_prob)
+    # post sits strictly between market (0.30) and brain (0.70).
+    assert 0.30 < candidate.post_prob < 0.70
 
     assert candidate.wang_lambda is not None
     assert candidate.wang_edge == pytest.approx(candidate.post_prob - 0.30)
@@ -402,11 +400,10 @@ def test_wang_mode_populates_pricing_fields():
 @freeze_time("2026-06-02T00:00:00+00:00")
 def test_wang_mode_skips_market_below_min_edge():
     pipeline, bridge, log_calls = _wang_pipeline(wang_min_edge=0.05)
-    # Market price set exactly to the Wang-only fair value: blending a value
-    # with itself is a no-op, so the final post_prob == market_price and
-    # wang_edge == 0.0 exactly.
-    wang_fair = logit_shrink(0.70, pipeline.config.entry_k)
-    market = _market(price=wang_fair, expiry_days=10)
+    # Market price set equal to the brain's raw probability: under the
+    # market-anchored design brain == market -> post_prob == market, so
+    # wang_edge == 0.0 exactly and the trade is skipped below min_edge.
+    market = _market(price=0.70, expiry_days=10)
     mock_hunter = MagicMock()
     mock_hunter.get_live_truth.return_value = 97_000.0
 

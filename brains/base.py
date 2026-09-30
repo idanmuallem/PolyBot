@@ -5,14 +5,12 @@ implement _calculate_probability() with domain-specific models.
 """
 
 from abc import ABC, abstractmethod
-import logging
 import re
 from datetime import datetime, timezone
-from brains.pricing_engine import logit_shrink
+from brains.pricing_engine import market_anchored_shrink
 from core.trading_config import (
     DEFAULT_MIN_EV,
     DEFAULT_ENTRY_K,
-    DEFAULT_MODEL_WEIGHT,
 )
 from core.models import MarketData, TradeSignal
 
@@ -100,41 +98,30 @@ class BaseBrain(ABC):
         live_truth: float,
         min_ev: float = DEFAULT_MIN_EV,
         entry_k: float = DEFAULT_ENTRY_K,
-        model_weight: float = DEFAULT_MODEL_WEIGHT,
     ) -> TradeSignal:
         """Compute fair value, EV, Kelly size, and tradability for *market*.
 
         Single source of truth for pricing (see trading/decision_pipeline.py,
         which calls this directly rather than re-deriving fair value itself).
-        Two layers run in order, each correcting what the last couldn't:
 
-        1. Logit shrink — proportionally shrinks the raw model probability
-           toward 0.5 in log-odds space (brains/pricing_engine.logit_shrink),
-           strength controlled by entry_k in [0, 1]. Monotonic toward 0.5 for
-           every input by construction (replaces the old probit-space Wang
-           Transform, which was only "toward 0.5" for part of the input
-           range - see PHASE1_FINDINGS.md for the bug this fixed).
-        2. Market blending — pulls the shrunk value toward the market's own
-           price by (1 - model_weight), which is what actually reins in a
-           saturated raw probability the shrink step alone can't.
+        Pricing is a single step: market_anchored_shrink interpolates between
+        the market price and the brain's raw probability in log-odds space,
+        with entry_k in [0, 1] as the trust dial (0 = defer fully to market,
+        1 = trust the brain fully). This replaced a two-step design (shrink
+        toward 0.5, then a separate model_weight market blend) that
+        manufactured a spurious YES edge on cheap markets even when the brain
+        agreed with the market - see A1_TRADE_RATE_FINDINGS.md. With the
+        market-anchored form, brain == market yields post == market (zero
+        edge), so the model only moves price when it genuinely diverges.
+        model_weight is subsumed by entry_k and is no longer a parameter.
         """
         pre_prob = self.get_raw_probability(market, live_truth)
         market_price = float(market.initial_price) if market.initial_price > 0 else 0.5
 
-        # Step 1: logit shrink toward 0.5.
-        wang_fair = logit_shrink(pre_prob, entry_k)
-
-        # Step 2: Market blending. model_weight is a caller-supplied knob
-        # (ultimately from config/env - see MODEL_WEIGHT in core/trading_config.py),
-        # so clamp defensively rather than let a bad value silently invert the
-        # blend or amplify past [0, 1].
-        if not (0.0 <= model_weight <= 1.0):
-            logging.warning(
-                "model_weight=%.4f out of [0.0, 1.0] range; clamping.", model_weight
-            )
-            model_weight = max(0.0, min(1.0, model_weight))
-        blended_fair = model_weight * wang_fair + (1.0 - model_weight) * market_price
-        post_prob = max(0.0, min(1.0, blended_fair))
+        # Single step: trust-weighted interpolation between market and brain,
+        # in logit space. entry_k is validated to [0, 1] by TradingConfig, and
+        # market_anchored_shrink clamps defensively regardless.
+        post_prob = market_anchored_shrink(pre_prob, market_price, entry_k)
 
         price_yes = market_price
         price_no = max(1e-9, 1.0 - price_yes)
@@ -160,10 +147,12 @@ class BaseBrain(ABC):
             kelly_size=kelly_size,
             is_tradable=is_tradable,
             pre_prob=pre_prob,
-            wang_fair_value=wang_fair,
+            wang_fair_value=post_prob,  # no separate pre-blend value now: the
+            # market-anchored interpolation IS the fair value. Field name kept
+            # for storage/dashboard continuity; equals post_prob.
             wang_lambda=entry_k,  # field name kept for storage/dashboard continuity;
-            # holds entry_k (logit-shrink strength) as of this redesign, not a
-            # probit Wang lambda. See brains/pricing_engine.logit_shrink().
+            # holds entry_k (trust dial, [0,1]) as of the market-anchored
+            # redesign, not a probit Wang lambda. See brains/pricing_engine.py.
             wang_edge=post_prob - market_price,
             confidence=1.0,
             side=side,

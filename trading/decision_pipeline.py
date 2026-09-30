@@ -880,25 +880,21 @@ class SequentialTradingPipeline:
         )
         brain = get_brain_for_asset_type(asset_type)
 
-        # Pricing (logit shrink -> market blend) is all computed inside
-        # evaluate() — see brains/base.py. "legacy" mode asks for both layers
-        # disabled (entry_k=1.0, i.e. no shrink; full model weight) so it
-        # reduces to the brain's raw probability, for A/B comparison against
-        # "wang" mode. NOTE: entry_k=1.0 is the passthrough value, NOT 0.0 —
-        # logit_shrink(p, 0.0) collapses everything to 0.5, the opposite of
-        # disabling the shrink. This is a deliberate flip from the old
-        # wang_transform(), where lambda=0.0 was the passthrough; the two
-        # functions use opposite conventions for their "off" value.
+        # Pricing (market-anchored interpolation between market and brain) is
+        # computed inside evaluate() — see brains/base.py. "legacy" mode uses
+        # entry_k=1.0, which under the market-anchored design means "trust the
+        # brain fully" (post_prob == raw brain probability, market ignored) —
+        # exactly the raw-probability A/B baseline. entry_k=0.0 would be the
+        # opposite (defer fully to market).
         if self.pricing_mode == "legacy":
             signal = brain.evaluate(
                 market, live_truth, min_ev=self.min_ev_threshold,
-                entry_k=1.0, model_weight=1.0,
+                entry_k=1.0,
             )
         else:
             signal = brain.evaluate(
                 market, live_truth, min_ev=self.min_ev_threshold,
                 entry_k=self.config.entry_k,
-                model_weight=self.config.model_weight,
             )
 
         # Read AFTER evaluate() — get_brain_for_asset_type() constructs a

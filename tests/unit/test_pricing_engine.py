@@ -4,7 +4,13 @@ import numpy as np
 import pytest
 from scipy.stats import norm
 
-from brains.pricing_engine import PricingEngine, _clamp_prob, logit_shrink, wang_transform
+from brains.pricing_engine import (
+    PricingEngine,
+    _clamp_prob,
+    logit_shrink,
+    market_anchored_shrink,
+    wang_transform,
+)
 
 
 # ── wang_fair_value: known values ───────────────────────────────────────────
@@ -324,3 +330,62 @@ def test_logit_shrink_never_reproduces_crossover_bug():
         for k in (0.1, 0.3, 0.5, 0.7, 0.9):
             shrunk = logit_shrink(p, k)
             assert shrunk >= p, f"p={p} k={k}: expected shrunk >= p (toward 0.5), got {shrunk}"
+
+
+# ── market_anchored_shrink: the current entry-side mechanism ────────────────
+#
+# post = sigmoid(logit(market) + k*(logit(brain) - logit(market))). Properties
+# that MUST hold for every brain, market in (0,1) and k in [0,1]:
+#   - k=0 -> market; k=1 -> brain
+#   - brain == market -> market (no manufactured edge; the A1 bug fix)
+#   - post always lands between market and brain (inclusive)
+#   - monotonic non-decreasing in brain for fixed market, k
+
+_MP_GRID = np.linspace(0.02, 0.98, 25)
+_BRAIN_GRID = np.concatenate([[1e-4], np.linspace(0.02, 0.98, 25), [1 - 1e-4]])
+_K_GRID2 = np.linspace(0.0, 1.0, 11)
+
+
+def test_market_anchored_k0_is_market_k1_is_brain():
+    for m in _MP_GRID:
+        for b in _BRAIN_GRID:
+            assert market_anchored_shrink(float(b), float(m), 0.0) == pytest.approx(float(m), abs=1e-9)
+            assert market_anchored_shrink(float(b), float(m), 1.0) == pytest.approx(float(b), abs=1e-9)
+
+
+def test_market_anchored_agreement_is_fixed_point():
+    # brain == market -> post == market, for every k. This is the property the
+    # old shrink-toward-0.5 design violated (it manufactured edge on agreement).
+    for m in _MP_GRID:
+        for k in _K_GRID2:
+            assert market_anchored_shrink(float(m), float(m), float(k)) == pytest.approx(float(m), abs=1e-9)
+
+
+def test_market_anchored_lands_between_market_and_brain():
+    for m in _MP_GRID:
+        for b in _BRAIN_GRID:
+            for k in _K_GRID2:
+                post = market_anchored_shrink(float(b), float(m), float(k))
+                lo, hi = sorted((float(m), float(b)))
+                assert lo - 1e-9 <= post <= hi + 1e-9, f"m={m} b={b} k={k}: {post}"
+
+
+def test_market_anchored_monotonic_in_brain():
+    for m in (0.10, 0.30, 0.50, 0.80):
+        for k in (0.2, 0.5, 0.9):
+            outs = [market_anchored_shrink(float(b), m, k) for b in _BRAIN_GRID]
+            assert all(a <= b + 1e-9 for a, b in zip(outs, outs[1:])), f"m={m} k={k}"
+
+
+def test_market_anchored_k_clamped():
+    # k outside [0,1] is clamped, not extrapolated.
+    assert market_anchored_shrink(0.8, 0.3, 5.0) == pytest.approx(market_anchored_shrink(0.8, 0.3, 1.0))
+    assert market_anchored_shrink(0.8, 0.3, -2.0) == pytest.approx(market_anchored_shrink(0.8, 0.3, 0.0))
+
+
+def test_market_anchored_no_cheap_market_manufactured_edge():
+    # The A1 regression, at the function level: on a cheap market, agreement
+    # yields exactly the market price (zero edge), where logit_shrink+blend
+    # previously produced a value well above it.
+    assert market_anchored_shrink(0.10, 0.10, 0.5) == pytest.approx(0.10, abs=1e-9)
+    assert market_anchored_shrink(0.05, 0.05, 0.5) == pytest.approx(0.05, abs=1e-9)

@@ -62,3 +62,21 @@ def test_from_env_no_wang_lambda_no_warning(monkeypatch, caplog):
         cfg = TradingConfig.from_env()
     assert cfg.entry_k == DEFAULT_ENTRY_K
     assert "WANG_LAMBDA" not in caplog.text
+
+
+# ── deprecated MODEL_WEIGHT env-var guard (from_env) ────────────────────────
+
+def test_from_env_warns_on_leftover_model_weight(monkeypatch, caplog):
+    # model_weight is subsumed by entry_k under the market-anchored design;
+    # a leftover MODEL_WEIGHT in the .env now has no effect and should warn.
+    monkeypatch.setenv("MODEL_WEIGHT", "0.40")
+    with caplog.at_level(logging.WARNING):
+        TradingConfig.from_env()
+    assert "MODEL_WEIGHT" in caplog.text
+
+
+def test_from_env_no_model_weight_no_warning(monkeypatch, caplog):
+    monkeypatch.delenv("MODEL_WEIGHT", raising=False)
+    with caplog.at_level(logging.WARNING):
+        TradingConfig.from_env()
+    assert "MODEL_WEIGHT" not in caplog.text

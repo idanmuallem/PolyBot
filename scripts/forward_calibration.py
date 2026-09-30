@@ -139,7 +139,6 @@ def analyze(joined):
     print(f"Market mean signed error = {float(np.mean(mkt - out)):+.5f}\n")
 
     # The core question: when brain and market diverge, which is closer?
-    div = pre - mkt
     brain_closer = np.abs(pre - out) < np.abs(mkt - out)
     print(f"Brain closer to outcome than market: {int(brain_closer.sum())}/{n} "
           f"({100 * brain_closer.mean():.1f}%)")
