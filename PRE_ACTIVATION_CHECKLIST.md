@@ -11,7 +11,15 @@ Grouped by whether it gates activation.
 
 ## A. BLOCKERS — the run is wasted or unsafe without these
 
-### A1. DONE (analysis) — and the original worry was INVERTED
+### A1. RESOLVED — entry mechanism redesigned (market-anchored)
+The manufactured cheap-YES problem below was fixed by replacing
+shrink-toward-0.5 with a market-anchored trust blend (ENTRY_K, default 0.4;
+0=market, 1=brain). Agreement now yields zero edge. See the redesign commit
+and the updated README. The analysis that drove it is preserved below.
+
+---
+
+### A1 (analysis, historical) — the original worry was INVERTED
 Original worry: `entry_k=0.5` shrinks edges below `min_ev` -> zero trades.
 Running the numbers (scripts/trade_rate_check.py, A1_TRADE_RATE_FINDINGS.md)
 showed the OPPOSITE: `logit_shrink` pulls the brain toward 0.5, which on
