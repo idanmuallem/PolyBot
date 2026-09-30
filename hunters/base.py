@@ -90,6 +90,7 @@ class BasePolymarketHunter(BaseHunter):
         best_market = None
         highest_volume = 0.0
         tag = self.__class__.__name__
+        skipped_cooldown = 0
 
         for page in range(max_pages):
             params = {
@@ -147,7 +148,10 @@ class BasePolymarketHunter(BaseHunter):
                         no_market_id = str(tokens[1]).strip() if len(tokens) > 1 else None
 
                         if market_id in skip_ids:
-                            print(f"[{tag}] SKIP cooldown | id={market_id}")
+                            # One summary line per scan (below) instead of one
+                            # line per market: the per-market print grew the
+                            # container log to 3+ GB and filled the disk.
+                            skipped_cooldown += 1
                             continue
 
                         current_price = float(
@@ -226,6 +230,8 @@ class BasePolymarketHunter(BaseHunter):
                 print(f"[{tag}] Scan error on page {page}: {str(e).encode('ascii', errors='replace').decode()}")
                 break
 
+        if skipped_cooldown:
+            print(f"[{tag}] skipped {skipped_cooldown} markets in cooldown")
         return best_market
 
     @abstractmethod
