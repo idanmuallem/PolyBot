@@ -11,16 +11,22 @@ Grouped by whether it gates activation.
 
 ## A. BLOCKERS — the run is wasted or unsafe without these
 
-### A1. Will the bot actually trade under the new pricing? (verify FIRST)
-`entry_k=0.5` makes `post_prob` less extreme (closer to market) than the old
-bug did — this SHRINKS edges. `min_ev` is at its real default (0.50). If the
-new, smaller edges sit systematically below `min_ev`, the bot trades nothing
-and the dry-run yields zero calibration data — you'd walk away for days and
-come back to an empty table. Before activating, simulate the full entry path
-on CURRENT live crypto markets (not the far-OTM historical set) and confirm
-at least some markets clear `min_ev`. If almost none do, decide up front
-whether to lower `min_ev` for this run or accept a very low trade rate. This
-is the one that most directly wastes the run if wrong.
+### A1. DONE (analysis) — and the original worry was INVERTED
+Original worry: `entry_k=0.5` shrinks edges below `min_ev` -> zero trades.
+Running the numbers (scripts/trade_rate_check.py, A1_TRADE_RATE_FINDINGS.md)
+showed the OPPOSITE: `logit_shrink` pulls the brain toward 0.5, which on
+cheap markets (price ≲0.12) lifts the 40% model component ABOVE the price and
+manufactures a tradable YES edge even when the brain AGREES with the market
+(e.g. market=0.10, brain=0.10 -> ev_yes=+0.60). So:
+- `min_ev` is NOT too high; do NOT lower it.
+- Expect the bot to readily take cheap-market YES bets with little brain
+  conviction. Cheap longshots historically resolve NO ~94% of the time, so
+  this could be systematically bad — read it as the known behavior of this
+  setting, not a bug, and let forward_calibration.py measure whether these
+  win. May argue for a LOWER entry_k later; don't change it blind now.
+- Still worth running `scripts/trade_rate_check.py --csv <live export>` on a
+  current live-market dump from the instance for the real trade-rate number
+  (the historical CSV is far-OTM and unrepresentative).
 
 ### A2. Confirm forward-calibration data is actually captured and joinable
 The resolution loop (`resolve_closed_markets`, every 15 min in dry-run) does
