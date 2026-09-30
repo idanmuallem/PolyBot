@@ -83,6 +83,12 @@ class CandidateTrade:
     strategy_type: str = "model"       # "model" for brain-driven trades, "arbitrage" etc. for strategies
     kelly_fraction_used: float = 0.0   # the config.kelly_fraction applied when this bet was sized
     correlation_exposure: float = 0.0  # avg correlation with the currently open book (see trading/correlation.py)
+    # Entry-snapshot inputs, logged so forward calibration (see
+    # scripts/forward_calibration.py) can bucket resolved trades by moneyness
+    # and horizon the way PHASE1_FINDINGS.md did - these cannot be
+    # reconstructed after the fact, so capture them at entry time.
+    spot: float = 0.0                  # underlying spot price at evaluation
+    tte_days: float = 0.0              # time-to-expiry in days at evaluation
 
 
 class SequentialTradingPipeline:
@@ -990,6 +996,11 @@ class SequentialTradingPipeline:
             strategy_type="model",
             kelly_fraction_used=self.budget_manager.kelly_fraction,
             correlation_exposure=float(correlation_exposure),
+            spot=(
+                float(live_truth.get("spot_price") or 0.0)
+                if isinstance(live_truth, dict) else float(live_truth)
+            ),
+            tte_days=float(calculate_tte(getattr(market, "expiry_date", None))),
         )
 
     def _stage_risk_and_budget(self, candidate: CandidateTrade):
@@ -1151,6 +1162,17 @@ class SequentialTradingPipeline:
                 "spent_today": round(float(self.spent_today), 2),
                 "strike_price": float(getattr(candidate.market, "strike_price", 0.0) or 0.0),
                 "expiry_date": str(getattr(candidate.market, "expiry_date", "") or ""),
+                # Entry-snapshot fields for forward calibration (joined to the
+                # EXPIRED resolution row by token_id — see
+                # scripts/forward_calibration.py). market_price_yes is the
+                # market's implied YES probability at entry (the "market_prob"
+                # the brain's divergence is measured against); pre_prob (in the
+                # analytics fields) is the brain's raw probability; spot/tte_days
+                # let the analysis bucket by moneyness and horizon. None of
+                # these can be reconstructed after the fact.
+                "market_price_yes": round(float(candidate.price_yes), 4),
+                "spot": round(float(getattr(candidate, "spot", 0.0)), 2),
+                "tte_days": round(float(getattr(candidate, "tte_days", 0.0)), 4),
             })
 
         self.hunter.add_to_cooldown(candidate.token_id)
