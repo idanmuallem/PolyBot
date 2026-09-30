@@ -167,6 +167,26 @@ def test_inversion_keyword_flips_probability():
     assert abs(prob_above - (1.0 - prob_below)) < 0.01
 
 
+@freeze_time("2026-06-02T00:00:00+00:00")
+def test_dip_phrasing_triggers_inversion():
+    # "dip to $X" is a downward phrasing that was previously missing from
+    # invert_keywords, so a terminal-path "dip to" market was priced in the
+    # wrong direction. It should now invert like "below" does: prob for a
+    # "dip to" market ≈ 1 - prob for the equivalent "exceed" market.
+    # (Terminal path: default description="" classifies as non-touch.)
+    brain_above = HybridCryptoBrain()
+    brain_dip = HybridCryptoBrain()
+    expiry = (datetime(2026, 6, 2, tzinfo=timezone.utc) + timedelta(days=10)).isoformat()
+    m_above = _make_market(expiry=expiry, market_name="Bitcoin Will BTC exceed $100,000?")
+    m_dip = _make_market(expiry=expiry, market_name="Will Bitcoin dip to $100,000?")
+    prob_above = brain_above._calculate_probability(m_above, 95_000.0)
+    prob_dip = brain_dip._calculate_probability(m_dip, 95_000.0)
+    # Confirm the dip market actually took the terminal (invertible) path,
+    # not first-passage (which would skip inversion and break this contract).
+    assert brain_dip.last_model_used != "first_passage"
+    assert abs(prob_above - (1.0 - prob_dip)) < 0.01
+
+
 # ── _price_short_term ─────────────────────────────────────────────────────────
 
 def test_sigmoid_mid_at_equal_prices():

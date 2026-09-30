@@ -168,7 +168,16 @@ class HybridCryptoBrain(BaseBrain):
             return base_prob
 
         question = str(getattr(market, "market_name", "") or getattr(market, "question", "")).lower()
-        invert_keywords = ["↓", "below", "under", "less", "down", "lower"]
+        # Downward-direction keywords: a market asking whether price falls to /
+        # below a level answers the complement of the brain's "ends above"
+        # probability, so invert. "dip" (as in "dip to $X") is a downward
+        # phrasing that was previously missing - without it, a terminal-path
+        # "dip to $X" market was priced in the wrong direction. Note this whole
+        # block is skipped for the first-passage path above (which gets
+        # direction from strike-vs-spot geometry, not wording), so this only
+        # affects the terminal Black-Scholes path (sub-1-day TTE, or
+        # expiry/unknown-classified markets).
+        invert_keywords = ["↓", "below", "under", "less", "down", "lower", "dip"]
 
         if any(kw in question for kw in invert_keywords):
             base_prob = 1.0 - base_prob
