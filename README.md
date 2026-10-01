@@ -245,7 +245,7 @@ This entry-side calibration is distinct from `PricingEngine`'s hierarchical Wang
 
 The pipeline filters markets through several gates before executing:
 
-1. Expected value (computed off the calibrated fair value above) must exceed `MIN_EV` (default `0.50`)
+1. Expected value (computed off the calibrated fair value above) must exceed `MIN_EV` (default `0.20`)
 2. Time to expiry must be between `MIN_TTE_MINUTES` and `MAX_TTE_DAYS`
 3. Daily spend must be below `DAILY_LIMIT_USD`
 4. Available balance must exceed `MIN_TRADING_BALANCE`
@@ -339,7 +339,7 @@ SIGNATURE_TYPE=2
 TRADING_MODE=dry_run
 
 # Risk parameters
-MIN_EV=0.30
+MIN_EV=0.20
 DAILY_LIMIT_USD=5.0
 MAX_BET_SIZE_USD=3.0
 BANKROLL_USD=1000.0
@@ -472,7 +472,7 @@ Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 | `SIGNATURE_TYPE` | `2` | Polymarket signature scheme (2 = proxy/funder) |
 | `TRADING_MODE` | `dry_run` | Trading mode: `dry_run` (simulate) or `live_run` (real orders) |
 | `PAPER_BALANCE_USD` | `1000.0` | Starting virtual balance for paper trading |
-| `MIN_EV` | `0.50` | Minimum expected value (off the calibrated fair value) to enter a trade |
+| `MIN_EV` | `0.20` | Minimum expected value (off the calibrated fair value) to enter a trade |
 | `MIN_TTE_MINUTES` | `60` | Minimum time-to-expiry in minutes |
 | `MAX_TTE_DAYS` | `180` | Maximum time-to-expiry in days |
 | `DAILY_LIMIT_USD` | `5.0` | Maximum USD to spend per day |

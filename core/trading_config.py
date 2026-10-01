@@ -6,7 +6,7 @@ from dataclasses import dataclass, fields
 from dotenv import load_dotenv
 
 
-DEFAULT_MIN_EV = 0.50
+DEFAULT_MIN_EV = 0.20
 DEFAULT_MAX_BET_SIZE_USD = 3.0
 DEFAULT_DAILY_LIMIT_USD = 15.0
 
@@ -229,7 +229,7 @@ class TradingConfig:
             )
 
         cfg = cls(
-            min_ev=float(os.getenv("MIN_EV", "0.50")),
+            min_ev=float(os.getenv("MIN_EV", str(DEFAULT_MIN_EV))),
             min_tte_minutes=int(os.getenv("MIN_TTE_MINUTES", "60")),
             max_tte_days=int(os.getenv("MAX_TTE_DAYS", "180")),
             daily_limit_usd=float(os.getenv("DAILY_LIMIT_USD", "15.0")),
