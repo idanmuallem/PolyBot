@@ -1,15 +1,15 @@
 import time
-from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from ui import data_manager
 
 from brains.pricing_engine import PricingEngine
 from trading.correlation import CorrelationTracker
+from trading.gate import Gate, Ok
 
 
 class PortfolioManager:
-    def __init__(self, bridge, executor, config, hunter=None, db_path: Optional[str] = None, ledger=None):
+    def __init__(self, bridge, executor, config, hunter=None, db_path: Optional[str] = None, ledger=None, gate=None):
         self.bridge = bridge
         self.executor = executor
         self.hunter = hunter
@@ -42,30 +42,11 @@ class PortfolioManager:
         self.correlation_tracker = CorrelationTracker(config=config)
         self._last_snapshot_at: float = 0.0
 
-        # A position whose market has disappeared (resolved/closed on
-        # Polymarket while we still hold it) can never actually sell —
-        # sell_position() keeps returning False forever. Without a cap,
-        # manage_portfolio() re-triggers _exit_position() for it every loop
-        # tick (~2s) indefinitely: one real incident retried a single dead
-        # position ~2,000 times over 15+ hours with no backoff. After
-        # MAX_EXIT_ATTEMPTS consecutive failures for one token, stop
-        # retrying it every cycle — see _exit_position().
-        self.MAX_EXIT_ATTEMPTS = 5
-        self._exit_attempt_counts: dict = {}
-
-        # Post-exit cooldown: after a loss-type exit (EV-CONVERGENCE,
-        # WANG-EDGE-DECAY, STOP-LOSS -- not TAKE-PROFIT, see _exit_position),
-        # block re-entry on that token for EXIT_COOLDOWN_HOURS. Without this,
-        # an EV estimate that oscillates enough to cross both the entry bar
-        # and min_hold_ev within hours makes the bot buy, exit, and re-buy
-        # the same market repeatedly -- neither decision is wrong on its own,
-        # but the cycle nets a loss (confirmed in production: one token was
-        # bought 5x and EV-converge-sold 3x for -$9.50 before a single
-        # take-profit that didn't even recover the churn cost). A plain
-        # tunable constant, not an env var -- keep the config surface
-        # minimal until there's evidence 24h is the wrong number.
-        self.EXIT_COOLDOWN_HOURS = 24
-        self._exit_cooldowns: dict = {}  # token_id -> earliest allowed re-entry time (UTC)
+        # Exit eligibility (attempt cap) and the post-exit cooldown live in
+        # the Gate (trading/gate.py). Every exit path here asks
+        # gate.can_exit before selling and reports the outcome; the pipeline
+        # asks the same Gate before entering.
+        self.gate = gate if gate is not None else Gate(ledger, venue=self._venue)
 
     def _refresh_portfolio(self):
         positions = self.executor.get_open_positions()
@@ -241,7 +222,7 @@ class PortfolioManager:
             return 0.0
 
         try:
-            sold = self.executor.sell_position(token_id, shares, current_price, log_func)
+            sold, _gave_up = self._sell(position, "PORTFOLIO-CULL", log_func)
         except Exception as exc:
             print(f"[PORTFOLIO-CULL] Liquidation failed for {token_id}: {exc}")
             return 0.0
@@ -262,32 +243,30 @@ class PortfolioManager:
         self.bridge.current_balance = float(updated_cash)
         self.bridge.cash = float(updated_cash)
 
-    def _prune_exit_cooldowns(self):
-        """Drop expired entries so this dict doesn't grow unbounded -- same
-        lazy-prune-on-access pattern as PolymarketScannerHunter's own
-        seen_markets cooldown cache (polymarket.py's _get_active_seen_ids)."""
-        now = datetime.now(timezone.utc)
-        expired = [tok for tok, until in self._exit_cooldowns.items() if now >= until]
-        for tok in expired:
-            del self._exit_cooldowns[tok]
-
-    def exit_cooldown_until(self, token_id: str) -> Optional[datetime]:
-        """Return the cooldown-expiry time if token_id is still blocked from
-        re-entry after a loss-type exit, else None. Called from the entry
-        side (SequentialTradingPipeline._stage_evaluate_ev)."""
-        self._prune_exit_cooldowns()
-        return self._exit_cooldowns.get(str(token_id))
+    def _sell(self, position, reason: str, log_func):
+        """Sell a whole position if the Gate allows it, and report the
+        attempt back to the Gate. Returns (sold, gave_up): gave_up is True
+        on the failure that reaches the exit attempt cap. A refused exit is
+        not an attempt and returns (False, False)."""
+        if not isinstance(self.gate.can_exit(position), Ok):
+            return False, False
+        token_id = str(self._position_field(position, "token_id", "") or "")
+        shares = float(self._position_field(position, "shares", 0.0) or 0.0)
+        current_price = float(self._position_field(position, "current_price", 0.0) or 0.0)
+        sold = bool(self.executor.sell_position(token_id, shares, current_price, log_func))
+        gave_up = self.gate.record_exit_attempt(position, sold=sold, reason=reason)
+        return sold, gave_up
 
     def _exit_position(self, position, level: str, threshold: float, extra: dict, log_func) -> bool:
         """Sell a position and log the exit. Returns True if sold.
 
-        Gives up silently after MAX_EXIT_ATTEMPTS consecutive failures for
-        the same token_id (see __init__) — a position that can't sell isn't
-        going to start succeeding on attempt 2,001.
+        Gives up silently once the Gate's exit attempt cap is reached for
+        the token — a position that can't sell isn't going to start
+        succeeding on attempt 2,001.
         """
         token_id = str(self._position_field(position, "token_id", "") or "")
 
-        if token_id and self._exit_attempt_counts.get(token_id, 0) >= self.MAX_EXIT_ATTEMPTS:
+        if not isinstance(self.gate.can_exit(position), Ok):
             return False
 
         shares = float(self._position_field(position, "shares", 0.0) or 0.0)
@@ -300,27 +279,11 @@ class PortfolioManager:
         initial_price = float(self._position_field(position, "initial_price", 0.0) or 0.0)
         position_value = float(self._position_field(position, "value", shares * current_price) or 0.0)
 
-        sold = self.executor.sell_position(token_id, shares, current_price, log_func)
-
-        gave_up = False
-        if token_id:
-            if sold:
-                self._exit_attempt_counts.pop(token_id, None)
-            else:
-                attempts = self._exit_attempt_counts.get(token_id, 0) + 1
-                self._exit_attempt_counts[token_id] = attempts
-                gave_up = attempts >= self.MAX_EXIT_ATTEMPTS
+        sold, gave_up = self._sell(position, level, log_func)
 
         if sold:
             self._apply_sale_to_bridge(position_value)
             self._record_sale(position, level)
-            # See __init__ for why TAKE-PROFIT is excluded: a profitable exit
-            # means the model was right about this market, so re-entering it
-            # is a legitimate trade, not the churn pattern this guards against.
-            if token_id and level != "TAKE-PROFIT":
-                self._exit_cooldowns[token_id] = (
-                    datetime.now(timezone.utc) + timedelta(hours=self.EXIT_COOLDOWN_HOURS)
-                )
         log_func(level, "Portfolio", token_id, {
             "threshold": threshold,
             "shares": shares,
@@ -331,9 +294,9 @@ class PortfolioManager:
             **extra,
         })
 
-        # Live-mode-only: giving up after MAX_EXIT_ATTEMPTS is the existing
+        # Live-mode-only: giving up at the Gate's exit attempt cap is the existing
         # signal for "this position's market has no live order book left" —
-        # per the __init__ comment above, that's what a resolved/closed
+        # per the MAX_EXIT_ATTEMPTS comment in trading/gate.py, that's what a resolved/closed
         # Polymarket market looks like from here (it doesn't disappear from
         # the positions API, it just stops being sellable). Fires exactly
         # once per token (the attempt that pushes the counter to the cap;
@@ -361,7 +324,7 @@ class PortfolioManager:
                 "market_name": str(self._position_field(position, "market_id", "") or ""),
                 "sold": False,
                 "reason": (
-                    f"Gave up selling after {self.MAX_EXIT_ATTEMPTS} failed attempts — "
+                    f"Gave up selling after {self.gate.MAX_EXIT_ATTEMPTS} failed attempts — "
                     "market most likely resolved/closed on Polymarket. On-chain "
                     "redemption is not automated by this bot."
                 ),
@@ -458,7 +421,7 @@ class PortfolioManager:
             current_price = float(position.current_price)
             position_value = float(getattr(position, "value", shares * current_price))
 
-            sold = self.executor.sell_position(token_id, shares, current_price, log_func)
+            sold, _gave_up = self._sell(position, "OPPORTUNITY-SWAP", log_func)
             if not sold:
                 continue
 
