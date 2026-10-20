@@ -16,6 +16,7 @@ from eth_utils import to_checksum_address
 
 from core.models import MarketData, Position, PRICE_FLOOR, PRICE_CEILING
 from core.trading_config import TradingConfig
+from trading.venue import LimitOrder, MarketRef, Venue, normalize_side, side_price
 
 try:
     from py_clob_client.client import ClobClient
@@ -32,44 +33,25 @@ except Exception as e:
     SELL = "SELL"
     CLOB_IMPORT_OK = False
 
-try:
-    from trading.paper_adapter import PaperAdapter
-    PAPER_ADAPTER_AVAILABLE = True
-except ImportError:
-    PaperAdapter = None
-    PAPER_ADAPTER_AVAILABLE = False
-
 
 class TradeExecutor:
     """Handles trade execution with risk management.
 
-    Modes: dry_run (simulate with virtual balance), live_run (real CLOB orders).
+    Modes: dry_run (orders go to the paper Venue), live_run (real CLOB orders).
+
+    venue is the paper Venue used while dry_run is set, built by the caller
+    (PaperVenue.for_wallet() in core/wallet_manager.py). With no venue,
+    dry-run is log-only.
     """
 
-    def __init__(self, config: TradingConfig):
+    def __init__(self, config: TradingConfig, venue: Optional[Venue] = None):
         self.config = config
         self.trade_count_today = 0
         self.trades_by_strategy: Dict[str, int] = {}
         self.dry_run = self.config.is_dry_run
         self.proxy_address = self.config.proxy_address
         self.client = None
-        self.paper: Optional[object] = None  # set below; stays None outside dry-run
-
-        # Paper trading adapter (active only in dry-run mode) — independent of
-        # the live CLOB client, so it must init before the CLOB_IMPORT_OK gate
-        # below. Otherwise an environment without py-clob-client would leave
-        # dry-run/paper trading dead even though it never needs the live client.
-        if self.dry_run and PAPER_ADAPTER_AVAILABLE:
-            try:
-                self.paper = PaperAdapter()
-                if self.paper.is_ready:
-                    print("[PAPER] Paper trading engine initialized")
-                else:
-                    print("[PAPER] Paper engine not available — DRY-RUN log-only mode")
-                    self.paper = None
-            except Exception as exc:
-                print(f"[PAPER] Paper engine init failed: {exc} — DRY-RUN log-only mode")
-                self.paper = None
+        self.venue = venue
 
         if not CLOB_IMPORT_OK:
             print("[FATAL] py-clob-client is not loaded correctly!")
@@ -162,8 +144,8 @@ class TradeExecutor:
     def get_balance(self) -> float:
         """Fetch available CLOB collateral balance (deployable cash)."""
         if self.dry_run:
-            if self.paper is not None:
-                return self.paper.get_cash_balance()
+            if self.venue is not None:
+                return self.venue.cash()
             return float(self.config.paper_balance_usd)
 
         if self.client is None:
@@ -198,8 +180,8 @@ class TradeExecutor:
         listing method across versions.
         """
         # Paper trading mode — positions live in paper engine, not on-chain
-        if self.dry_run and self.paper is not None:
-            return self.paper.get_positions()
+        if self.dry_run and self.venue is not None:
+            return self.venue.open_positions()
 
         wallet_address = self._resolve_positions_user_address()
         if not wallet_address:
@@ -303,15 +285,18 @@ class TradeExecutor:
         condition_id: Optional[str] = None,
         slug: Optional[str] = None,
     ) -> bool:
-        """Execute a live order or simulate it based on configuration."""
-        execution_side = str(side or "YES").upper()
-        execution_token_id = str(token_id)
-        execution_price = float(current_poly_price)
+        """Execute a live order or simulate it based on configuration.
 
-        if execution_side == "NO":
-            if no_token_id:
-                execution_token_id = str(no_token_id)
-            execution_price = max(1e-6, 1.0 - float(current_poly_price))
+        token_id/current_poly_price are the market's YES token and price;
+        side picks which outcome is bought.
+        """
+        market = MarketRef(
+            yes_token_id=str(token_id), no_token_id=no_token_id or None,
+            condition_id=condition_id or None, slug=slug or None,
+        )
+        execution_side = normalize_side(side)
+        execution_token_id = market.token_for(execution_side)
+        execution_price = side_price(current_poly_price, execution_side)
 
         if self.dry_run:
             print(
@@ -323,29 +308,14 @@ class TradeExecutor:
                 "bet_amount_usd": bet_amount, "side": execution_side,
             })
 
-            # Paper trading fill. A failed fill (e.g. missing slug/condition_id,
-            # so PaperAdapter can't resolve what to buy) must not be reported
-            # as success — the caller (evaluate_and_execute / arbitrage leg
-            # execution) uses this return value to decide whether to count
-            # the trade against budget/daily-trade-count and whether a real
-            # position now exists to manage. Reporting success for a buy that
-            # never landed in the paper engine desyncs the two: budget gets
-            # spent, trade count increments, but there's no position to ever
-            # sell — or worse, a *different*, unrelated position quietly
-            # inherits stale bookkeeping. No paper adapter configured at all
-            # is not a failure in this sense (log-only DRY-RUN mode, working
-            # as designed), so that case still reports success.
+            # A failed paper fill (e.g. missing slug/condition_id) must not be
+            # reported as success: callers spend budget and trade count, and
+            # assume a position exists, on True. No venue at all is log-only
+            # dry-run (removed by #17), which still reports success.
             paper_buy_ok = True
-            if self.paper is not None:
+            if self.venue is not None:
                 try:
-                    paper_buy_ok = self.paper.execute_buy(
-                        slug=slug,
-                        condition_id=condition_id,
-                        token_id=token_id,
-                        side=execution_side,
-                        amount_usd=bet_amount,
-                        no_token_id=no_token_id,
-                    )
+                    paper_buy_ok = self.venue.buy(market, execution_side, bet_amount)
                 except Exception as exc:
                     logging.warning(f"[PAPER] Paper fill failed (non-fatal to pipeline): {exc}")
                     paper_buy_ok = False
@@ -397,22 +367,15 @@ class TradeExecutor:
                 "message": msg, "price": price, "shares": shares,
             })
 
-            # Paper trading sell. Unlike buys, a failed sell must not be
-            # reported as success: PortfolioManager._exit_position() credits
-            # cash to bridge.current_balance based on this return value, and
-            # never actually removes the position from the paper engine's
-            # own book unless the sell genuinely landed there. Swallowing a
-            # failure here (the old unconditional `return True`) meant a
-            # position whose paper sell kept failing (e.g. a missing
-            # _token_map entry) got "sold" — and credited cash — on every
-            # single loop tick, forever, without ever actually closing.
-            # No paper adapter configured at all is not a failure in this
-            # sense (there's nothing to desync from), so that case still
-            # reports success.
+            # A failed paper sell must not be reported as success:
+            # PortfolioManager._exit_position() credits cash on True, so a
+            # sell that kept failing (e.g. a missing token mapping) used to
+            # get "sold" -- and credited -- every tick, forever (6a06f35).
+            # No venue at all is log-only dry-run, which still reports success.
             paper_sell_ok = True
-            if self.paper is not None:
+            if self.venue is not None:
                 try:
-                    paper_sell_ok = self.paper.execute_sell(token_id, shares)
+                    paper_sell_ok = self.venue.sell(token_id, shares)
                 except Exception as exc:
                     logging.warning(f"[PAPER] Paper sell failed (non-fatal to pipeline): {exc}")
                     paper_sell_ok = False
@@ -519,14 +482,11 @@ class TradeExecutor:
         self, legs: List[Dict[str, Any]], log_func: Callable,
         asset_type: str, group_id: Optional[str], strategy_tag: str,
     ) -> Dict[str, Any]:
-        """Log-only fallback for when NO real PaperAdapter is available
-        (pm_trader not installed) — execute_arbitrage_group() now routes to
-        _execute_paper_limit_arbitrage_group() instead whenever self.paper
-        is set, so this only runs in the degraded "no paper engine at all"
-        mode. Attempts every leg through execute_trade() and only records a
-        leg as filled if that attempt genuinely succeeded (execute_trade()
-        with no paper adapter returns True unconditionally — the original
-        log-only DRY-RUN behavior, working as designed).
+        """Log-only fallback for dry-run with no paper venue (removed by
+        #17) -- execute_arbitrage_group() routes to
+        _execute_paper_limit_arbitrage_group() whenever self.venue is set.
+        Attempts every leg through execute_trade() and only records a leg
+        as filled if that attempt genuinely succeeded.
 
         Previously this recorded every leg's *requested* shares as filled
         unconditionally, ignoring execute_trade()'s return value entirely —
@@ -673,9 +633,9 @@ class TradeExecutor:
         self, legs: List[Dict[str, Any]], timeout_seconds: float, log_func: Callable,
         strategy_tag: str, asset_type: str, group_id: Optional[str],
     ) -> Dict[str, Any]:
-        """Paper-mode arbitrage execution via limit orders, replacing
-        _simulate_full_fill_arbitrage_group()'s market-order walk for
-        groups where a real PaperAdapter is available. A market order pays
+        """Paper-mode arbitrage execution via limit orders on self.venue,
+        replacing _simulate_full_fill_arbitrage_group()'s market-order walk.
+        A market order pays
         whatever it takes to fill the full requested dollar amount — real
         arbitrage-leg data showed that walk was where 100% of this
         strategy's cost overhead came from, concentrated in the thinnest
@@ -691,39 +651,31 @@ class TradeExecutor:
         Structurally mirrors _execute_live_arbitrage_group() above (submit
         every leg, poll with a bounded async loop, collect fills as they
         land, cancel/void whatever's left unfilled at the timeout) — see
-        that method for the live-CLOB equivalent this is modeled on.
-        pm_trader.Engine's own limit-order support (place_limit_order/
-        check_orders/cancel_limit_order) plays the same role here that the
-        live CLOB client's order endpoints play there.
+        that method for the live-CLOB equivalent this is modeled on. The
+        Venue's place/poll/cancel limit operations play the role the live
+        CLOB client's order endpoints play there.
 
-        One real difference from the live path worth knowing: pm_trader's
-        check_orders() uses "fak" (fill-and-kill) semantics per check — the
-        first check that finds ANY liquidity within a leg's limit price
-        fills it (fully or partially) and immediately marks that order
-        done; it does not keep resting to pick up more shares on later
-        checks. So polling here mainly gives legs that haven't found ANY
-        liquidity yet a chance for the book to move favorably before the
-        timeout — not a chance for an already-partially-filled leg to grow.
+        One real difference from the live path worth knowing: the paper
+        engine fills limit orders fill-and-kill per poll -- the first poll
+        that finds ANY liquidity within a leg's limit price fills it (fully
+        or partially) and closes that order. So polling here mainly gives
+        legs that haven't found ANY liquidity yet a chance for the book to
+        move favorably before the timeout.
         """
-        # check_orders() operates on every pending order in the engine, not
-        # just this group's — harmless in practice since arbitrage legs are
-        # the only place this codebase ever places limit orders, and groups
-        # are processed one at a time (_stage_strategy_scan awaits each
-        # _execute_strategy_group call before starting the next).
-        orders: Dict[str, Optional[dict]] = {}
+        # Polling advances every pending order on the venue, not just this
+        # group's -- harmless since arbitrage legs are the only limit orders
+        # placed, and groups are processed one at a time.
+        orders: Dict[str, Optional[LimitOrder]] = {}
 
         for leg in legs:
             token_id = str(leg["token_id"])
             price = float(leg["price"])
             shares = float(leg["shares"])
-            order = self.paper.place_limit_buy(
-                slug=leg.get("slug"),
-                condition_id=leg.get("condition_id"),
-                token_id=token_id,
-                side=str(leg.get("side", "YES")),
-                amount_usd=float(leg.get("bet_amount_usd", shares * price)),
+            order = self.venue.place_limit_buy(
+                MarketRef.from_leg(leg),
+                str(leg.get("side", "YES")),
+                float(leg.get("bet_amount_usd", shares * price)),
                 limit_price=price,
-                no_token_id=leg.get("no_token_id"),
             )
             orders[token_id] = order
             if order is None:
@@ -736,13 +688,12 @@ class TradeExecutor:
         poll_interval = max(0.01, min(1.0, timeout_seconds / 10.0)) if timeout_seconds > 0 else 0.0
         deadline = time.monotonic() + timeout_seconds
 
+        placed = [order for order in orders.values() if order is not None]
         while True:
-            self.paper.check_pending_limit_orders()
+            filled_by_order = self.venue.poll_limit_orders(placed)
             for token_id, order in orders.items():
                 if order is not None:
-                    fills[token_id] = self.paper.get_position_shares(
-                        order["market_condition_id"], order["outcome"],
-                    )
+                    fills[token_id] = float(filled_by_order.get(order.id, 0.0))
             if fills and all(filled > 0 for filled in fills.values()):
                 break
             if time.monotonic() >= deadline:
@@ -753,12 +704,10 @@ class TradeExecutor:
 
         if unfilled:
             # Cancel every order, matching _execute_live_arbitrage_group's
-            # structure — cancelling one that already filled is a harmless
-            # no-op (pm_trader's check_orders() already removed it from
-            # "pending" via mark_filled(); it doesn't retract the fill).
-            for order in orders.values():
-                if order is not None:
-                    self.paper.cancel_limit_order(order["id"])
+            # structure -- cancelling one that already filled is a harmless
+            # no-op (it doesn't retract the fill).
+            for order in placed:
+                self.venue.cancel_limit_order(order)
 
             for token_id in unfilled:
                 log_func("REJECTED", asset_type, token_id, {
@@ -821,18 +770,14 @@ class TradeExecutor:
         per-leg keys `bet_amount_usd`, `asset_type`, `no_token_id`, and
         `group_id` (read from the first leg) enrich logging.
 
-        Dry-run/paper with a real PaperAdapter available: legs are executed
-        via _execute_paper_limit_arbitrage_group() — limit orders against
-        pm_trader's simulated order book, capping the price paid per leg
-        instead of walking the book as deep as it takes (see that method's
-        docstring for why: real trade data showed 100% of this strategy's
-        cost overhead was slippage from that walk).
+        Dry-run with a paper venue: legs are executed via
+        _execute_paper_limit_arbitrage_group() -- limit orders on the venue,
+        capping the price paid per leg instead of walking the book as deep
+        as it takes (real trade data showed 100% of this strategy's cost
+        overhead was slippage from that walk).
 
-        Dry-run/paper with no PaperAdapter (pm_trader not installed): falls
-        back to _simulate_full_fill_arbitrage_group()'s log-only
-        simulation — there's no real order book to place anything against
-        in this degraded mode, so it just logs the group structure and
-        reuses execute_trade()'s existing "no paper adapter" behavior.
+        Dry-run with no venue: falls back to
+        _simulate_full_fill_arbitrage_group()'s log-only simulation.
         """
         if not legs:
             return {"success": False, "arb_sets": 0, "fills": {}, "unfilled": [], "surplus": {}}
@@ -841,7 +786,7 @@ class TradeExecutor:
         group_id = legs[0].get("group_id")
 
         if self.dry_run or self.client is None:
-            if self.paper is not None:
+            if self.venue is not None:
                 return await self._execute_paper_limit_arbitrage_group(
                     legs, float(timeout_seconds), log_func, strategy_tag, asset_type, group_id,
                 )
@@ -874,14 +819,12 @@ class TradeExecutor:
         """Gate on EV + daily limit + price bounds, then fire the order."""
         asset_type = market.asset_type
         token_id = market.market_id
-        execution_side = str(side or "YES").upper()
+        execution_side = normalize_side(side)
 
-        execution_token_id = token_id
-        execution_price = float(current_poly_price)
+        execution_token_id = MarketRef.from_market(market).token_for(execution_side)
+        execution_price = side_price(current_poly_price, execution_side)
         execution_fair_value = float(fair_value)
         if execution_side == "NO":
-            execution_token_id = str(getattr(market, "no_market_id", None) or token_id)
-            execution_price = max(1e-6, 1.0 - float(current_poly_price))
             execution_fair_value = 1.0 - float(fair_value)
 
         if ev < self.config.min_ev:

@@ -252,7 +252,7 @@ async def test_empty_markets_list_returns_empty():
 # event payload (unlike CryptoHunter/WeatherHunter/EconomyHunter, which all
 # go through BasePolymarketHunter._scan_polymarket()) — it must independently
 # carry condition_id/slug through, or every arbitrage leg silently fails to
-# reach the paper engine (PaperAdapter.execute_buy() requires one of the two).
+# reach the paper engine (PaperVenue.buy() requires one of the two).
 
 @pytest.mark.asyncio
 async def test_leg_market_carries_condition_id_and_slug():

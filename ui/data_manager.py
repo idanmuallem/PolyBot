@@ -590,7 +590,7 @@ def get_trade_stats(db_path: str) -> dict:
     # EXEC_LEVELS (entries) and CLOSE_LEVELS (exits) together are every level
     # a real trade action can be logged under — CLOSE_LEVELS matches every
     # exit reason PortfolioManager._exit_position() can produce, plus
-    # EXPIRED (market resolution — see PaperAdapter.resolve_closed_markets()
+    # EXPIRED (market resolution — see PaperVenue.resolve_closed_markets()
     # for paper mode and PortfolioManager._exit_position()'s gave-up branch
     # for live mode; see get_closed_trade_deltas()'s docstring for the same
     # list).
@@ -770,7 +770,7 @@ def fetch_transactions(db_path: str, limit: int = 100) -> pd.DataFrame:
 
     Buys are EXEC_LEVELS (LIVE-TRADE/DRY-RUN/PAPER-TRADE); exits are
     CLOSE_LEVELS (see get_trade_stats()) plus EXPIRED market resolutions
-    (PaperAdapter.resolve_closed_markets() in paper mode,
+    (PaperVenue.resolve_closed_markets() in paper mode,
     PortfolioManager._exit_position()'s gave-up branch in live mode).
 
     A non-EXPIRED exit row without payload["sold"] is a failed sell retry,

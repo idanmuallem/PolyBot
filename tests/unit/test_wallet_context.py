@@ -112,3 +112,25 @@ def test_two_contexts_loaded_from_different_files_keep_independent_config(tmp_pa
 def test_new_context_defaults_to_idle_status(tmp_path):
     ctx = _make_ctx("wallet_alpha", str(tmp_path / "trades.db"))
     assert ctx.status == "idle"
+
+
+# ── build_wallet_runtime: each wallet gets its own paper venue ───────────────
+
+def test_dry_run_wallets_get_isolated_paper_venues(tmp_path):
+    import pytest
+    pytest.importorskip("pm_trader")
+    from core.wallet_manager import build_wallet_runtime
+
+    ctx_a = _make_ctx("wallet_alpha", str(tmp_path / "alpha" / "trades.db"),
+                      trading_mode="dry_run", paper_balance_usd=300.0)
+    ctx_b = _make_ctx("wallet_beta", str(tmp_path / "beta" / "trades.db"),
+                      trading_mode="dry_run", paper_balance_usd=700.0)
+
+    build_wallet_runtime(ctx_a)
+    build_wallet_runtime(ctx_b)
+
+    assert ctx_a.executor.get_balance() == pytest.approx(300.0)
+    assert ctx_b.executor.get_balance() == pytest.approx(700.0)
+    assert ctx_a.bridge.current_balance == pytest.approx(300.0)
+    assert (tmp_path / "alpha" / "paper_trading" / "paper.db").exists()
+    assert (tmp_path / "beta" / "paper_trading" / "paper.db").exists()

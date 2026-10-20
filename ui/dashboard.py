@@ -283,7 +283,7 @@ def _compute_balance_snapshot() -> tuple[float, float, float, float]:
     shared in-process; that's no longer possible post-split, and reading the
     real engine (rather than a live wallet API call) here also sidesteps the
     paper engine's thread-affine sqlite3 connection (see
-    trading/paper_adapter.py) the same way the in-process version did.
+    trading/paper_venue.py) the same way the in-process version did.
 
     Shared by both the top-level "Total PnL" KPI and the Balance view's own
     stats row so the two stay numerically consistent by construction

@@ -236,7 +236,7 @@ def test_get_trade_stats_excludes_failed_sell_attempts_from_win_loss(db):
 
 
 def test_get_trade_stats_counts_expired_market_resolutions(db):
-    """EXPIRED (market resolution — see PaperAdapter.resolve_closed_markets()
+    """EXPIRED (market resolution — see PaperVenue.resolve_closed_markets()
     and PortfolioManager._exit_position()'s gave-up branch) is a real closed
     trade like any other exit reason, win/loss derived from price vs
     initial_price the same way EV-CONVERGENCE/WANG-EDGE-DECAY are."""

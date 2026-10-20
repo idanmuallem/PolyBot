@@ -1,4 +1,6 @@
 import asyncio
+
+import pytest
 from unittest.mock import MagicMock, patch
 
 from core.models import MarketData
@@ -26,26 +28,20 @@ def _dry_config(**overrides):
     return TradingConfig(**defaults)
 
 
-def _make_executor(**config_overrides):
-    """Create a TradeExecutor with a controlled TradingConfig (no real CLOB).
-
-    TradeExecutor.__init__ unconditionally tries to construct a real
-    PaperAdapter whenever trading_mode="dry_run" and pm_trader is importable —
-    which it is in this environment. Most tests here are about evaluate_and_execute's
-    own gating logic (EV/price/budget/daily-limit), not paper-engine
-    fidelity, and now that sell_position()/execute_trade() honestly
-    propagate the paper adapter's real success/failure (see
-    trading/executor.py), a real adapter would make those tests depend on
-    incidental details like whether _valid_market() sets a slug/condition_id
-    — and would write real files to disk. Default it off here; tests that
-    specifically exercise paper-adapter behavior already set executor.paper
-    themselves (to a mock or back to None) right after this call.
-    """
+def _make_executor(venue=None, **config_overrides):
+    """A TradeExecutor with a controlled TradingConfig (no real CLOB).
+    venue is the paper Venue (e.g. a FakeVenue); None is log-only dry-run."""
     from trading.executor import TradeExecutor
-    config = _dry_config(**config_overrides)
-    executor = TradeExecutor(config=config)
-    executor.paper = None
-    return executor
+    return TradeExecutor(config=_dry_config(**config_overrides), venue=venue)
+
+
+def _listed_venue(market_ref=None, yes_price=0.50, cash=1000.0):
+    """A FakeVenue with tok1/tok1_no (see _valid_market) tradeable."""
+    from trading.fake_venue import FakeVenue
+    from trading.venue import MarketRef
+    venue = FakeVenue(cash=cash)
+    venue.list_market(market_ref or MarketRef(yes_token_id="tok1", no_token_id="tok1_no"), yes_price)
+    return venue
 
 
 def _valid_market():
@@ -298,11 +294,7 @@ def test_none_response_is_invalid():
 
 def test_get_open_positions_live_ev_normalization_at_boundary():
     """A 1% gain (pnl_ratio=0.01) must produce live_ev=0.01."""
-    executor = _make_executor()
-    # This test targets the live Data-API positions path specifically (field
-    # normalization), not the paper adapter — force the paper adapter off so
-    # get_open_positions() falls through to the mocked HTTP call below.
-    executor.paper = None
+    executor = _make_executor(trading_mode="live_run")
     from unittest.mock import patch as _patch
     raw_position = {
         "asset": "tok1",
@@ -325,131 +317,156 @@ def test_get_open_positions_live_ev_normalization_at_boundary():
     )
 
 
-# ── get_balance in dry-run ────────────────────────────────────────────────────
+# ── Construction ──────────────────────────────────────────────────────────────
 
-def test_get_balance_dry_run_returns_configured_paper_balance():
-    executor = _make_executor(paper_balance_usd=500.0)
-    # This test targets the config-driven fallback used when no paper
-    # adapter is available, not the paper engine's own tracked balance.
-    executor.paper = None
-    assert executor.get_balance() == 500.0
+def test_executor_constructs_without_pm_trader_or_filesystem(tmp_path, monkeypatch):
+    """The executor never builds a paper venue itself: constructing one in
+    dry-run must not import pm_trader or write anything to disk."""
+    import sys
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TRADES_DB_PATH", str(tmp_path / "trades.db"))
+    monkeypatch.setitem(sys.modules, "pm_trader", None)
+    monkeypatch.setitem(sys.modules, "pm_trader.engine", None)
+
+    executor = _make_executor()
+
+    assert executor.venue is None
+    assert list(tmp_path.iterdir()) == []
 
 
-# ── Paper trading adapter integration (best-effort, must not break dry-run) ──
+# ── Dry-run reads cash and positions from the Venue ───────────────────────────
 
-def test_dry_run_paper_adapter_failure_does_not_raise_but_reports_failure():
-    """A raising paper adapter must not crash the pipeline (no exception
-    propagates) — but the return value must honestly reflect that the paper
-    fill never landed, not claim success. evaluate_and_execute()'s caller
-    (budget/trade-count bookkeeping) and PortfolioManager._exit_position()'s
-    cash-crediting both key off this return value; a hardcoded True here
-    previously let a market whose paper fill kept failing get "traded"
-    forever without ever having a real position to show for it."""
-    executor = _make_executor()  # trading_mode="dry_run"
+def test_get_balance_dry_run_reads_venue_cash():
+    venue = _listed_venue(cash=640.0)
+    assert _make_executor(venue=venue, paper_balance_usd=500.0).get_balance() == 640.0
 
-    # Inject a paper adapter whose execute_buy always raises
-    mock_paper = MagicMock()
-    mock_paper.execute_buy.side_effect = RuntimeError("Engine exploded")
-    executor.paper = mock_paper
 
-    market = _valid_market()
+def test_get_balance_dry_run_without_venue_returns_configured_paper_balance():
+    assert _make_executor(paper_balance_usd=500.0).get_balance() == 500.0
+
+
+def test_get_open_positions_dry_run_reads_venue_positions():
+    from trading.venue import MarketRef
+    venue = _listed_venue(yes_price=0.40)
+    venue.buy(MarketRef(yes_token_id="tok1", no_token_id="tok1_no"), "NO", 6.0)
+
+    positions = _make_executor(venue=venue).get_open_positions()
+
+    assert [(p.token_id, p.side) for p in positions] == [("tok1_no", "NO")]
+
+
+# ── Dry-run buys go through the Venue ─────────────────────────────────────────
+
+def _evaluate(executor, side="YES", price=0.50, bet=2.0, log_calls=None):
+    sink = log_calls if log_calls is not None else []
+    return executor.evaluate_and_execute(
+        market=_valid_market(),
+        fair_value=0.75,
+        ev=0.50,
+        current_poly_price=price,
+        bet_amount_usd=bet,
+        side=side,
+        log_func=lambda level, *a, **kw: sink.append(level),
+    )
+
+
+def test_dry_run_yes_buy_fills_on_the_venue():
+    venue = _listed_venue(yes_price=0.50)
+    executor = _make_executor(venue=venue)
+
+    assert _evaluate(executor, side="YES", bet=2.0) is True
+
+    assert venue.fills == [("buy", "tok1", pytest.approx(4.0), 2.0)]
+    assert executor.trade_count_today == 1
+
+
+def test_dry_run_no_buy_trades_the_no_token_through_the_venue():
+    """YES->NO translation happens behind the port: the executor passes the
+    market and side; the NO token is what gets bought."""
+    venue = _listed_venue(yes_price=0.40)
+    executor = _make_executor(venue=venue)
+    log_rows = []
+
+    result = executor.evaluate_and_execute(
+        market=_valid_market(), fair_value=0.30, ev=0.50, current_poly_price=0.40,
+        bet_amount_usd=3.0, side="NO",
+        log_func=lambda level, asset, token, payload: log_rows.append((level, token, payload)),
+    )
+
+    assert result is True
+    assert venue.fills == [("buy", "tok1_no", pytest.approx(5.0), 3.0)]
+    dry_run = [(token, payload) for level, token, payload in log_rows if level == "DRY-RUN"]
+    assert dry_run[0][0] == "tok1_no"
+    assert dry_run[0][1]["price"] == pytest.approx(0.60)
+
+
+def test_dry_run_buy_the_venue_refuses_is_not_reported_as_success():
+    """Phantom-trade regression (6a06f35): a fill that never landed must not
+    count as a trade -- callers spend budget and trade count on True."""
+    from trading.fake_venue import FakeVenue
+    executor = _make_executor(venue=FakeVenue(cash=1000.0))  # tok1 not listed: unfillable
     log_calls = []
 
-    # Must not raise, but must now honestly report failure.
-    result = executor.evaluate_and_execute(
-        market=market,
-        fair_value=0.75,
-        ev=0.50,
-        current_poly_price=0.50,
-        bet_amount_usd=2.0,
-        side="YES",
-        log_func=lambda level, *a, **kw: log_calls.append(level),
-    )
-    assert result is False
-    assert "DRY-RUN" in log_calls  # still logged — the attempt itself isn't hidden
+    assert _evaluate(executor, log_calls=log_calls) is False
+    assert executor.trade_count_today == 0
+    assert "DRY-RUN" in log_calls  # the attempt itself isn't hidden
 
 
-def test_dry_run_no_paper_adapter_configured_still_returns_true():
-    """No paper adapter at all (pm_trader not installed) is the original
-    log-only DRY-RUN mode, working as designed — not a failure to report."""
-    executor = _make_executor()  # trading_mode="dry_run"
-    executor.paper = None
-    market = _valid_market()
+class _ExplodingVenue:
+    def buy(self, *a, **kw):
+        raise RuntimeError("Engine exploded")
 
-    result = executor.evaluate_and_execute(
-        market=market,
-        fair_value=0.75,
-        ev=0.50,
-        current_poly_price=0.50,
-        bet_amount_usd=2.0,
-        side="YES",
-        log_func=lambda *a, **kw: None,
-    )
-    assert result is True
+    def sell(self, *a, **kw):
+        raise RuntimeError("Engine exploded")
 
 
-def test_dry_run_paper_buy_returning_false_is_not_reported_as_success():
-    """A paper adapter that runs without raising but returns False (e.g.
-    missing slug/condition_id, or no token_map entry to resolve later) must
-    also not be reported as a successful trade."""
-    executor = _make_executor()
-    mock_paper = MagicMock()
-    mock_paper.execute_buy.return_value = False
-    executor.paper = mock_paper
-    market = _valid_market()
-
-    result = executor.evaluate_and_execute(
-        market=market,
-        fair_value=0.75,
-        ev=0.50,
-        current_poly_price=0.50,
-        bet_amount_usd=2.0,
-        side="YES",
-        log_func=lambda *a, **kw: None,
-    )
-    assert result is False
+def test_dry_run_venue_raising_on_buy_does_not_raise_but_reports_failure():
+    executor = _make_executor(venue=_ExplodingVenue())
+    assert _evaluate(executor) is False
 
 
-def test_dry_run_sell_paper_failure_is_not_reported_as_success():
-    """The actual bug being fixed: a failed paper SELL must not be reported
-    as sold — PortfolioManager._exit_position() credits cash and treats the
-    position as closed based on this return value alone."""
-    executor = _make_executor()
-    mock_paper = MagicMock()
-    mock_paper.execute_sell.return_value = False
-    executor.paper = mock_paper
+def test_dry_run_without_venue_is_log_only_and_reports_success():
+    """No paper venue at all is the log-only dry-run mode (removed by #17)."""
+    assert _evaluate(_make_executor()) is True
 
+
+# ── Dry-run sells go through the Venue ────────────────────────────────────────
+
+def test_dry_run_sell_closes_the_venue_position():
+    from trading.venue import MarketRef
+    venue = _listed_venue(yes_price=0.50)
+    venue.buy(MarketRef(yes_token_id="tok1", no_token_id="tok1_no"), "YES", 5.0)
+    executor = _make_executor(venue=venue)
+
+    assert executor.sell_position("tok1", 10.0, 0.50, log_func=lambda *a, **kw: None) is True
+    assert executor.get_open_positions() == []
+
+
+def test_dry_run_sell_the_venue_refuses_is_not_reported_as_success():
+    """Phantom-sell regression (6a06f35): PortfolioManager credits cash and
+    treats the position as closed on True alone, so a sale that never
+    landed must report False -- every tick, not just the first."""
+    venue = _listed_venue()
+    executor = _make_executor(venue=venue)
     log_calls = []
-    result = executor.sell_position(
-        token_id="stuck_tok", shares=1000.0, price=0.0005,
-        log_func=lambda level, *a, **kw: log_calls.append(level),
-    )
-    assert result is False
-    assert "DRY-RUN-SELL" in log_calls  # attempt still logged, just not as a success
+
+    for _ in range(3):
+        result = executor.sell_position(
+            token_id="stuck_tok", shares=1000.0, price=0.0005,
+            log_func=lambda level, *a, **kw: log_calls.append(level),
+        )
+        assert result is False
+    assert log_calls.count("DRY-RUN-SELL") == 3  # attempts still logged
+    assert venue.cash() == 1000.0
 
 
-def test_dry_run_sell_paper_raising_is_not_reported_as_success():
-    executor = _make_executor()
-    mock_paper = MagicMock()
-    mock_paper.execute_sell.side_effect = RuntimeError("Engine exploded")
-    executor.paper = mock_paper
-
-    result = executor.sell_position(
-        token_id="stuck_tok", shares=1000.0, price=0.0005,
-        log_func=lambda *a, **kw: None,
-    )
-    assert result is False
+def test_dry_run_venue_raising_on_sell_is_not_reported_as_success():
+    executor = _make_executor(venue=_ExplodingVenue())
+    assert executor.sell_position("stuck_tok", 1000.0, 0.0005, log_func=lambda *a, **kw: None) is False
 
 
-def test_dry_run_sell_no_paper_adapter_configured_still_returns_true():
-    executor = _make_executor()
-    executor.paper = None
-
-    result = executor.sell_position(
-        token_id="tok1", shares=10.0, price=0.5,
-        log_func=lambda *a, **kw: None,
-    )
-    assert result is True
+def test_dry_run_sell_without_venue_is_log_only_and_reports_success():
+    assert _make_executor().sell_position("tok1", 10.0, 0.5, log_func=lambda *a, **kw: None) is True
 
 
 # ── execute_arbitrage_group (Phase 3: limit order timeout + partial fills) ──
@@ -566,151 +583,92 @@ def test_execute_arbitrage_group_dry_run_simulates_full_fill_no_real_orders():
     assert "ARBITRAGE-FILL" in log_calls
 
 
-# ── _execute_paper_limit_arbitrage_group ──────────────────────────────────────
+# ── Paper arbitrage: limit orders through the Venue ─────────────────────────
 #
-# Paper-mode arbitrage now goes through limit orders (capping the price
-# paid per leg) instead of _simulate_full_fill_arbitrage_group's market-order
-# walk, whenever a real PaperAdapter is available. These mock PaperAdapter
-# directly (place_limit_buy/check_pending_limit_orders/get_position_shares/
-# cancel_limit_order) rather than a real pm_trader engine, mirroring how the
-# live-branch tests above mock _submit_order/_get_order_filled_shares.
+# Paper-mode arbitrage places limit orders (capping the price paid per leg)
+# on the Venue rather than walking the book. A FakeVenue stands in for the
+# paper engine: listed legs fill at their listed price, unlisted legs never
+# fill.
 
-def _paper_limit_executor(**config_overrides):
-    """A TradeExecutor wired for the paper-limit-order branch of
-    execute_arbitrage_group — trading_mode="dry_run" with a mocked PaperAdapter."""
-    executor = _make_executor(**config_overrides)  # trading_mode="dry_run", paper=None by default
-    executor.paper = MagicMock()
-    return executor
+def _arb_venue(listed: dict, cash=1000.0):
+    from trading.fake_venue import FakeVenue
+    from trading.venue import MarketRef
+    venue = FakeVenue(cash=cash)
+    for token_id, price in listed.items():
+        venue.set_price(MarketRef(yes_token_id=token_id), "YES", price)
+    return venue
 
 
-def _mock_paper_limit_orders(fills_by_token: dict):
-    """Configures a MagicMock as PaperAdapter for the limit-order path,
-    matched by token_id via a deterministic order/condition id, so tests
-    can simulate arbitrary per-leg fills without a real order book."""
-    condition_to_token = {}
+def _leg(token_id, price, usd):
+    return {"token_id": token_id, "price": price, "shares": round(usd / price, 2),
+            "side": "YES", "bet_amount_usd": usd}
 
-    def fake_place_limit_buy(slug, condition_id, token_id, side, amount_usd, limit_price, no_token_id=None):
-        cond = f"cond_{token_id}"
-        condition_to_token[cond] = token_id
-        return {"id": f"order_{token_id}", "market_condition_id": cond, "outcome": side.lower()}
 
-    def fake_get_position_shares(condition_id, outcome):
-        token_id = condition_to_token.get(condition_id)
-        return fills_by_token.get(token_id, 0.0)
-
-    paper = MagicMock()
-    paper.place_limit_buy.side_effect = fake_place_limit_buy
-    paper.check_pending_limit_orders.return_value = []
-    paper.get_position_shares.side_effect = fake_get_position_shares
-    paper.cancel_limit_order.return_value = True
-    return paper
+def _run_arb(executor, legs, timeout=0.05):
+    return asyncio.run(executor.execute_arbitrage_group(
+        legs=legs, timeout_seconds=timeout, log_func=lambda *a, **kw: None,
+    ))
 
 
 def test_paper_limit_arbitrage_group_all_legs_fill_returns_success():
-    executor = _paper_limit_executor()
-    executor.paper = _mock_paper_limit_orders({"A": 3.0, "B": 2.0})
-    legs = [
-        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 0.9},
-        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES", "bet_amount_usd": 0.8},
-    ]
+    venue = _arb_venue({"A": 0.30, "B": 0.40})
+    executor = _make_executor(venue=venue)
 
-    result = asyncio.run(executor.execute_arbitrage_group(
-        legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
-    ))
+    result = _run_arb(executor, [_leg("A", 0.30, 3.0), _leg("B", 0.40, 2.0)])
 
     assert result["success"] is True
-    assert result["arb_sets"] == 2.0
+    assert result["arb_sets"] == pytest.approx(5.0)
     assert result["unfilled"] == []
-    assert result["fills"] == {"A": 3.0, "B": 2.0}
-    # Limit price = the raw scan-time leg price, no premium — same price
-    # _execute_live_arbitrage_group() submits at, so paper doesn't fill
-    # more easily than live would for the same signal.
-    call_kwargs = {c.kwargs["token_id"]: c.kwargs for c in executor.paper.place_limit_buy.call_args_list}
-    assert call_kwargs["A"]["limit_price"] == 0.30
-    assert call_kwargs["B"]["limit_price"] == 0.40
+    assert result["fills"] == {"A": pytest.approx(10.0), "B": pytest.approx(5.0)}
+    assert executor.trades_by_strategy["arbitrage"] == 2
 
 
-def test_paper_limit_arbitrage_group_never_filled_leg_voids_group():
-    executor = _paper_limit_executor()
-    executor.paper = _mock_paper_limit_orders({"A": 3.0, "B": 0.0})  # B's limit never touched
-    legs = [
-        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
-        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES"},
-    ]
+def test_paper_limit_arbitrage_limit_price_is_the_raw_leg_price():
+    """No premium above the scan-time leg price -- the same price the live
+    path submits at, so paper doesn't fill more easily than live would."""
+    venue = _arb_venue({"A": 0.31})  # one tick above the leg price
+    executor = _make_executor(venue=venue)
 
-    result = asyncio.run(executor.execute_arbitrage_group(
-        legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
-    ))
+    result = _run_arb(executor, [_leg("A", 0.30, 3.0)])
+
+    assert result["success"] is False
+    assert result["unfilled"] == ["A"]
+
+
+def test_paper_limit_arbitrage_group_never_filled_leg_voids_group_and_cancels():
+    from trading.venue import MarketRef
+    venue = _arb_venue({"A": 0.30})  # B never listed: its limit never fills
+    executor = _make_executor(venue=venue)
+
+    result = _run_arb(executor, [_leg("A", 0.30, 3.0), _leg("B", 0.40, 2.0)])
 
     assert result["success"] is False
     assert result["arb_sets"] == 0
     assert result["unfilled"] == ["B"]
-    assert result["fills"] == {"A": 3.0, "B": 0.0}
-    # Both orders get cancelled when the group is voided — cancelling an
-    # already-filled one is a harmless no-op.
-    assert executor.paper.cancel_limit_order.call_count == 2
-
-
-def test_paper_limit_arbitrage_group_partial_fill_counts_as_unfilled_for_group_purposes():
-    """A limit order that partially fills (some shares, less than
-    requested) is still short of the guaranteed complementary set if
-    another leg got zero — the group must still void, not silently keep
-    the partial fill as if it were complete."""
-    executor = _paper_limit_executor()
-    executor.paper = _mock_paper_limit_orders({"A": 1.5, "B": 0.0})  # A partially filled, B never touched
-    legs = [
-        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
-        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES"},
-    ]
-
-    result = asyncio.run(executor.execute_arbitrage_group(
-        legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
-    ))
-
-    assert result["success"] is False
-    assert result["arb_sets"] == 0
-    assert result["unfilled"] == ["B"]
-    assert result["fills"]["A"] == 1.5  # the partial fill is preserved in the data, not discarded
+    assert result["fills"]["A"] == pytest.approx(10.0)  # the real fill is preserved
+    assert result["fills"]["B"] == 0.0
+    # B's resting order was cancelled: a later price move can't fill it.
+    venue.set_price(MarketRef(yes_token_id="B"), "YES", 0.40)
+    venue.poll_limit_orders([])
+    assert [p.token_id for p in venue.open_positions()] == ["A"]
 
 
 def test_paper_limit_arbitrage_group_uneven_fills_computes_surplus():
-    executor = _paper_limit_executor()
-    executor.paper = _mock_paper_limit_orders({"A": 3.0, "B": 10.0, "C": 5.0})
-    legs = [
-        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
-        {"token_id": "B", "price": 0.30, "shares": 10.0, "side": "YES"},
-        {"token_id": "C", "price": 0.30, "shares": 5.0, "side": "YES"},
-    ]
+    venue = _arb_venue({"A": 0.30, "B": 0.30, "C": 0.30})
+    executor = _make_executor(venue=venue)
 
-    result = asyncio.run(executor.execute_arbitrage_group(
-        legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
-    ))
+    result = _run_arb(executor, [_leg("A", 0.30, 1.5), _leg("B", 0.30, 3.0), _leg("C", 0.30, 2.1)])
 
     assert result["success"] is True
-    assert result["arb_sets"] == 3.0
-    assert result["surplus"] == {"B": 7.0, "C": 2.0}
+    assert result["arb_sets"] == pytest.approx(5.0)
+    assert result["surplus"] == {"B": pytest.approx(5.0), "C": pytest.approx(2.0)}
 
 
-def test_execute_arbitrage_group_routes_to_paper_limit_when_paper_available():
-    """execute_arbitrage_group()'s dispatch: dry_run + a real (mocked)
-    PaperAdapter must route through the limit-order path, not the
-    log-only market-order simulation."""
-    executor = _paper_limit_executor()
-    executor.paper = _mock_paper_limit_orders({"A": 1.0})
-    legs = [{"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"}]
-
-    asyncio.run(executor.execute_arbitrage_group(
-        legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
-    ))
-
-    executor.paper.place_limit_buy.assert_called_once()
-
-
-def test_execute_arbitrage_group_falls_back_to_simulation_when_no_paper_adapter():
-    """dry_run with no PaperAdapter at all (pm_trader not installed) must
+def test_execute_arbitrage_group_falls_back_to_simulation_without_venue():
+    """dry_run with no paper venue at all (log-only mode) must
     still fall back to the log-only simulation, not the limit-order path
     (which has nothing real to place orders against in that mode)."""
-    executor = _make_executor()  # trading_mode="dry_run", paper=None
+    executor = _make_executor()  # trading_mode="dry_run", no venue
     legs = [{"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 1.0}]
 
     result = asyncio.run(executor.execute_arbitrage_group(
