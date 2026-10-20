@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from core.models import Position
-from trading.venue import LimitOrder, MarketRef, Resolution, normalize_side, report_resolution
+from trading.venue import (
+    LimitOrder, MarketRef, Resolution, log_paper_buy, log_paper_sell, normalize_side, report_resolution,
+)
 
 MIN_ORDER_USD = 1.0  # same floor pm_trader enforces
 
@@ -29,6 +31,8 @@ class _Holding:
 
 
 class FakeVenue:
+    name = "paper"
+
     def __init__(self, cash: float = 1000.0) -> None:
         self._cash = float(cash)
         self._prices: Dict[str, float] = {}           # token -> price per share
@@ -79,10 +83,12 @@ class FakeVenue:
             ))
         return positions
 
-    def buy(self, market: MarketRef, side: str, usd: float) -> bool:
+    def buy(self, market: MarketRef, side: str, usd: float, price=None, log_func=None) -> bool:
+        log_paper_buy(log_func, market.token_for(side), normalize_side(side), usd, price)
         return self._fill_buy(market, side, float(usd), max_price=None, arbitrage=False) > 0
 
-    def sell(self, token_id: str, shares: float) -> bool:
+    def sell(self, token_id: str, shares: float, price=None, log_func=None) -> bool:
+        log_paper_sell(log_func, str(token_id), shares, price)
         holding = self._holdings.get(str(token_id))
         price = self._prices.get(str(token_id))
         shares = float(shares)

@@ -15,6 +15,7 @@ from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
 from trading.ledger import Ledger
+from tests.venue_harness import open_book_venue
 from trading.risk_manager import PortfolioManager
 from trading.strategies.base import StrategySignal
 
@@ -73,7 +74,7 @@ def _make_pipeline(balance=100.0, config=None, venue=None, ledger=None):
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
-        ctx.executor = TradeExecutor(config=ctx.config, venue=venue)
+        ctx.executor = TradeExecutor(config=ctx.config, venue=venue or open_book_venue())
         ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
@@ -96,17 +97,17 @@ def _make_pipeline(balance=100.0, config=None, venue=None, ledger=None):
 # ── Signals execute through the executor, tagged strategy_type ───────────────
 
 @pytest.mark.asyncio
-async def test_underpriced_event_executes_every_leg_dry_run():
+async def test_underpriced_event_executes_every_leg():
     pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
 
     with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[_underpriced_event(n=3)]):
         await pipeline._stage_strategy_scan()
 
-    dry_run_entries = [c for c in log_calls if c["level"] == "DRY-RUN"]
+    filled_tokens = [fill[1] for fill in pipeline.executor.venue.fills]
     leg_entries = [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
     group_entries = [c for c in log_calls if c["level"] == "STRATEGY-GROUP"]
 
-    assert len(dry_run_entries) == 3
+    assert filled_tokens == ["evt1_tok0", "evt1_tok1", "evt1_tok2"]
     assert len(leg_entries) == 3
     assert len(group_entries) == 1
     assert group_entries[0]["payload"]["executed_legs"] == 3
@@ -119,7 +120,7 @@ async def test_all_strategy_logs_tagged_arbitrage():
     with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[_underpriced_event(n=2)]):
         await pipeline._stage_strategy_scan()
 
-    strategy_logs = [c for c in log_calls if c["level"] in ("DRY-RUN", "STRATEGY-LEG", "STRATEGY-GROUP")]
+    strategy_logs = [c for c in log_calls if c["level"] in ("STRATEGY-LEG", "STRATEGY-GROUP", "ARBITRAGE-FILL")]
     assert strategy_logs, "expected at least one strategy-tagged log entry"
     for entry in strategy_logs:
         assert entry["payload"].get("strategy_type") == "arbitrage", entry
@@ -231,9 +232,8 @@ async def test_partially_held_group_not_skipped_only_missing_leg_bought(tmp_path
         await pipeline._stage_strategy_scan()
 
     assert not [c for c in log_calls if c["level"] == "SCAN-SKIP"]
-    dry_run_entries = [c for c in log_calls if c["level"] == "DRY-RUN"]
     leg_entries = [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
-    assert [c["token_id"] for c in dry_run_entries] == ["evt1_tok2"]
+    assert [fill[1] for fill in pipeline.executor.venue.fills] == ["evt1_tok2"]
     assert [c["token_id"] for c in leg_entries] == ["evt1_tok2"]
 
     group_entries = [c for c in log_calls if c["level"] == "STRATEGY-GROUP"]

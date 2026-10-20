@@ -1011,12 +1011,9 @@ class SequentialTradingPipeline:
         )
 
     def _ledger_venue(self) -> str:
-        """Ledger venue tag for a fill: "paper" when the executor trades on
-        its paper Venue (or log-only dry-run with no venue), else "live".
-        #19 moves the Venue onto the pipeline."""
-        if getattr(self.executor, "venue", None) is not None or getattr(self.executor, "dry_run", True):
-            return "paper"
-        return "live"
+        """Ledger venue tag for a fill: the name ("paper" / "live") of the
+        Venue the executor trades on. #19 moves the Venue onto the pipeline."""
+        return getattr(getattr(self.executor, "venue", None), "name", "paper")
 
     def _record_arbitrage_entry(self, signal, group_id: str, filled_shares: float) -> None:
         """Record one arbitrage leg fill in the Ledger, tagged with its

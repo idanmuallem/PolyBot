@@ -5,28 +5,56 @@ Used by run_engine.py's standalone entrypoint. WalletContext stays a plain
 container — this is the one place that builds and wires what it holds.
 """
 
+from typing import Optional, Tuple
+
 from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
+from trading.clob_venue import ClobUnavailable, ClobVenue
 from trading.decision_pipeline import _default_log_func, sync_live_account_state
 from trading.executor import TradeExecutor
 from trading.ledger import Ledger
 from trading.paper_venue import PaperVenue
 from trading.risk_manager import PortfolioManager
+from trading.venue import Venue
 
 
-def _paper_venue(ctx: WalletContext):
-    """This wallet's PaperVenue in dry-run, else None. A paper engine that
-    can't open leaves dry-run log-only (that mode is removed by #17)."""
-    if not ctx.config.is_dry_run:
-        return None
+def _build_venues(ctx: WalletContext) -> Tuple[Venue, Optional[Venue]]:
+    """(active, standby) Venues for this wallet's configured TRADING_MODE.
+
+    The configured mode's Venue must build: live_run without a usable CLOB
+    client raises ClobUnavailable, and dry_run without a paper engine raises
+    (there is no log-only mode). The other mode's Venue is built if it can
+    be, so the dashboard can switch modes at runtime; if it can't, switching
+    to that mode is refused.
+    """
+    paper: Optional[Venue] = None
+    paper_error: Optional[Exception] = None
     try:
-        venue = PaperVenue.for_wallet(ctx)
+        paper = PaperVenue.for_wallet(ctx)
         print("[PAPER] Paper trading engine initialized")
-        return venue
     except Exception as exc:
-        print(f"[PAPER] Paper engine init failed: {exc} -- DRY-RUN log-only mode")
-        return None
+        paper_error = exc
+
+    live: Optional[Venue] = None
+    live_error: Optional[Exception] = None
+    try:
+        live = ClobVenue.from_config(ctx.config)
+    except ClobUnavailable as exc:
+        live_error = exc
+
+    if ctx.config.is_live_run:
+        if live is None:
+            raise ClobUnavailable(f"TRADING_MODE=live_run needs a Polymarket CLOB client: {live_error}")
+        if paper is None:
+            print(f"[PAPER] Paper engine unavailable ({paper_error}) -- switching to paper is disabled")
+        return live, paper
+
+    if paper is None:
+        raise RuntimeError(f"TRADING_MODE=dry_run needs the paper trading engine: {paper_error}") from paper_error
+    if live is None:
+        print(f"[LIVE] No CLOB client ({live_error}) -- switching to live is disabled")
+    return paper, live
 
 
 def build_wallet_runtime(ctx: WalletContext) -> None:
@@ -35,7 +63,8 @@ def build_wallet_runtime(ctx: WalletContext) -> None:
     sync) -> budget_manager.
     """
     ctx.ledger = Ledger(ctx.db_path)
-    ctx.executor = TradeExecutor(config=ctx.config, venue=_paper_venue(ctx))
+    venue, standby_venue = _build_venues(ctx)
+    ctx.executor = TradeExecutor(config=ctx.config, venue=venue, standby_venue=standby_venue)
     ctx.scanner = PolymarketScannerHunter(
         bridge=ctx.bridge,
         executor=ctx.executor,
