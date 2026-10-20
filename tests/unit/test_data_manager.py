@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 import sqlite3
 from types import SimpleNamespace
 
@@ -278,18 +279,29 @@ def test_restore_runtime_state_returns_default_when_empty(db):
     assert state["source"] == "default"
 
 
-def test_restore_runtime_state_picks_most_recent_balance(db):
-    bridge = DataBridge()
-    # Insert older TRACK row with equity=900
-    dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok_old",
-                 {"total_equity": 900.0}, db_path=db)
-    # Insert newer TRACK row with equity=850
-    dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok_new",
-                 {"total_equity": 850.0}, db_path=db)
+def test_restore_runtime_state_spent_today_is_todays_ledger_entries(db):
+    ledger = Ledger(db)
+    common = dict(condition_id="c", side="YES", venue="paper", strategy="crypto")
+    ledger.record_entry(token_id="old", shares=10.0, price=0.5, at="2026-10-19 23:59:59", **common)
+    ledger.record_entry(token_id="a", shares=20.0, price=0.5, at="2026-10-20 00:00:01", **common)
+    ledger.record_entry(token_id="b", shares=8.0, price=0.25, at="2026-10-20 13:00:00",
+                        **{**common, "strategy": "arbitrage"})
 
-    # restore_runtime_state reads DESC by id → picks most recent first → 850
+    state = dm.restore_runtime_state(db, fallback_starting_balance=500.0,
+                                     now=datetime(2026, 10, 20, 15, 0, 0))
+
+    assert state["spent_today"] == pytest.approx(12.0)
+
+
+def test_restore_runtime_state_balances_resume_from_the_last_engine_status(db):
+    dm.write_engine_status(db, balance=850.0, starting_balance=1000.0, position_value=120.0,
+                           unrealized_pnl=3.0, watch_only=False)
+
     state = dm.restore_runtime_state(db, fallback_starting_balance=500.0)
+
     assert state["current_balance"] == 850.0
+    assert state["starting_balance"] == 1000.0
+    assert state["source"] == "engine_status"
 
 
 # ── WAL mode ──────────────────────────────────────────────────────────────────
