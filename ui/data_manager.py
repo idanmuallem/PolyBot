@@ -6,6 +6,7 @@ from datetime import datetime
 import pandas as pd
 
 from trading.ledger import Ledger, init_schema as init_ledger_schema
+from trading.ledger_backfill import backfill_hunt_history
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +129,14 @@ def init_db(db_path: str):
         init_ledger_schema(conn)
 
         conn.execute("PRAGMA journal_mode=WAL")
+
+    # One-time copy of pre-Ledger trade history into the Ledger. Atomic and
+    # marker-guarded, so a failed or interrupted run commits nothing and is
+    # retried on the next init; it must never stop either process starting.
+    try:
+        backfill_hunt_history(db_path)
+    except Exception as e:
+        print(f"[LEDGER] hunt_history backfill failed (will retry on next start): {e}")
 
 
 def insert_paper_snapshot(db_path: str, cash: float, positions_value: float):
@@ -676,7 +685,14 @@ def get_equity_curve(db_path: str) -> pd.DataFrame:
     return df.dropna(subset=["timestamp"])[["timestamp", "total_equity"]]
 
 
-def restore_runtime_state(db_path: str, fallback_starting_balance: float) -> dict:
+def restore_runtime_state(db_path: str, fallback_starting_balance: float, now: datetime | None = None) -> dict:
+    """Engine state to resume from after a restart or redeploy.
+
+    spent_today comes from the Ledger (today's entry fills). Balances resume
+    from the last engine_status the engine published before it stopped;
+    they are refreshed from the Venue on the first sync after startup.
+    hunt_history is not consulted: it is a diagnostics log, not state.
+    """
     state = {
         "starting_balance": float(fallback_starting_balance),
         "current_balance": float(fallback_starting_balance),
@@ -685,43 +701,20 @@ def restore_runtime_state(db_path: str, fallback_starting_balance: float) -> dic
         "source": "default",
     }
 
+    today = (now or datetime.now()).strftime("%Y-%m-%d")
     try:
-        with _open_db(db_path) as conn:
-            rows = conn.execute(
-                "SELECT level, payload FROM hunt_history WHERE level IN ('LOOP-SUMMARY','TRACK') ORDER BY id DESC LIMIT 250"
-            ).fetchall()
-    except Exception:
-        return state
+        state["spent_today"] = Ledger(db_path).spent_on(today)
+    except Exception as e:
+        print(f"[RESTORE] Could not read today's spend from the Ledger: {e}")
 
-    for level, payload_raw in rows:
-        payload = _parse_payload_value(payload_raw)
-        if not isinstance(payload, dict):
-            continue
-
-        if state["source"] == "default":
-            for key in ("cash", "current_balance", "available_cash", "total_equity"):
-                val = payload.get(key)
-                if val is not None:
-                    try:
-                        fval = float(val)
-                        if fval > 0:
-                            state["current_balance"] = fval
-                            state["starting_balance"] = fval
-                            state["source"] = f"db:{level}:{key}"
-                            break
-                    except Exception:
-                        continue
-
-        for key in ("start_of_day_equity", "spent_today"):
-            val = payload.get(key)
-            if val is not None:
-                try:
-                    state[key] = float(val)
-                except Exception:
-                    pass
-
-        if state["source"] != "default" and state["start_of_day_equity"] > 0:
-            break
+    status = read_engine_status(db_path)
+    if status:
+        balance = float(status.get("current_balance") or 0.0)
+        starting = float(status.get("starting_balance") or 0.0)
+        if balance > 0 or starting > 0:
+            state["current_balance"] = balance
+            state["starting_balance"] = starting if starting > 0 else balance
+            state["source"] = "engine_status"
 
     return state
 

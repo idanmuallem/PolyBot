@@ -66,7 +66,9 @@ def validate_runtime_env(bridge: DataBridge) -> WalletContext:
 
 def restore_wallet_state(ctx: WalletContext) -> dict:
     """Restore starting_balance/current_balance/start_of_day_equity/
-    spent_today onto ctx.bridge from this wallet's trade history, and seed
+    spent_today onto ctx.bridge (spend from the Ledger, balances from the
+    last published engine_status; see data_manager.restore_runtime_state).
+    init_db also runs the one-time hunt_history -> Ledger backfill. Seeds
     the live_trading DB control's default from config if no operator
     preference is on record yet.
 

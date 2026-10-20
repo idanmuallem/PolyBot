@@ -107,16 +107,45 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+class _Borrowed:
+    """A caller's open connection, lent to a Ledger: entering and leaving it
+    neither commits nor closes, so the caller owns the transaction."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        return self._conn
+
+    def __exit__(self, *exc):
+        return False
+
+
 class Ledger:
     def __init__(self, db_path: str):
         self.db_path = str(db_path)
+        self._conn = None
         parent = os.path.dirname(self.db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
         with self._connect() as conn:
             init_schema(conn)
 
+    @classmethod
+    def on_connection(cls, conn) -> "Ledger":
+        """A Ledger that reads and writes through `conn` inside the caller's
+        transaction (the hunt_history backfill records a whole history
+        atomically this way). The caller commits or rolls back."""
+        conn.row_factory = sqlite3.Row
+        ledger = cls.__new__(cls)
+        ledger.db_path = None
+        ledger._conn = conn
+        init_schema(conn)
+        return ledger
+
     def _connect(self):
+        if self._conn is not None:
+            return _Borrowed(self._conn)
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         return conn
@@ -130,12 +159,13 @@ class Ledger:
         price: float, venue: str, strategy: str, asset_type: Optional[str] = None,
         market_name: Optional[str] = None, pre_prob: Optional[float] = None,
         post_prob: Optional[float] = None, wang_edge: Optional[float] = None,
-        group_id: Optional[str] = None,
+        group_id: Optional[str] = None, at: Optional[str] = None,
     ) -> int:
         """Record an entry fill. Returns the position id. group_id ties an
         arbitrage leg to its basket; the position's later sales and its
-        resolution inherit it."""
-        ts = _now()
+        resolution inherit it. `at` overrides the recorded time
+        ("YYYY-MM-DD HH:MM:SS"; default now)."""
+        ts = at or _now()
         side = str(side or "").upper() or None
         with self._connect() as conn:
             cur = conn.execute(
@@ -159,6 +189,7 @@ class Ledger:
         self, *, token_id: str, shares: float, price: float, reason: str, venue: str,
         strategy: Optional[str] = None, entry_price: Optional[float] = None,
         side: Optional[str] = None, market_name: Optional[str] = None,
+        at: Optional[str] = None,
     ) -> int:
         """Record a confirmed sale of `shares` at `price`. `reason` is the
         exit path (TAKE-PROFIT, STOP-LOSS, PORTFOLIO-CULL, ...).
@@ -170,13 +201,14 @@ class Ledger:
         return self._close(
             kind="SELL", token_id=token_id, shares=shares, price=price, reason=reason,
             venue=venue, strategy=strategy, entry_price=entry_price, side=side,
-            market_name=market_name, confirmed=True,
+            market_name=market_name, confirmed=True, at=at,
         )
 
     def record_resolution(
         self, *, token_id: str, shares: float, payout_price: Optional[float], venue: str,
         strategy: Optional[str] = None, entry_price: Optional[float] = None,
         side: Optional[str] = None, market_name: Optional[str] = None,
+        at: Optional[str] = None,
     ) -> int:
         """Record a market resolution or expiry, which ends the position.
 
@@ -189,15 +221,16 @@ class Ledger:
             kind="RESOLVED" if confirmed else "EXPIRED", token_id=token_id, shares=shares,
             price=payout_price, reason="EXPIRED", venue=venue, strategy=strategy,
             entry_price=entry_price, side=side, market_name=market_name, confirmed=confirmed,
+            at=at,
         )
 
     def _close(
         self, *, kind: str, token_id: str, shares: float, price: Optional[float],
         reason: Optional[str], venue: str, strategy: Optional[str],
         entry_price: Optional[float], side: Optional[str], market_name: Optional[str],
-        confirmed: bool,
+        confirmed: bool, at: Optional[str] = None,
     ) -> int:
-        ts = _now()
+        ts = at or _now()
         shares = float(shares)
         with self._connect() as conn:
             row = conn.execute(
@@ -284,6 +317,17 @@ class Ledger:
         with self._connect() as conn:
             rows = conn.execute(sql + " ORDER BY id", params).fetchall()
         return [_holding(r) for r in rows]
+
+    def spent_on(self, day: str) -> float:
+        """Total $ of entry fills recorded on `day` ("YYYY-MM-DD", the date
+        part of the recorded times), across venues and strategies."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount_usd), 0.0) FROM trades "
+                "WHERE kind = 'BUY' AND substr(timestamp, 1, 10) = ?",
+                (str(day),),
+            ).fetchone()
+        return float(row[0] or 0.0)
 
     def _closing_trades(self, venue: Optional[str] = None) -> list:
         """Confirmed closes (sales and paid-out resolutions) with a known
