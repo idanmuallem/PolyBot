@@ -14,6 +14,7 @@ from core.polymarket_client import PolymarketClient
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
+from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
 from trading.strategies.base import StrategySignal
 
@@ -47,7 +48,7 @@ def _underpriced_event(event_id="evt1", n=3, price=0.30, expiry_days=None, title
     return {"id": event_id, "title": title, "markets": markets}
 
 
-def _make_pipeline(balance=100.0, config=None, venue=None):
+def _make_pipeline(balance=100.0, config=None, venue=None, ledger=None):
     from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
 
     bridge = DataBridge()
@@ -64,6 +65,7 @@ def _make_pipeline(balance=100.0, config=None, venue=None):
         )
 
     ctx = WalletContext(wallet_id="test_wallet", config=config, bridge=bridge, db_path="test_wallet_trades.db")
+    ctx.ledger = ledger
     log_calls = []
     log_func = lambda level, asset_type, token_id, payload: log_calls.append(
         {"level": level, "asset_type": asset_type, "token_id": token_id, "payload": payload}
@@ -166,29 +168,23 @@ async def test_insufficient_cash_rejects_whole_group():
     assert pipeline.budget_manager.total_spent_today == 0.0
 
 
+def _hold_legs(ledger, legs):
+    """Seed the Ledger with open arbitrage holdings: (token_id, shares, price)."""
+    for token_id, shares, price in legs:
+        ledger.record_entry(token_id=token_id, condition_id=None, side="YES", shares=shares,
+                            price=price, venue="paper", strategy="arbitrage", group_id="event_sum:evt1")
+
+
 @pytest.mark.asyncio
-async def test_fully_held_group_is_skipped_not_rebought():
-    """Restart-safety: _filled_arb_groups (in-memory) resets on every
-    process restart, but real holdings — reflected in bridge.current_portfolio
-    — persist across restarts. A group whose ENTIRE currently-valid basket
-    is already held must be skipped even on a "fresh" pipeline instance
-    that has never seen this group_id before, or a redeploy re-buys
-    everything it already holds (the confirmed root cause of a
-    runaway-trade-rate incident). See test_partially_held_group_* below
-    for the complementary case: a basket only PARTLY held must NOT be
-    skipped — see _group_already_held's docstring for why the check is
-    ALL-legs, not ANY-leg."""
-    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
-    event = _underpriced_event(n=3)
+async def test_fully_held_group_is_skipped_not_rebought(tmp_path):
+    """Restart-safety: holdings live in the Ledger, so a fresh pipeline that
+    has never seen this group still skips a basket whose every leg is held
+    (a redeploy used to re-buy everything it held)."""
+    ledger = Ledger(str(tmp_path / "trades.db"))
+    _hold_legs(ledger, [(f"evt1_tok{i}", 3.0, 0.30) for i in range(3)])
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0, ledger=ledger)
 
-    # Simulate holding every leg, as if positions persisted across a
-    # restart that wiped _filled_arb_groups.
-    bridge.current_portfolio = [
-        SimpleNamespace(asset_id=f"evt1_tok{i}", shares=3.0, initial_price=0.30)
-        for i in range(3)
-    ]
-
-    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[event]):
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[_underpriced_event(n=3)]):
         await pipeline._stage_strategy_scan()
 
     assert not [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
@@ -197,26 +193,41 @@ async def test_fully_held_group_is_skipped_not_rebought():
         for c in log_calls
     )
     assert pipeline.budget_manager.total_spent_today == 0.0
-    assert "event_sum:evt1" in pipeline._filled_arb_groups
 
 
 @pytest.mark.asyncio
-async def test_partially_held_group_not_skipped_only_missing_leg_bought():
+async def test_filled_basket_is_not_rebought_on_the_next_attempt(tmp_path):
+    venue = _venue_listing({"tokA": 0.30, "tokB": 0.35})
+    pipeline, bridge, log_calls = _make_pipeline(
+        balance=100.0, venue=venue, ledger=Ledger(str(tmp_path / "trades.db")),
+    )
+    pipeline.config.arbitrage_order_timeout_seconds = 0.05
+    signals = [_signal("tokA", 0.30), _signal("tokB", 0.35)]
+
+    def _buys():
+        return [token for op, token, _shares, _usd in venue.fills if op == "buy"]
+
+    await pipeline._execute_strategy_group(_FAKE_ARBITRAGE_STRATEGY, "event_sum:evt1", signals)
+    assert _buys() == ["tokA", "tokB"]
+
+    await pipeline._execute_strategy_group(_FAKE_ARBITRAGE_STRATEGY, "event_sum:evt1", signals)
+
+    assert _buys() == ["tokA", "tokB"]
+    assert log_calls[-1]["level"] == "SCAN-SKIP"
+    assert log_calls[-1]["payload"]["reason"] == "already_owned_in_portfolio"
+
+
+@pytest.mark.asyncio
+async def test_partially_held_group_not_skipped_only_missing_leg_bought(tmp_path):
     """A basket where 2 of 3 currently-valid legs are already held (e.g.
-    the event gained a new candidate/outcome after the original buy — see
-    _group_already_held's docstring for the real Nobel Peace Prize case
-    this is modeled on) must NOT be skipped, and the pipeline must only
-    attempt to buy the still-missing leg — not re-buy the 2 it already
-    holds."""
-    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
-    event = _underpriced_event(n=3)
+    the event gained a new outcome after the original buy, as with the
+    Nobel Peace Prize event) must NOT be skipped, and only the missing leg
+    is bought."""
+    ledger = Ledger(str(tmp_path / "trades.db"))
+    _hold_legs(ledger, [("evt1_tok0", 10.0, 0.30), ("evt1_tok1", 10.0, 0.30)])
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0, ledger=ledger)
 
-    bridge.current_portfolio = [
-        SimpleNamespace(asset_id="evt1_tok0", shares=10.0, initial_price=0.30),
-        SimpleNamespace(asset_id="evt1_tok1", shares=10.0, initial_price=0.30),
-    ]
-
-    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[event]):
+    with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[_underpriced_event(n=3)]):
         await pipeline._stage_strategy_scan()
 
     assert not [c for c in log_calls if c["level"] == "SCAN-SKIP"]
@@ -231,26 +242,19 @@ async def test_partially_held_group_not_skipped_only_missing_leg_bought():
     assert group_entries[0]["payload"]["legs_already_held"] == 2
     assert group_entries[0]["payload"]["legs_total_in_basket"] == 3
 
-    assert "event_sum:evt1" in pipeline._filled_arb_groups
-
 
 @pytest.mark.asyncio
-async def test_partial_hold_topup_trims_new_leg_to_held_share_count():
+async def test_partial_hold_topup_trims_new_leg_to_held_share_count(tmp_path):
     """The missing leg is bought for a fixed dollar amount, which can land
-    far more shares than the already-held legs hold — e.g. a cheap
-    long-shot outcome added to the event after the original buy. The true
-    guaranteed-set size is bounded by the SCARCEST leg in the whole
-    basket, held or new, so the excess on the newly-bought leg must be
-    trimmed back to the held legs' share count, not kept as naked
-    exposure on a candidate that can't actually complete a full set."""
-    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
+    far more shares than the already-held legs hold (e.g. a cheap long-shot
+    outcome added after the original buy). The guaranteed set is bounded
+    by the scarcest leg in the whole basket, held or new, so the excess on
+    the new leg is trimmed back to the held legs' share count."""
+    ledger = Ledger(str(tmp_path / "trades.db"))
+    _hold_legs(ledger, [("evt1_tok0", 2.0, 0.30), ("evt1_tok1", 2.0, 0.30)])
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0, ledger=ledger)
     event = _underpriced_event(n=3)
     event["markets"][2]["lastTradePrice"] = 0.05  # cheap long-shot leg: $1 buys ~20 shares
-
-    bridge.current_portfolio = [
-        SimpleNamespace(asset_id="evt1_tok0", shares=2.0, initial_price=0.30),
-        SimpleNamespace(asset_id="evt1_tok1", shares=2.0, initial_price=0.30),
-    ]
 
     with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[event]):
         await pipeline._stage_strategy_scan()
@@ -261,7 +265,6 @@ async def test_partial_hold_topup_trims_new_leg_to_held_share_count():
     assert leg_entries[0]["payload"]["shares"] == pytest.approx(2.0)  # trimmed to the held legs' 2.0 shares
 
     assert any(c["level"] == "DRY-RUN-SELL" for c in log_calls)  # ~18 excess shares sold back
-    assert "event_sum:evt1" in pipeline._filled_arb_groups
 
 
 @pytest.mark.asyncio
@@ -561,7 +564,6 @@ async def test_arbitrage_rejects_group_not_profitable_after_real_fills():
         c["level"] == "REJECTED" and c["payload"].get("reason") == "not_profitable_after_real_fills"
         for c in log_calls
     )
-    assert "event_sum:evt1" not in pipeline._filled_arb_groups
     assert "event_sum:evt1" in pipeline._exhausted_arb_groups
 
 
@@ -584,7 +586,6 @@ async def test_arbitrage_executes_when_genuinely_profitable_after_real_fills():
     assert len(leg_entries) == 2
     assert all(c["payload"]["executed"] for c in leg_entries)
     assert not [c for c in log_calls if c["level"] == "REJECTED"]
-    assert "event_sum:evt1" in pipeline._filled_arb_groups
 
 
 @pytest.mark.asyncio
@@ -610,7 +611,6 @@ async def test_arbitrage_trims_surplus_when_fills_are_unequal_but_profitable():
     leg_entries = {c["token_id"]: c for c in log_calls if c["level"] == "STRATEGY-LEG"}
     assert leg_entries["tokA"]["payload"]["shares"] == 2.5  # trimmed, not the raw 5.0 fill
     assert leg_entries["tokB"]["payload"]["shares"] == 2.5
-    assert "event_sum:evt1" in pipeline._filled_arb_groups
 
 
 @pytest.mark.asyncio
@@ -637,7 +637,6 @@ async def test_arbitrage_unwinds_when_group_incomplete():
         c["level"] == "REJECTED" and c["payload"].get("reason") == "group_incomplete_unwound_partial_fills"
         for c in log_calls
     )
-    assert "event_sum:evt1" not in pipeline._filled_arb_groups
     assert "event_sum:evt1" in pipeline._exhausted_arb_groups
 
 
@@ -684,7 +683,6 @@ async def test_paper_limit_orders_end_to_end_some_legs_fill_others_dont():
         c["level"] == "REJECTED" and c["payload"].get("reason") == "group_incomplete_unwound_partial_fills"
         for c in log_calls
     )
-    assert "event_sum:evt1" not in pipeline._filled_arb_groups
 
 
 @pytest.mark.asyncio
@@ -701,5 +699,4 @@ async def test_paper_limit_orders_end_to_end_all_legs_fill():
     leg_entries = [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
     assert len(leg_entries) == 2
     assert all(c["payload"]["executed"] for c in leg_entries)
-    assert "event_sum:evt1" in pipeline._filled_arb_groups
     assert sorted(p.token_id for p in venue.open_positions()) == ["tokA", "tokB"]

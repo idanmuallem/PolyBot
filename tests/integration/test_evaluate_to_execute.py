@@ -14,10 +14,11 @@ from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
+from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
 
 
-def _make_pipeline(config=None, balance=100.0):
+def _make_pipeline(config=None, balance=100.0, ledger=None):
     from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
 
     bridge = DataBridge()
@@ -39,6 +40,7 @@ def _make_pipeline(config=None, balance=100.0):
         )
 
     ctx = WalletContext(wallet_id="test_wallet", config=config, bridge=bridge, db_path="test_wallet_trades.db")
+    ctx.ledger = ledger
 
     log_calls = []
     log_func = lambda level, *a, **kw: log_calls.append(level)
@@ -125,76 +127,39 @@ def test_evaluate_returns_none_on_missing_live_truth():
     assert "SCAN-SKIP" in log_calls
 
 
-# ── Stage 2: already-held guards (restart-proof real-portfolio check +
-#    in-memory _simulated_positions backstop) ─────────────────────────────────
+# ── Stage 2: the Gate (Ledger-backed already-held check) ─────────────────────
+# Gate.can_enter's own rules are covered in tests/unit/test_gate.py; these
+# only pin that the evaluate stage asks it.
 
 @freeze_time("2026-06-02T00:00:00+00:00")
-def test_already_owned_check_catches_no_side_holding_after_restart():
-    """Regression: a NO-side paper fill is recorded under the NO token's own
-    id (no_market_id), not the market's YES-canonical token_id used here for
-    hunting -- see MarketRef.token_for() in trading/venue.py.
-    Simulates a fresh process restart: _simulated_positions (the in-memory
-    backstop) is empty, exactly as it is right after a container restart,
-    so only the real-portfolio check (bridge.current_portfolio, restored
-    from disk) can catch this."""
-    pipeline, bridge, log_calls = _make_pipeline()
-    market = _market(price=0.40)  # market_id="tok1", no_market_id="tok1_no"
-    assert pipeline._simulated_positions == set()  # fresh-restart precondition
+def test_evaluate_skips_market_whose_no_side_the_ledger_holds(tmp_path):
+    ledger = Ledger(str(tmp_path / "trades.db"))
+    ledger.record_entry(token_id="tok1_no", condition_id=None, side="NO", shares=5.0,
+                        price=0.6, venue="paper", strategy="crypto")
+    pipeline, bridge, log_calls = _make_pipeline(ledger=ledger)
 
-    bridge.current_portfolio = [SimpleNamespace(token_id="tok1_no")]
-
-    candidate = pipeline._stage_evaluate_ev(market, MagicMock())
+    candidate = pipeline._stage_evaluate_ev(_market(price=0.40), MagicMock())
 
     assert candidate is None
     assert "SCAN-SKIP" in log_calls
 
 
 @freeze_time("2026-06-02T00:00:00+00:00")
-def test_already_owned_check_still_catches_yes_side_holding():
-    """Regression: the original token_id match (YES-side holdings, where
-    the market's own token_id IS what a paper/live fill is recorded under)
-    must keep working unchanged."""
-    pipeline, bridge, log_calls = _make_pipeline()
-    market = _market(price=0.40)  # market_id="tok1"
-    bridge.current_portfolio = [SimpleNamespace(token_id="tok1")]
-
-    candidate = pipeline._stage_evaluate_ev(market, MagicMock())
-
-    assert candidate is None
-    assert "SCAN-SKIP" in log_calls
-
-
-@freeze_time("2026-06-02T00:00:00+00:00")
-def test_already_owned_check_ignores_unrelated_holding():
-    """A held position for a different market must not block evaluation."""
-    pipeline, bridge, _ = _make_pipeline()
-    market = _market(price=0.40)  # market_id="tok1", no_market_id="tok1_no"
-    bridge.current_portfolio = [SimpleNamespace(token_id="unrelated_tok")]
-
+def test_executed_entry_blocks_the_next_evaluation_of_that_market(tmp_path):
+    """The same-session re-buy guard is the Ledger entry itself (it used to
+    be an in-memory simulated-positions set)."""
+    pipeline, bridge, log_calls = _make_pipeline(ledger=Ledger(str(tmp_path / "trades.db")))
     mock_hunter = MagicMock()
     mock_hunter.get_live_truth.return_value = 97_000.0
 
     with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.70):
-        candidate = pipeline._stage_evaluate_ev(market, mock_hunter)
+        candidate = pipeline._stage_evaluate_ev(_market(price=0.40), mock_hunter)
+        approved_bet, risk_ctx = pipeline._stage_risk_and_budget(candidate)
+        pipeline._stage_execute(candidate, approved_bet, risk_ctx)
+        again = pipeline._stage_evaluate_ev(_market(price=0.40), mock_hunter)
 
-    assert candidate is not None
-
-
-@freeze_time("2026-06-02T00:00:00+00:00")
-def test_already_held_simulated_skip_still_works_during_normal_operation():
-    """The in-memory _simulated_positions backstop (distinct from the
-    real-portfolio check above) must still fire unchanged -- this is the
-    same-session guard that catches a just-bought token before the next
-    portfolio refresh reflects it. Not restart-related; must survive this
-    change untouched."""
-    pipeline, bridge, log_calls = _make_pipeline()
-    market = _market(price=0.40)  # market_id="tok1"
-    pipeline._simulated_positions.add("tok1")
-
-    candidate = pipeline._stage_evaluate_ev(market, MagicMock())
-
-    assert candidate is None
-    assert "SCAN-SKIP" in log_calls
+    assert again is None
+    assert log_calls[-1] == "SCAN-SKIP"
 
 
 # ── Stage 2: post-exit cooldown (prevents same-market buy/exit/re-buy churn) ──

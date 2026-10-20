@@ -19,6 +19,7 @@ from brains.base import calculate_tte
 from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
 from core.polymarket_client import PolymarketClient
+from trading.gate import Gate, Skip
 from trading.strategies import EventSumStrategy, Strategy
 from trading.venue import MarketRef, normalize_side
 from ui import data_manager
@@ -141,25 +142,16 @@ class SequentialTradingPipeline:
         # _reset_daily_if_needed().
         self._exhausted_arb_groups: set[str] = set()
 
-        # token_ids "held" this "day" via a dry-run/paper-trade fill. Neither
-        # mode submits a real order, so TradeExecutor.get_open_positions()
-        # (which always queries the live Polymarket Data API - see
-        # _stage_evaluate_ev's "already_owned_in_portfolio" check) never sees
-        # them, and without this the same EV-positive market gets re-bought
-        # every hunt cycle. Live mode's real on-chain position already
-        # covers this once the order settles; this is purely a simulated-
-        # mode backstop. Cleared in _reset_daily_if_needed().
-        self._simulated_positions: set[str] = set()
-
-        # group_ids successfully filled this "day" - this applies in EVERY
-        # mode, not just simulated ones (unlike _simulated_positions above):
-        # the arbitrage path has no "already hold this" check of its own at
-        # all, so a group gets rediscovered and re-filled every scan for as
-        # long as it stays profitable in the live Gamma API snapshot.
-        # Cleared in _reset_daily_if_needed().
-        self._filled_arb_groups: set[str] = set()
-
         self.portfolio_manager = ctx.portfolio_manager
+
+        # Entry eligibility (already held on either side, post-exit
+        # cooldown) for model entries and arbitrage baskets alike. Holdings
+        # come from the Ledger, so the answer survives restarts.
+        self.gate = Gate(
+            self.ledger,
+            exit_cooldown_until=self.portfolio_manager.exit_cooldown_until,
+            venue=self._ledger_venue,
+        )
 
         sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
         if float(getattr(self.bridge, "starting_balance", 0.0) or 0.0) <= 0.0:
@@ -273,8 +265,6 @@ class SequentialTradingPipeline:
             self.budget_manager.trades_by_strategy = {}
             self.executor.reset_daily_count()
             self._exhausted_arb_groups.clear()
-            self._simulated_positions.clear()
-            self._filled_arb_groups.clear()
 
     # ------------------------------------------------------------------
     # Strategy scan — constraint-based arbitrage, independent of the
@@ -350,8 +340,6 @@ class SequentialTradingPipeline:
                 continue
 
             for group_id, group_signals in self._group_signals(signals).items():
-                if group_id in self._filled_arb_groups:
-                    continue  # already hold this position, skip silently
                 if group_id in self._exhausted_arb_groups:
                     continue
                 await self._execute_strategy_group(strategy, group_id, group_signals)
@@ -382,54 +370,6 @@ class SequentialTradingPipeline:
     @staticmethod
     def _leg_token_id(signal) -> str:
         return MarketRef.from_market(signal.market).token_for(signal.side)
-
-    def _held_token_map(self) -> dict:
-        """token_id -> live Position for every currently open real position,
-        keyed the same way _leg_token_id() results are looked up elsewhere
-        in this class (asset_id, falling back to token_id)."""
-        return {
-            str(getattr(position, "asset_id", getattr(position, "token_id", ""))): position
-            for position in (getattr(self.bridge, "current_portfolio", None) or [])
-        }
-
-    def _group_already_held(self, signals: list) -> bool:
-        """True only if EVERY currently-valid leg of this group is already
-        an open position — i.e. the basket is genuinely complete.
-
-        Used to be an ANY-leg check ("is at least one leg of this event
-        held?"), which permanently marked the WHOLE event "done" the
-        instant a single leg was bought — including legs that didn't exist
-        yet at buy time and were added to the event later (confirmed via
-        real data: the Nobel Peace Prize event has 20 currently-valid legs
-        per EventSumStrategy._extract_legs(), only 12 held; the other 8
-        aren't filtered out by _extract_legs() at all, they simply weren't
-        part of the event yet when it was first bought — the ANY-check saw
-        the 12 held tokens among today's 20 signals and called the whole
-        group done, forever). An ALL-legs check instead only treats the
-        group as complete when every leg currently valid is actually held,
-        so _execute_strategy_group can keep topping up a partial basket as
-        new legs appear, while a genuinely complete basket still gets
-        skipped so it isn't re-evaluated every scan.
-
-        _filled_arb_groups (the primary re-buy guard) is in-memory and
-        resets to empty on every process restart, while the positions it's
-        meant to prevent re-buying persist across restarts (paper positions
-        on disk, live positions on-chain). Without this check, a redeploy
-        wipes the guard but not the holdings, and the very next strategy
-        scan re-discovers and re-buys every still-profitable arbitrage group
-        it already holds — this is the confirmed root cause of a rapid-fire
-        trade/holdings burst observed after redeploys. Checking the actual
-        current portfolio (refreshed every loop tick, before this runs) is
-        restart-proof because it reflects real holdings, not session state.
-        """
-        if not signals:
-            return False
-        held_tokens = self._held_token_map()
-        return all(
-            self._leg_token_id(signal) in held_tokens
-            or self._leg_token_id(signal) in self._simulated_positions
-            for signal in signals
-        )
 
     async def _execute_strategy_group(self, strategy: Strategy, group_id: str, signals: list):
         """Execute every leg of one strategy opportunity (e.g. every outcome
@@ -472,31 +412,21 @@ class SequentialTradingPipeline:
         tagged_log = self._tag_log_func(strategy.strategy_type)
         asset_type = signals[0].market.asset_type
 
-        if self._group_already_held(signals):
-            tagged_log("SCAN-SKIP", asset_type, group_id, {"reason": "already_owned_in_portfolio"})
-            self._filled_arb_groups.add(group_id)
+        # The Gate refuses a basket that is fully held (or can't be
+        # completed: a leg held on its other side, or cooling down after an
+        # exit) and otherwise names the legs still missing. Only those are
+        # bought, and only new capital goes through the TTE/budget/trade-count
+        # gates below. `signals` (the full basket) and `held_legs` are kept
+        # for the group-level profitability re-verification further down,
+        # which judges completing the basket against its real total cost:
+        # the sunk cost of what's already held plus what's newly bought.
+        decision = self.gate.can_enter(signals)
+        if isinstance(decision, Skip):
+            tagged_log("SCAN-SKIP", asset_type, group_id, {"reason": decision.reason, **decision.detail})
             return
-
-        # Some (not all) legs are already held — _group_already_held above
-        # only returned False because at least one currently-valid leg is
-        # missing. Only attempt to buy the missing legs: re-buying a leg
-        # already held would just double the position for no reason.
-        # `missing_signals` drives what actually gets bought (and the TTE/
-        # budget/trade-count gates below, since only new capital is at
-        # stake there); `signals` (the FULL current basket) and
-        # `held_signals` are kept for the group-level profitability
-        # re-verification further down, which judges completing the
-        # basket against its real total cost — sunk cost of what's already
-        # held plus the cost of what's newly bought — not just the cost of
-        # this one attempt in isolation. See that section for why.
-        held_tokens = self._held_token_map()
-
-        def _is_held(s):
-            tid = self._leg_token_id(s)
-            return tid in held_tokens or tid in self._simulated_positions
-
-        missing_signals = [s for s in signals if not _is_held(s)]
-        held_signals = [s for s in signals if _is_held(s)]
+        missing_signals = list(decision.legs)
+        held_legs = list(decision.held)  # (signal, Ledger Holding)
+        held_signals = [signal for signal, _holding in held_legs]
 
         if self._group_has_leg_beyond_max_tte(missing_signals, group_id, asset_type, tagged_log):
             self._exhausted_arb_groups.add(group_id)
@@ -610,21 +540,9 @@ class SequentialTradingPipeline:
         # at $0.02 buys ~50 shares/$1; legs bought earlier around $0.25
         # might only hold ~4 shares each) — the true guaranteed structure
         # is bounded by the SCARCEST leg across the WHOLE basket, held or
-        # new, not just what got bought in this one attempt. Legs held only
-        # via _simulated_positions (a same-tick dry-run backstop with no
-        # share-count data of its own — see its definition in __init__)
-        # can't be capped this way; treating them as unconstrained here is
-        # the conservative choice, since in practice _execute_strategy_group
-        # never adds to _simulated_positions itself (only the model-driven
-        # path does), so this case doesn't arise for arbitrage legs today.
-        if arb_sets > 0 and held_signals:
-            held_share_counts = [
-                float(getattr(held_tokens[self._leg_token_id(s)], "shares", 0.0))
-                for s in held_signals
-                if self._leg_token_id(s) in held_tokens
-            ]
-            if held_share_counts:
-                arb_sets = min(arb_sets, min(held_share_counts))
+        # new, not just what got bought in this one attempt.
+        if arb_sets > 0 and held_legs:
+            arb_sets = min(arb_sets, min(float(holding.shares) for _s, holding in held_legs))
 
         # Group-level guaranteed-profit re-verification against REAL fills.
         # EventSumStrategy's own scan-time edge check (sum of lastTradePrice
@@ -655,11 +573,7 @@ class SequentialTradingPipeline:
                 if filled > 0:
                     per_leg_unit_cost[tid] = float(signal.bet_amount_usd) / filled
 
-            held_unit_costs = [
-                float(getattr(held_tokens[self._leg_token_id(s)], "initial_price", 0.0))
-                for s in held_signals
-                if self._leg_token_id(s) in held_tokens
-            ]
+            held_unit_costs = [float(holding.entry_price) for _s, holding in held_legs]
 
             guaranteed_payout = arb_sets * 1.0
             guaranteed_cost = (
@@ -777,14 +691,6 @@ class SequentialTradingPipeline:
             "total_cost": round(total_cost, 4),
         })
 
-        # We now hold at least part of this group's position - don't
-        # rediscover and re-buy it on a future scan (see
-        # _filled_arb_groups' definition in __init__). Gated on at least
-        # one real fill: a group where every leg got zero fills holds
-        # nothing and should stay eligible for a genuine future attempt.
-        if executed_legs > 0:
-            self._filled_arb_groups.add(group_id)
-
     async def _stage_hunt(self):
         """Run market discovery off the event loop.
 
@@ -816,48 +722,11 @@ class SequentialTradingPipeline:
         # unconditionally, before any evaluation begins, replaces all of them.
         self.hunter.add_to_cooldown(token_id)
 
-        # Dry-run/paper-trade equivalent of the real-portfolio check below -
-        # see _simulated_positions' definition in __init__. Neither mode
-        # submits a real order, so the real-portfolio check has nothing to
-        # catch; this is the session-level backstop for those modes.
-        if token_id in self._simulated_positions:
-            self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_held_simulated"})
-            return None
-
-        # Prevent buying a market already in the portfolio. A NO-side paper
-        # fill is recorded under the NO token's own id, not this market's
-        # YES-canonical token_id used above for hunting/evaluation -- see
-        # MarketRef.token_for() in trading/venue.py: a NO buy is
-        # held under no_token_id.
-        # Matching only token_id here meant this check silently never fired
-        # for any NO-side holding (confirmed in production: every held
-        # position was a NO-side paper fill, so the restart-proof check
-        # never caught any of them -- only the in-memory
-        # _simulated_positions backstop above did, which resets to empty on
-        # every process restart while the real paper positions persist to
-        # disk, so a restart let every held position get re-bought). Also
-        # matching no_market_id closes that gap.
-        no_token_id = str(getattr(market, "no_market_id", "") or "")
-        if hasattr(self.bridge, "current_portfolio") and self.bridge.current_portfolio:
-            for position in self.bridge.current_portfolio:
-                pos_token = str(getattr(position, "asset_id", getattr(position, "token_id", "")))
-                if pos_token == token_id or (no_token_id and pos_token == no_token_id):
-                    self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_owned_in_portfolio"})
-                    return None
-
-        # Post-exit cooldown (see PortfolioManager.__init__/_exit_position):
-        # a loss-type exit (EV-CONVERGENCE, WANG-EDGE-DECAY, STOP-LOSS) blocks
-        # re-entry on that token for a while, to stop the buy/exit/re-buy
-        # churn an oscillating EV estimate can otherwise cause. A closed
-        # NO-side position is recorded under no_market_id, not this market's
-        # YES-canonical token_id -- same dual check as already_owned above.
-        cooldown_until = self.portfolio_manager.exit_cooldown_until(token_id)
-        if cooldown_until is None and no_token_id:
-            cooldown_until = self.portfolio_manager.exit_cooldown_until(no_token_id)
-        if cooldown_until is not None:
-            self.log_func("SCAN-SKIP", asset_type, token_id, {
-                "reason": "exit_cooldown", "until": str(cooldown_until),
-            })
+        # Already held (YES or NO side, per the Ledger) or inside the
+        # post-exit cooldown: see trading/gate.py.
+        decision = self.gate.can_enter(market)
+        if isinstance(decision, Skip):
+            self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": decision.reason, **decision.detail})
             return None
 
         self.bridge.status = f"Scanning {asset_type}: {question[:60]}..."
@@ -1211,18 +1080,6 @@ class SequentialTradingPipeline:
             self._set_spend(self.spent_today)
             if not self.executor.dry_run:
                 self._set_cash(max(0.0, float(self.bridge.current_balance) - float(approved_bet)))
-
-            # Record the simulated fill so _stage_evaluate_ev's
-            # already_held_simulated check can catch it next cycle - see
-            # _simulated_positions' definition in __init__. token_id (the
-            # market's canonical YES id, which is what _stage_evaluate_ev
-            # always keys its lookup on) is always added; the NO token is
-            # added too on a NO-side trade, in case anything else keys off it.
-            self._simulated_positions.add(candidate.token_id)
-            if candidate.side == "NO" and hasattr(candidate.market, "no_market_id"):
-                no_token = str(candidate.market.no_market_id or "")
-                if no_token:
-                    self._simulated_positions.add(no_token)
 
             total_equity = self._total_equity()
 
