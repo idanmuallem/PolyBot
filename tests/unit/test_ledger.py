@@ -227,3 +227,51 @@ def test_transactions_respect_the_limit(ledger):
         _enter(ledger, token_id=f"t{i}", condition_id=f"c{i}")
 
     assert [t["token_id"] for t in ledger.transactions(limit=2)] == ["t2", "t1"]
+
+
+def test_arbitrage_leg_and_its_closes_carry_the_group_id(ledger):
+    _enter(ledger, token_id="legA", strategy="arbitrage", shares=5.0, price=0.30,
+           group_id="event_sum:evt1")
+
+    assert ledger.holding("legA").group_id == "event_sum:evt1"
+
+    ledger.record_exit(token_id="legA", shares=2.0, price=0.31, reason="ARBITRAGE-TRIM", venue="paper")
+    ledger.record_resolution(token_id="legA", shares=3.0, payout_price=1.0, venue="paper")
+
+    rows = ledger.transactions()
+    assert [r["kind"] for r in rows] == ["RESOLVED", "SELL", "BUY"]
+    assert {r["group_id"] for r in rows} == {"event_sum:evt1"}
+    assert {r["strategy"] for r in rows} == {"arbitrage"}
+
+
+def test_ledger_opens_a_database_created_before_group_id_existed(tmp_path):
+    import sqlite3
+
+    db = str(tmp_path / "old.db")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE positions (id INTEGER PRIMARY KEY AUTOINCREMENT, venue TEXT NOT NULL, "
+            "strategy TEXT NOT NULL, token_id TEXT NOT NULL, condition_id TEXT, side TEXT, "
+            "asset_type TEXT, market_name TEXT, shares REAL NOT NULL, entry_price REAL NOT NULL, "
+            "pre_prob REAL, post_prob REAL, wang_edge REAL, opened_at TEXT NOT NULL, closed_at TEXT, "
+            "status TEXT NOT NULL DEFAULT 'open', realized_pnl REAL NOT NULL DEFAULT 0.0)"
+        )
+        conn.execute(
+            "CREATE TABLE trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, "
+            "venue TEXT NOT NULL, strategy TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT, "
+            "position_id INTEGER, token_id TEXT NOT NULL, condition_id TEXT, side TEXT, "
+            "market_name TEXT, shares REAL NOT NULL, price REAL, amount_usd REAL, entry_price REAL, "
+            "realized_pnl REAL, confirmed INTEGER NOT NULL DEFAULT 1)"
+        )
+
+    upgraded = Ledger(db)
+    _enter(upgraded, token_id="legA", strategy="arbitrage", group_id="g1")
+
+    assert upgraded.holding("legA").group_id == "g1"
+
+
+def test_model_entry_has_no_group_id(ledger):
+    _enter(ledger)
+
+    assert ledger.holding("tok_yes").group_id is None
+    assert ledger.transactions()[0]["group_id"] is None

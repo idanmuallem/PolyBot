@@ -603,6 +603,7 @@ _SELL_REASON_LABELS = {
     "TAKE-PROFIT": "SELL (Take-Profit)", "STOP-LOSS": "SELL (Stop-Loss)",
     "WANG-EDGE-DECAY": "SELL (Edge Decay)", "EV-CONVERGENCE": "SELL (EV Converged)",
     "PORTFOLIO-CULL": "SELL (Cull)", "OPPORTUNITY-SWAP": "SELL (Swap)",
+    "ARBITRAGE-TRIM": "SELL (Arb Trim)", "ARBITRAGE-UNWIND": "SELL (Arb Unwind)",
 }
 
 _TRANSACTIONS_COLUMNS = [

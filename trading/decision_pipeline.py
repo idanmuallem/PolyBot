@@ -594,6 +594,16 @@ class SequentialTradingPipeline:
         fills: dict = dict(result.get("fills") or {})
         arb_sets = float(result.get("arb_sets", 0.0) or 0.0)
 
+        # Every share that filled is a real entry, whatever happens to the
+        # basket below (kept, trimmed or unwound): record each leg's fill
+        # in the Ledger now, and each sale back as it happens.
+        for signal in missing_signals:
+            self._record_arbitrage_entry(signal, group_id, float(fills.get(self._leg_token_id(signal), 0.0)))
+
+        def _sell_back(signal, tid, shares, reason):
+            if self.executor.sell_position(tid, shares, signal.price, tagged_log):
+                self._record_arbitrage_sale(signal, tid, shares, reason)
+
         # Cap the guaranteed-set size by the ALREADY-HELD legs' real share
         # counts too, not just this attempt's fills. A top-up buy is sized
         # to the same fixed trade_size_usd as any other leg, so it can land
@@ -673,7 +683,7 @@ class SequentialTradingPipeline:
                     tid = self._leg_token_id(signal)
                     filled = fills.get(tid, 0.0)
                     if filled > 0:
-                        self.executor.sell_position(tid, filled, signal.price, tagged_log)
+                        _sell_back(signal, tid, filled, "ARBITRAGE-UNWIND")
                         self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
                 self.spent_today = float(self.budget_manager.total_spent_today)
                 self._set_spend(self.spent_today)
@@ -713,7 +723,7 @@ class SequentialTradingPipeline:
             filled = fills.get(tid, 0.0)
             excess = round(filled - arb_sets, 4)
             if excess > 0:
-                self.executor.sell_position(tid, excess, signal.price, tagged_log)
+                _sell_back(signal, tid, excess, "ARBITRAGE-UNWIND" if arb_sets <= 0 else "ARBITRAGE-TRIM")
                 if arb_sets <= 0:
                     unwound_incomplete_group = True
                     self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
@@ -1126,13 +1136,44 @@ class SequentialTradingPipeline:
             side=side,
             shares=shares,
             price=price,
-            venue="paper" if getattr(self.executor, "dry_run", True) else "live",
+            venue=self._ledger_venue(),
             strategy="crypto",
             asset_type=candidate.asset_type,
             market_name=candidate.question,
             pre_prob=float(candidate.pre_prob),
             post_prob=float(candidate.post_prob),
             wang_edge=candidate.wang_edge,
+        )
+
+    def _ledger_venue(self) -> str:
+        return "paper" if getattr(self.executor, "dry_run", True) else "live"
+
+    def _record_arbitrage_entry(self, signal, group_id: str, filled_shares: float) -> None:
+        """Record one arbitrage leg fill in the Ledger, tagged with its
+        basket's group_id. Entry price is the leg's limit price."""
+        if self.ledger is None or filled_shares <= 0:
+            return
+        self.ledger.record_entry(
+            token_id=self._leg_token_id(signal),
+            condition_id=getattr(signal.market, "condition_id", None),
+            side=signal.side,
+            shares=filled_shares,
+            price=float(signal.price),
+            venue=self._ledger_venue(),
+            strategy="arbitrage",
+            asset_type=signal.market.asset_type,
+            market_name=signal.market.market_name,
+            group_id=group_id,
+        )
+
+    def _record_arbitrage_sale(self, signal, token_id: str, shares: float, reason: str) -> None:
+        """Record a confirmed trim / unwind sale of an arbitrage leg."""
+        if self.ledger is None:
+            return
+        self.ledger.record_exit(
+            token_id=token_id, shares=float(shares), price=float(signal.price), reason=reason,
+            venue=self._ledger_venue(), strategy="arbitrage", side=signal.side,
+            market_name=signal.market.market_name,
         )
 
     def _record_paper_resolution(self, resolved: dict) -> None:

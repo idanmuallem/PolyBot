@@ -43,6 +43,7 @@ _SCHEMA = (
         pre_prob      REAL,
         post_prob     REAL,
         wang_edge     REAL,
+        group_id      TEXT,
         opened_at     TEXT NOT NULL,
         closed_at     TEXT,
         status        TEXT NOT NULL DEFAULT 'open',
@@ -69,9 +70,17 @@ _SCHEMA = (
         amount_usd    REAL,
         entry_price   REAL,
         realized_pnl  REAL,
-        confirmed     INTEGER NOT NULL DEFAULT 1
+        confirmed     INTEGER NOT NULL DEFAULT 1,
+        group_id      TEXT
     )
     """,
+)
+
+# Columns added after a table first shipped: (table, column, type). Added by
+# init_schema to databases created before them.
+_ADDED_COLUMNS = (
+    ("positions", "group_id", "TEXT"),
+    ("trades", "group_id", "TEXT"),
 )
 
 
@@ -91,6 +100,7 @@ class Holding:
     post_prob: Optional[float]
     wang_edge: Optional[float]
     opened_at: str
+    group_id: Optional[str] = None  # arbitrage basket the leg belongs to
 
 
 def _now() -> str:
@@ -120,25 +130,28 @@ class Ledger:
         price: float, venue: str, strategy: str, asset_type: Optional[str] = None,
         market_name: Optional[str] = None, pre_prob: Optional[float] = None,
         post_prob: Optional[float] = None, wang_edge: Optional[float] = None,
+        group_id: Optional[str] = None,
     ) -> int:
-        """Record an entry fill. Returns the position id."""
+        """Record an entry fill. Returns the position id. group_id ties an
+        arbitrage leg to its basket; the position's later sales and its
+        resolution inherit it."""
         ts = _now()
         side = str(side or "").upper() or None
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO positions (venue, strategy, token_id, condition_id, side, asset_type, "
-                "market_name, shares, entry_price, pre_prob, post_prob, wang_edge, opened_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "market_name, shares, entry_price, pre_prob, post_prob, wang_edge, group_id, opened_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (venue, strategy, str(token_id), condition_id, side, asset_type, market_name,
-                 float(shares), float(price), pre_prob, post_prob, wang_edge, ts),
+                 float(shares), float(price), pre_prob, post_prob, wang_edge, group_id, ts),
             )
             position_id = int(cur.lastrowid)
             conn.execute(
                 "INSERT INTO trades (timestamp, venue, strategy, kind, position_id, token_id, "
-                "condition_id, side, market_name, shares, price, amount_usd, entry_price) "
-                "VALUES (?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "condition_id, side, market_name, shares, price, amount_usd, entry_price, group_id) "
+                "VALUES (?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (ts, venue, strategy, position_id, str(token_id), condition_id, side, market_name,
-                 float(shares), float(price), float(shares) * float(price), float(price)),
+                 float(shares), float(price), float(shares) * float(price), float(price), group_id),
             )
         return position_id
 
@@ -195,9 +208,11 @@ class Ledger:
 
             position_id = None
             condition_id = None
+            group_id = None
             if row is not None:
                 position_id = int(row["id"])
                 condition_id = row["condition_id"]
+                group_id = row["group_id"]
                 entry_price = float(row["entry_price"])
                 side = row["side"]
                 strategy = row["strategy"]
@@ -225,13 +240,14 @@ class Ledger:
             cur = conn.execute(
                 "INSERT INTO trades (timestamp, venue, strategy, kind, reason, position_id, token_id, "
                 "condition_id, side, market_name, shares, price, amount_usd, entry_price, "
-                "realized_pnl, confirmed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "realized_pnl, confirmed, group_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (ts, venue, strategy or "crypto", kind, reason, position_id, str(token_id),
                  condition_id, (str(side).upper() if side else None), market_name, shares,
                  (float(price) if price is not None else None),
                  (float(price) * shares if price is not None else None),
                  (float(entry_price) if entry_price is not None else None),
-                 realized, int(bool(confirmed))),
+                 realized, int(bool(confirmed)), group_id),
             )
             return int(cur.lastrowid)
 
@@ -369,6 +385,7 @@ class Ledger:
                 "side": r["side"], "market_name": r["market_name"], "price": r["price"],
                 "shares": r["shares"], "amount_usd": r["amount_usd"],
                 "pnl_per_share": pnl_per_share, "confirmed": bool(r["confirmed"]),
+                "group_id": r["group_id"],
             })
         return out
 
@@ -387,6 +404,10 @@ def init_schema(conn) -> None:
     ui.data_manager.init_db so both processes see the same schema."""
     for statement in _SCHEMA:
         conn.execute(statement)
+    for table, column, col_type in _ADDED_COLUMNS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
 
 def _holding(row) -> Holding:
@@ -395,5 +416,5 @@ def _holding(row) -> Holding:
         shares=float(row["shares"]), entry_price=float(row["entry_price"]),
         venue=row["venue"], strategy=row["strategy"], asset_type=row["asset_type"],
         market_name=row["market_name"], pre_prob=row["pre_prob"], post_prob=row["post_prob"],
-        wang_edge=row["wang_edge"], opened_at=row["opened_at"],
+        wang_edge=row["wang_edge"], opened_at=row["opened_at"], group_id=row["group_id"],
     )
