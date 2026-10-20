@@ -403,8 +403,8 @@ def _render_dashboard_snapshot(view_name: str):
                 bridge.current_balance = float(live_balance)
                 bridge.balance_connection_error = not live_balance_ok
         # else: dry-run/paper mode. Don't touch bridge.current_balance here —
-        # the paper pipeline keeps it in sync with the paper engine's actual
-        # cash via _set_cash() in decision_pipeline.py. Overwriting it with
+        # the engine's Account (trading/account.py) publishes the paper
+        # engine's actual cash via engine_status. Overwriting it with
         # the real wallet balance was causing the Cash figure to flicker
         # between the two. Also skip the live-balance fetch entirely: it's
         # never used while in dry-run, so there's no reason to keep hitting

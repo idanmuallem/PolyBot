@@ -18,7 +18,6 @@ from hunters.crypto import CryptoHunter
 from core.polymarket_client import PolymarketClient
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
-from trading.decision_pipeline import sync_live_account_state
 from tests.venue_harness import open_book_venue
 from trading.executor import TradeExecutor
 from trading.risk_manager import PortfolioManager
@@ -35,7 +34,6 @@ def _wire_ctx(ctx: WalletContext, log_func) -> None:
         bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
         hunter=ctx.scanner, db_path=ctx.db_path,
     )
-    sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
     ctx.budget_manager = BudgetManager(
         bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
     )
@@ -77,7 +75,6 @@ async def test_single_pipeline_loop_dry_run(tmp_path):
     bridge.current_balance = 100.0
     bridge.current_portfolio = []
     bridge.open_position_value = 0.0
-    bridge.open_positions_value = 0.0
     bridge.live_trading = False
 
     # 29 days from now: standard_bs model; price=0.35 gives EV > 0.30
@@ -195,7 +192,6 @@ async def test_full_pipeline_loop_dry_run_wang_mode(tmp_path):
     bridge.current_balance = 100.0
     bridge.current_portfolio = []
     bridge.open_position_value = 0.0
-    bridge.open_positions_value = 0.0
     bridge.live_trading = False
 
     # Real (unmocked) brain: spot=93,000 well below strike=95,000 -> a low

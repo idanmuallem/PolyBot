@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from trading.risk_manager import PortfolioManager
     from trading.budget_manager import BudgetManager
     from trading.ledger import Ledger
+    from trading.account import Account
 
 
 @dataclass
@@ -41,8 +42,6 @@ class WalletContext:
     bridge: DataBridge                # this wallet's live state
     db_path: str                      # path to this wallet's SQLite DB (e.g. "data/wallet_alpha/trades.db")
     status: str = "idle"              # "running" | "stopped" | "error"
-    drawdown_paused: bool = False     # set by the drawdown circuit breaker: True pauses new trade entry,
-                                       # but position management/exits keep running (see decision_pipeline.py)
 
     # Runtime components — built by the caller and carried here so they
     # travel with the wallet. WalletContext never constructs these itself.
@@ -51,3 +50,4 @@ class WalletContext:
     portfolio_manager: Optional["PortfolioManager"] = None
     budget_manager: Optional["BudgetManager"] = None
     ledger: Optional["Ledger"] = None  # typed trades/positions record (trading/ledger.py)
+    account: Optional["Account"] = None  # cash, equity, drawdown breaker (trading/account.py)

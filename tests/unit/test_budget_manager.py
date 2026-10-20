@@ -60,14 +60,7 @@ def test_record_trade_increments_spent():
     mgr, bridge = _make_manager(initial_balance=50.0)
     mgr.record_trade(2.5)
     assert mgr.total_spent_today == 2.5
-    assert bridge.daily_spend == 2.5
-
-
-def test_record_trade_decrements_bridge_balance():
-    mgr, bridge = _make_manager(initial_balance=50.0)
-    mgr.record_trade(2.5)
-    # _sync_bridge sets current_balance = max(base_balance - spent, 0)
-    assert bridge.current_balance == 47.5
+    assert bridge.spent_today == 2.5
 
 
 def test_watch_only_when_below_minimum():

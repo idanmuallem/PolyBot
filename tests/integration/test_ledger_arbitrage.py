@@ -33,7 +33,7 @@ _ARBITRAGE = SimpleNamespace(strategy_type="arbitrage")
 
 
 def _make_pipeline(db_path, balance=100.0):
-    from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
+    from trading.decision_pipeline import SequentialTradingPipeline
 
     dm.init_db(db_path)
     bridge = DataBridge()
@@ -57,7 +57,6 @@ def _make_pipeline(db_path, balance=100.0):
             bridge=bridge, executor=ctx.executor, config=config,
             hunter=ctx.scanner, db_path=db_path, ledger=ctx.ledger,
         )
-        sync_live_account_state(bridge, ctx.executor, ctx.portfolio_manager, log_func)
         ctx.budget_manager = BudgetManager(bridge=bridge, config=config, initial_balance=balance)
         pipeline = SequentialTradingPipeline(ctx=ctx, log_func=log_func, delay=0.01)
     return pipeline, ctx

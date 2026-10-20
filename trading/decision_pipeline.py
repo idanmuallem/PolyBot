@@ -19,6 +19,7 @@ from brains.base import calculate_tte
 from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
 from core.polymarket_client import PolymarketClient
+from trading.account import Account
 from trading.gate import Gate, Skip
 from trading.strategies import EventSumStrategy, Strategy
 from trading.venue import MarketRef, normalize_side
@@ -36,27 +37,6 @@ from ui import data_manager
 # EventSumStrategy's own scan-time min_edge default, so the execution-time
 # floor doesn't contradict the strategy's own notion of "worth trying."
 _MIN_ARBITRAGE_MARGIN = 0.02
-
-
-def sync_live_account_state(bridge, executor, portfolio_manager, log_func):
-    """Refresh live positions and collateral balance into bridge state.
-
-    Free function (not a pipeline method) so it can run before a
-    SequentialTradingPipeline exists — e.g. by a caller wiring up
-    WalletContext components, which needs a live balance to construct
-    BudgetManager with an accurate initial_balance.
-    """
-    try:
-        portfolio_manager._refresh_portfolio()
-    except Exception as exc:
-        log_func("SYNC-WARN", "Pipeline", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
-
-    try:
-        balance = float(executor.get_balance())
-        bridge.current_balance = balance
-        bridge.cash = balance
-    except Exception as exc:
-        log_func("SYNC-WARN", "Pipeline", "balance", {"reason": "balance_fetch_failed", "error": str(exc)})
 
 
 @dataclass
@@ -153,9 +133,23 @@ class SequentialTradingPipeline:
             venue=self._ledger_venue,
         )
 
-        sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
+        # The single writer of cash, equity and the drawdown breaker. Built
+        # by build_wallet_runtime; a hand-assembled context gets one here.
+        if getattr(ctx, "account", None) is None:
+            ctx.account = Account(
+                venue=lambda: self.executor.venue,
+                bridge=self.bridge,
+                ledger=self.ledger,
+                max_drawdown_pct=float(getattr(self.config, "max_drawdown_pct", 0.20)),
+                log_func=log_func,
+            )
+        self.account = ctx.account
+        if getattr(self.portfolio_manager, "account", None) is None:
+            self.portfolio_manager.account = self.account
+
+        self._sync_account()
         if float(getattr(self.bridge, "starting_balance", 0.0) or 0.0) <= 0.0:
-            self.bridge.starting_balance = float(self.bridge.current_balance)
+            self.bridge.starting_balance = self.account.cash
 
         self.budget_manager = ctx.budget_manager
 
@@ -163,69 +157,21 @@ class SequentialTradingPipeline:
         self.spend_day = datetime.now(timezone.utc).date()
         self.start_of_day_equity = float(getattr(self.bridge, "start_of_day_equity", 0.0) or 0.0)
 
-        # Drawdown circuit breaker — pauses new trade entry (not exits) once
-        # equity has fallen more than max_drawdown_pct from its peak.
-        self.max_drawdown_pct = float(getattr(self.config, "max_drawdown_pct", 0.20))
-        self.peak_equity = self._total_equity()
-        self._update_drawdown_guard()
-
     # ------------------------------------------------------------------
     # Bridge helpers — keep related fields in sync
     # ------------------------------------------------------------------
 
-    def _set_cash(self, amount: float):
-        self.bridge.current_balance = float(amount)
-        self.bridge.cash = float(amount)
-
     def _set_spend(self, amount: float):
         self.bridge.spent_today = float(amount)
-        self.bridge.daily_spend = float(amount)
 
-    def _total_equity(self) -> float:
-        return float(self.bridge.current_balance) + float(self.bridge.open_position_value)
-
-    def _update_drawdown_guard(self):
-        """Drawdown circuit breaker: pause new trade entry (not position
-        management/exits) once equity has fallen more than max_drawdown_pct
-        from its peak. Call every loop tick, after balances/positions are synced.
-
-        The peak-tracking/threshold pattern mirrors oracle3's
-        StandardRiskManager._check_drawdown() (oracle3/risk/risk_manager.py) -
-        https://github.com/YichengYang-Ethan/oracle3, licensed under the
-        Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
-        """
-        current_equity = self._total_equity()
-        if current_equity > self.peak_equity:
-            self.peak_equity = current_equity
-
-        drawdown_pct = (
-            (self.peak_equity - current_equity) / self.peak_equity
-            if self.peak_equity > 0 else 0.0
-        )
-        should_pause = drawdown_pct >= self.max_drawdown_pct
-
-        was_paused = bool(getattr(self.ctx, "drawdown_paused", False))
-        self.ctx.drawdown_paused = should_pause
-        self.bridge.drawdown_paused = should_pause
-        self.bridge.peak_equity = self.peak_equity
-        self.bridge.current_drawdown_pct = drawdown_pct
-
-        if should_pause and not was_paused:
-            self.log_func("CIRCUIT-BREAKER", "Pipeline", "drawdown", {
-                "reason": "max_drawdown_pct breached — new trade entry paused; "
-                          "position management/exits still run",
-                "peak_equity": round(self.peak_equity, 4),
-                "current_equity": round(current_equity, 4),
-                "drawdown_pct": round(drawdown_pct, 4),
-                "max_drawdown_pct": self.max_drawdown_pct,
-            })
-        elif was_paused and not should_pause:
-            self.log_func("CIRCUIT-BREAKER-CLEAR", "Pipeline", "drawdown", {
-                "reason": "equity recovered above max_drawdown_pct — new trade entry resumed",
-                "peak_equity": round(self.peak_equity, 4),
-                "current_equity": round(current_equity, 4),
-                "drawdown_pct": round(drawdown_pct, 4),
-            })
+    def _sync_account(self):
+        """Refresh the positions list risk works from, then the Account
+        (cash, equity, drawdown breaker) from the active Venue."""
+        try:
+            self.portfolio_manager._refresh_portfolio()
+        except Exception as exc:
+            self.log_func("SYNC-WARN", "Pipeline", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
+        self.account.refresh()
 
     def _reject(self, level: str, candidate: CandidateTrade, payload: dict):
         """Log a rejection, cool down the market, and signal the pipeline to skip."""
@@ -433,7 +379,7 @@ class SequentialTradingPipeline:
             return
 
         total_cost = sum(float(s.bet_amount_usd) for s in missing_signals)
-        cash_balance = float(self.bridge.current_balance)
+        cash_balance = self.account.cash
         remaining_budget = float(self.budget_manager.get_remaining_budget("arbitrage"))
 
         # Distinct reject reasons (Point 5): "can't afford it" (wallet cash)
@@ -880,14 +826,14 @@ class SequentialTradingPipeline:
         )
 
     def _stage_risk_and_budget(self, candidate: CandidateTrade):
-        cash_balance = float(self.bridge.current_balance)
+        cash_balance = self.account.cash
 
         if cash_balance < self.safe_minimum:
             self.bridge.status = "Portfolio Management Mode (cash below $1.00)"
             self.log_func("PORTFOLIO-MODE", "Pipeline", "cash_guard", {
                 "reason": "insufficient_cash_for_new_entries",
                 "cash": round(cash_balance, 4),
-                "open_positions_value": round(float(self.bridge.open_position_value), 4),
+                "open_positions_value": round(self.account.snapshot().open_position_value, 4),
                 "minimum_required_cash": round(self.safe_minimum, 4),
             })
             return 0.0, None
@@ -952,11 +898,11 @@ class SequentialTradingPipeline:
             if available_cash < desired_bet:
                 try:
                     self.portfolio_manager.free_up_capital(desired_bet, self.log_func)
-                    available_cash = float(self.bridge.current_balance)
                 except Exception as exc:
                     print(f"[PIPELINE] free_up_capital failed: {exc}")
 
-            self._set_cash(available_cash)
+            # What the sales actually freed, as the Venue reports it.
+            available_cash = self.account.refresh().cash
 
         approved_bet = min(desired_bet, budget_bet, available_cash)
         if approved_bet < self.safe_minimum:
@@ -1075,10 +1021,7 @@ class SequentialTradingPipeline:
             self.budget_manager.record_trade(float(approved_bet), strategy_tag="crypto")
             self.spent_today = float(self.budget_manager.total_spent_today)
             self._set_spend(self.spent_today)
-            if not self.executor.dry_run:
-                self._set_cash(max(0.0, float(self.bridge.current_balance) - float(approved_bet)))
-
-            total_equity = self._total_equity()
+            total_equity = self.account.refresh().equity
 
             self.log_func("TRACK", candidate.asset_type, candidate.token_id, {
                 "market_name": candidate.question,
@@ -1158,10 +1101,10 @@ class SequentialTradingPipeline:
             requested_live = data_manager.read_live_trading_requested(self.db_path)
             self.executor.dry_run = not requested_live
 
-            sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
+            self._sync_account()
             self.portfolio_manager.manage_portfolio(self.log_func)  # exits always run, even while paused
-            sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
-            self._update_drawdown_guard()
+            self._sync_account()
+            account = self.account.snapshot()
 
             # Flush this tick's live state to the DB for the dashboard
             # process to read — every iteration, unconditionally, before any
@@ -1171,10 +1114,10 @@ class SequentialTradingPipeline:
             # tables and run_engine.py.
             data_manager.write_engine_status(
                 db_path=self.db_path,
-                balance=float(self.bridge.current_balance),
+                balance=account.cash,
                 starting_balance=float(self.bridge.starting_balance),
-                position_value=float(self.bridge.open_position_value),
-                unrealized_pnl=float(getattr(self.bridge, "unrealized_pnl", 0.0) or 0.0),
+                position_value=account.open_position_value,
+                unrealized_pnl=account.unrealized_pnl,
                 watch_only=bool(getattr(self.bridge, "watch_only", False)),
             )
             data_manager.write_open_positions(
@@ -1183,7 +1126,7 @@ class SequentialTradingPipeline:
                 position_analytics=dict(getattr(self.bridge, "position_analytics", None) or {}),
             )
 
-            if self.ctx.drawdown_paused:
+            if account.drawdown_paused:
                 continue  # circuit breaker: skip new-entry scanning/execution below
 
             await self._stage_strategy_scan()

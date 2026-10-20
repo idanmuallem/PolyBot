@@ -20,13 +20,12 @@ from trading.risk_manager import PortfolioManager
 
 
 def _make_pipeline(config=None, balance=100.0, ledger=None):
-    from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
+    from trading.decision_pipeline import SequentialTradingPipeline
 
     bridge = DataBridge()
     bridge.current_balance = balance
     bridge.current_portfolio = []
     bridge.open_position_value = 0.0
-    bridge.open_positions_value = 0.0
 
     if config is None:
         # pricing_mode="legacy": these tests exercise generic pipeline
@@ -48,13 +47,12 @@ def _make_pipeline(config=None, balance=100.0, ledger=None):
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
-        ctx.executor = TradeExecutor(config=ctx.config, venue=open_book_venue())
+        ctx.executor = TradeExecutor(config=ctx.config, venue=open_book_venue(cash=balance))
         ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
             hunter=ctx.scanner, db_path=ctx.db_path,
         )
-        sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
         ctx.budget_manager = BudgetManager(
             bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
         )

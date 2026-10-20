@@ -105,7 +105,7 @@ class TradeExecutor:
 
     def sell_position(self, token_id: str, shares: float, price: float, log_func: Callable) -> bool:
         """Sell an existing position on the active venue. True only if the
-        sale landed: PortfolioManager._exit_position() credits cash on True,
+        sale landed: PortfolioManager._exit_position() records the sale on True,
         so a sale that kept failing used to be "sold" every tick (6a06f35)."""
         try:
             return bool(self.venue.sell(token_id, shares, price=price, log_func=log_func))

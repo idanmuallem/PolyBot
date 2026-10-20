@@ -9,7 +9,8 @@ from trading.correlation import CorrelationTracker
 
 
 class PortfolioManager:
-    def __init__(self, bridge, executor, config, hunter=None, db_path: Optional[str] = None, ledger=None):
+    def __init__(self, bridge, executor, config, hunter=None, db_path: Optional[str] = None, ledger=None,
+                 account=None):
         self.bridge = bridge
         self.executor = executor
         self.hunter = hunter
@@ -17,6 +18,10 @@ class PortfolioManager:
         # Ledger (trading/ledger.py): every confirmed sale and expiry made
         # here is recorded in it exactly once. None = not recording.
         self.ledger = ledger
+        # Account (trading/account.py): the single source of cash. Sales
+        # here never adjust cash themselves; free_up_capital re-reads it
+        # after each sale. None (a bare test context) reads the Venue.
+        self.account = account
         self.take_profit_pct = float(config.take_profit_pct)
         self.stop_loss_pct = float(config.stop_loss_pct)
         self.min_hold_ev = float(config.min_hold_ev)
@@ -69,17 +74,9 @@ class PortfolioManager:
 
     def _refresh_portfolio(self):
         positions = self.executor.get_open_positions()
+        # The positions list risk works from. Their value, unrealized P&L
+        # and cash are the Account's (trading/account.py).
         self.bridge.current_portfolio = positions
-        total_open_value = sum(float(getattr(p, "value", 0.0) or 0.0) for p in positions)
-        self.bridge.open_position_value = float(total_open_value)
-        self.bridge.open_positions_value = float(total_open_value)
-        # Unrealized only: Ledger entry prices marked to the venue's current
-        # prices (Ledger.unrealized_pnl, the one place it is computed). The
-        # engine publishes it via engine_status; the dashboard's Portfolio
-        # view shows that number rather than recomputing it. The top-level
-        # "Total PnL" KPI uses Balance - Total Deposits instead.
-        self.bridge.unrealized_pnl = self._unrealized_pnl(positions)
-
         # Paper tracking mark-to-market snapshot (Phase 3)
         if getattr(self.executor, "dry_run", True):
             now = time.time()
@@ -89,20 +86,6 @@ class PortfolioManager:
                 if self.db_path:
                     data_manager.insert_paper_snapshot(self.db_path, cash, positions_value)
                 self._last_snapshot_at = now
-
-    def _unrealized_pnl(self, positions) -> float:
-        if self.ledger is None:
-            return 0.0
-        marks = {
-            str(self._position_field(p, "token_id", "") or ""):
-                float(self._position_field(p, "current_price", 0.0) or 0.0)
-            for p in positions
-        }
-        try:
-            return float(self.ledger.unrealized_pnl(marks, venue=self._venue()))
-        except Exception as exc:
-            print(f"[PORTFOLIO] Unrealized P&L unavailable: {exc}")
-            return 0.0
 
     @staticmethod
     def _position_field(position, field_name, default=None):
@@ -257,10 +240,10 @@ class PortfolioManager:
             return float(live_ev)
         return float(getattr(position, "pnl_ratio", 0.0) or 0.0)
 
-    def _apply_sale_to_bridge(self, position_value: float):
-        updated_cash = float(self.bridge.current_balance) + max(0.0, float(position_value))
-        self.bridge.current_balance = float(updated_cash)
-        self.bridge.cash = float(updated_cash)
+    def _cash(self) -> float:
+        if self.account is not None:
+            return self.account.refresh().cash
+        return float(self.executor.get_balance())
 
     def _prune_exit_cooldowns(self):
         """Drop expired entries so this dict doesn't grow unbounded -- same
@@ -312,7 +295,6 @@ class PortfolioManager:
                 gave_up = attempts >= self.MAX_EXIT_ATTEMPTS
 
         if sold:
-            self._apply_sale_to_bridge(position_value)
             self._record_sale(position, level)
             # See __init__ for why TAKE-PROFIT is excluded: a profitable exit
             # means the model was right about this market, so re-entering it
@@ -444,7 +426,7 @@ class PortfolioManager:
         """Sell weakest positions (by PnL) until required_amount of cash is available."""
         self._refresh_portfolio()
 
-        if float(self.bridge.current_balance) >= float(required_amount):
+        if self._cash() >= float(required_amount):
             return True
 
         weakest_first = sorted(
@@ -462,21 +444,21 @@ class PortfolioManager:
             if not sold:
                 continue
 
-            self._apply_sale_to_bridge(position_value)
             self._record_sale(position, "OPPORTUNITY-SWAP")
+            cash = self._cash()
             log_func("OPPORTUNITY-SWAP", "Portfolio", token_id, {
                 "message": f"Liquidated {token_id} to free capital for high-EV trade.",
                 "freed_value": round(position_value, 4),
                 "required_amount": round(float(required_amount), 4),
-                "current_balance": round(float(self.bridge.current_balance), 4),
+                "current_balance": round(cash, 4),
             })
 
-            if float(self.bridge.current_balance) >= float(required_amount):
+            if cash >= float(required_amount):
                 self._refresh_portfolio()
                 return True
 
         self._refresh_portfolio()
-        return float(self.bridge.current_balance) >= float(required_amount)
+        return self._cash() >= float(required_amount)
 
     def _update_position_analytics(self, position, wang_result: Optional[dict]) -> None:
         """Stash per-position analytics on the bridge for the dashboard —

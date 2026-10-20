@@ -17,7 +17,6 @@ def _make_pm(take_profit=0.20, stop_loss=-0.50, min_hold_ev=-0.10, ledger=None):
     bridge.current_balance = 50.0
     bridge.current_portfolio = []
     bridge.open_position_value = 0.0
-    bridge.open_positions_value = 0.0
     bridge.unrealized_pnl = 0.0
     config = TradingConfig(
         take_profit_pct=take_profit,
@@ -451,23 +450,6 @@ def test_correlation_exposure_zero_with_no_open_positions():
     pm._refresh_portfolio()
 
     assert pm.correlation_exposure_for("Crypto::BTCUSDT") == 0.0
-
-
-# ── Unrealized P&L (one computation, Ledger.unrealized_pnl) ──────────────────
-
-def test_unrealized_pnl_marks_ledger_entries_to_venue_prices(ledger):
-    """Entry price comes from the Ledger (0.40), not the venue's own average
-    price (0.45); the venue supplies only the current mark."""
-    pm, bridge, executor = _make_pm(ledger=ledger)
-    executor.dry_run = True
-    _enter(ledger, "tokA")  # 10 shares @ 0.40, paper
-    pos = Position(market_id="m", token_id="tokA", initial_price=0.45, current_price=0.50,
-                   shares=10.0, value=5.0, pnl_ratio=0.11)
-    executor.get_open_positions.return_value = [pos]
-
-    pm.manage_portfolio(lambda *a, **kw: None)
-
-    assert bridge.unrealized_pnl == pytest.approx(1.0)
 
 
 # ── Position analytics snapshot (dashboard edge-decay tracking) ──────────────

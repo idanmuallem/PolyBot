@@ -30,7 +30,7 @@ BTC = MarketRef(yes_token_id="btc-yes", no_token_id="btc-no", condition_id="0xbt
 
 
 def _make_pipeline(tmp_path, venue):
-    from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
+    from trading.decision_pipeline import SequentialTradingPipeline
 
     bridge = DataBridge()
     bridge.current_portfolio = []
@@ -51,7 +51,6 @@ def _make_pipeline(tmp_path, venue):
         bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
         hunter=ctx.scanner, db_path=ctx.db_path,
     )
-    sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
     ctx.budget_manager = BudgetManager(
         bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
     )

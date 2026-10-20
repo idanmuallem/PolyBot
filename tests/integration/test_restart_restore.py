@@ -38,10 +38,8 @@ def test_state_after_restart_matches_state_before(tmp_path):
     ctx = _ctx(db)
     restore_wallet_state(ctx)
 
-    assert ctx.bridge.current_balance == pytest.approx(987.0)
     assert ctx.bridge.starting_balance == pytest.approx(1000.0)
     assert ctx.bridge.spent_today == pytest.approx(13.0)
-    assert ctx.bridge.daily_spend == pytest.approx(13.0)
     assert Ledger(db).open_positions() == held_before
     assert Ledger(db).holding_for("c1", "NO").token_id == "no1"
 

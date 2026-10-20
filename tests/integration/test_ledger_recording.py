@@ -26,7 +26,7 @@ from trading.risk_manager import PortfolioManager
 
 
 def _make_pipeline(db_path, balance=100.0, venue=None):
-    from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
+    from trading.decision_pipeline import SequentialTradingPipeline
 
     dm.init_db(db_path)
     bridge = DataBridge()
@@ -51,7 +51,6 @@ def _make_pipeline(db_path, balance=100.0, venue=None):
             bridge=bridge, executor=ctx.executor, config=config,
             hunter=ctx.scanner, db_path=db_path, ledger=ctx.ledger,
         )
-        sync_live_account_state(bridge, ctx.executor, ctx.portfolio_manager, log_func)
         ctx.budget_manager = BudgetManager(bridge=bridge, config=config, initial_balance=balance)
         pipeline = SequentialTradingPipeline(ctx=ctx, log_func=log_func, delay=0.01)
     return pipeline, ctx
@@ -127,7 +126,7 @@ def test_live_entry_is_tagged_with_the_live_venue(tmp_path):
     from trading.clob_venue import ClobVenue
 
     db = str(tmp_path / "trades.db")
-    pipeline, ctx = _make_pipeline(db, venue=ClobVenue(client=StubClobClient(), proxy_address="", http_get=None))
+    pipeline, ctx = _make_pipeline(db, venue=ClobVenue(client=StubClobClient(balance="100"), proxy_address="", http_get=None))
 
     _enter(pipeline, price=0.40, prob=0.70)
 

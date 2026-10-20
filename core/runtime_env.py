@@ -65,9 +65,10 @@ def validate_runtime_env(bridge: DataBridge) -> WalletContext:
 
 
 def restore_wallet_state(ctx: WalletContext) -> dict:
-    """Restore starting_balance/current_balance/start_of_day_equity/
-    spent_today onto ctx.bridge (spend from the Ledger, balances from the
-    last published engine_status; see data_manager.restore_runtime_state).
+    """Restore starting_balance/start_of_day_equity/spent_today onto
+    ctx.bridge (spend from the Ledger, starting balance from the last
+    published engine_status; see data_manager.restore_runtime_state).
+    Cash is not restored: the engine's Account reads it from the Venue.
     init_db also runs the one-time hunt_history -> Ledger backfill. Seeds
     the live_trading DB control's default from config if no operator
     preference is on record yet.
@@ -84,10 +85,8 @@ def restore_wallet_state(ctx: WalletContext) -> dict:
     restored = data_manager.restore_runtime_state(db_path=ctx.db_path, fallback_starting_balance=0.0)
 
     ctx.bridge.starting_balance = float(restored["starting_balance"])
-    ctx.bridge.current_balance = float(restored["current_balance"])
     ctx.bridge.start_of_day_equity = float(restored["start_of_day_equity"])
     ctx.bridge.spent_today = float(restored["spent_today"])
-    ctx.bridge.daily_spend = float(restored["spent_today"])
     ctx.bridge.state_bootstrap_source = str(restored["source"])
     if ctx.bridge.starting_balance <= 0.0:
         ctx.bridge.starting_balance = float(restored["current_balance"])

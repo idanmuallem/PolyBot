@@ -50,13 +50,12 @@ def _underpriced_event(event_id="evt1", n=3, price=0.30, expiry_days=None, title
 
 
 def _make_pipeline(balance=100.0, config=None, venue=None, ledger=None):
-    from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
+    from trading.decision_pipeline import SequentialTradingPipeline
 
     bridge = DataBridge()
     bridge.current_balance = balance
     bridge.current_portfolio = []
     bridge.open_position_value = 0.0
-    bridge.open_positions_value = 0.0
 
     if config is None:
         config = TradingConfig(
@@ -74,13 +73,12 @@ def _make_pipeline(balance=100.0, config=None, venue=None, ledger=None):
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
-        ctx.executor = TradeExecutor(config=ctx.config, venue=venue or open_book_venue())
+        ctx.executor = TradeExecutor(config=ctx.config, venue=venue or open_book_venue(cash=balance))
         ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
             hunter=ctx.scanner, db_path=ctx.db_path,
         )
-        sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
         ctx.budget_manager = BudgetManager(
             bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
         )
@@ -155,8 +153,8 @@ async def test_fairly_priced_event_executes_nothing():
 
 @pytest.mark.asyncio
 async def test_insufficient_cash_rejects_whole_group():
-    pipeline, bridge, log_calls = _make_pipeline(balance=1.0)  # can't afford 3 legs at $1 each... actually needs < total_cost
-    bridge.current_balance = 0.50  # below the 3-leg $3.00 total cost
+    # $0.50 of cash: below the 3-leg $3.00 total cost.
+    pipeline, bridge, log_calls = _make_pipeline(balance=0.50, venue=open_book_venue(cash=0.50))
 
     with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[_underpriced_event(n=3)]):
         await pipeline._stage_strategy_scan()

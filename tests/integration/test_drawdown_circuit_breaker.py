@@ -1,28 +1,35 @@
-"""Integration: drawdown circuit breaker pauses new trade entry but not
-position management/exits."""
+"""Integration: the Account's drawdown circuit breaker pauses new trade
+entry for the pipeline tick, but position management/exits keep running.
+
+The breaker's own arithmetic (peak tracking, threshold, transition logging)
+is covered at the Account interface in tests/unit/test_account.py."""
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import ui.data_manager as dm
 from core.bridge import DataBridge
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
-from tests.venue_harness import open_book_venue
 from trading.executor import TradeExecutor
+from trading.fake_venue import FakeVenue
+from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
+from trading.venue import MarketRef
+
+BTC = MarketRef(yes_token_id="btc-yes", no_token_id="btc-no", condition_id="0xbtc", slug="btc-100k")
 
 
-def _make_pipeline(balance=100.0, max_drawdown_pct=0.20):
-    from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
+def _make_pipeline(tmp_path, max_drawdown_pct=0.20):
+    """A $100 account: $50 cash plus 100 BTC YES shares bought at 0.50."""
+    from trading.decision_pipeline import SequentialTradingPipeline
 
-    bridge = DataBridge()
-    bridge.current_balance = balance
-    bridge.current_portfolio = []
-    bridge.open_position_value = 0.0
-    bridge.open_positions_value = 0.0
+    venue = FakeVenue(cash=100.0)
+    venue.list_market(BTC, yes_price=0.50)
+    venue.buy(BTC, "YES", 50.0)
 
     config = TradingConfig(
         trading_mode="dry_run", min_ev=0.30, bankroll_usd=1000.0,
@@ -31,143 +38,68 @@ def _make_pipeline(balance=100.0, max_drawdown_pct=0.20):
         max_drawdown_pct=max_drawdown_pct,
         loop_delay_seconds=0.01,
     )
+    db_path = str(tmp_path / "trades.db")
+    dm.init_db(db_path)
+    ctx = WalletContext(wallet_id="test_wallet", config=config, bridge=DataBridge(), db_path=db_path)
+    ctx.ledger = Ledger(db_path)
+    ctx.executor = TradeExecutor(config=config, venue=venue)
+    ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=config)
+    ctx.portfolio_manager = PortfolioManager(
+        bridge=ctx.bridge, executor=ctx.executor, config=config,
+        hunter=ctx.scanner, db_path=db_path, ledger=ctx.ledger,
+    )
+    ctx.budget_manager = BudgetManager(bridge=ctx.bridge, config=config, initial_balance=100.0)
+    pipeline = SequentialTradingPipeline(ctx=ctx, log_func=lambda *a, **kw: None, delay=0.01)
 
-    ctx = WalletContext(wallet_id="test_wallet", config=config, bridge=bridge, db_path="test_wallet_trades.db")
-    log_calls = []
-    log_func = lambda level, *a, **kw: log_calls.append(level)
-
-    with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
-         patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
-        ctx.executor = TradeExecutor(config=ctx.config, venue=open_book_venue())
-        ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
-        ctx.portfolio_manager = PortfolioManager(
-            bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
-            hunter=ctx.scanner, db_path=ctx.db_path,
-        )
-        sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
-        ctx.budget_manager = BudgetManager(
-            bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
-        )
-
-        pipeline = SequentialTradingPipeline(
-            ctx=ctx,
-            log_func=log_func,
-            delay=0.01,
-        )
-
-    return pipeline, ctx, bridge, log_calls
-
-
-# ── _update_drawdown_guard: peak tracking, threshold, logging ────────────────
-
-def test_no_pause_within_drawdown_limit():
-    pipeline, ctx, bridge, log_calls = _make_pipeline(balance=100.0, max_drawdown_pct=0.20)
-    bridge.current_balance = 90.0  # 10% down from the $100 peak
-
-    pipeline._update_drawdown_guard()
-
-    assert ctx.drawdown_paused is False
-    assert bridge.drawdown_paused is False
-    assert "CIRCUIT-BREAKER" not in log_calls
-
-
-def test_pause_triggers_past_drawdown_limit():
-    pipeline, ctx, bridge, log_calls = _make_pipeline(balance=100.0, max_drawdown_pct=0.20)
-    bridge.current_balance = 75.0  # 25% down from the $100 peak
-
-    pipeline._update_drawdown_guard()
-
-    assert ctx.drawdown_paused is True
-    assert bridge.drawdown_paused is True
-    assert "CIRCUIT-BREAKER" in log_calls
-
-
-def test_pause_clears_once_equity_recovers():
-    pipeline, ctx, bridge, log_calls = _make_pipeline(balance=100.0, max_drawdown_pct=0.20)
-    bridge.current_balance = 75.0
-    pipeline._update_drawdown_guard()
-    assert ctx.drawdown_paused is True
-
-    bridge.current_balance = 100.0
-    pipeline._update_drawdown_guard()
-
-    assert ctx.drawdown_paused is False
-    assert bridge.drawdown_paused is False
-    assert "CIRCUIT-BREAKER-CLEAR" in log_calls
-
-
-def test_peak_equity_ratchets_up_with_new_highs():
-    pipeline, ctx, bridge, _ = _make_pipeline(balance=100.0, max_drawdown_pct=0.20)
-    bridge.current_balance = 150.0
-    pipeline._update_drawdown_guard()
-    assert pipeline.peak_equity == pytest.approx(150.0)
-
-    # A drop to $125 is only ~16.7% down from the new $150 peak -> no pause.
-    bridge.current_balance = 125.0
-    pipeline._update_drawdown_guard()
-    assert ctx.drawdown_paused is False
-
-
-def test_drawdown_pause_logs_only_once_on_transition():
-    pipeline, ctx, bridge, log_calls = _make_pipeline(balance=100.0, max_drawdown_pct=0.20)
-    bridge.current_balance = 75.0
-
-    pipeline._update_drawdown_guard()
-    pipeline._update_drawdown_guard()  # still paused -- should not re-log
-
-    assert log_calls.count("CIRCUIT-BREAKER") == 1
-
-
-def test_bridge_tracks_peak_equity_and_drawdown_pct():
-    pipeline, ctx, bridge, _ = _make_pipeline(balance=100.0, max_drawdown_pct=0.20)
-    bridge.current_balance = 80.0
-
-    pipeline._update_drawdown_guard()
-
-    assert bridge.peak_equity == pytest.approx(100.0)
-    assert bridge.current_drawdown_pct == pytest.approx(0.20)
-
-
-# ── run_forever: paused state skips new entries but not exits ────────────────
-
-@pytest.mark.asyncio
-async def test_paused_pipeline_skips_new_entry_but_runs_exits():
-    pipeline, ctx, bridge, log_calls = _make_pipeline(balance=100.0, max_drawdown_pct=0.20)
-    pipeline.peak_equity = 100.0
-
-    pipeline._stage_hunt = AsyncMock(return_value=None)  # _stage_hunt is now async (Phase 6a)
+    pipeline._stage_hunt = AsyncMock(return_value=None)
     pipeline._stage_strategy_scan = MagicMock(side_effect=lambda: asyncio.sleep(0))
     pipeline.portfolio_manager.manage_portfolio = MagicMock()
+    return pipeline, venue, ctx
 
-    # _sync_live_account_state() re-pulls the balance from the executor every
-    # tick, so the drop has to come from there, not a one-off bridge mutation.
-    with patch("trading.executor.TradeExecutor.get_balance", return_value=75.0):
-        try:
-            await asyncio.wait_for(pipeline.run_forever(), timeout=0.3)
-        except asyncio.TimeoutError:
-            pass
 
-    assert ctx.drawdown_paused is True
+async def _run_briefly(pipeline):
+    try:
+        await asyncio.wait_for(pipeline.run_forever(), timeout=0.3)
+    except asyncio.TimeoutError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_paused_pipeline_skips_new_entry_but_runs_exits(tmp_path):
+    pipeline, venue, ctx = _make_pipeline(tmp_path)
+    venue.set_price(BTC, "YES", 0.25)         # equity 75: 25% off the $100 peak
+
+    await _run_briefly(pipeline)
+
+    assert ctx.account.drawdown_paused is True
+    assert ctx.bridge.drawdown_paused is True
     pipeline.portfolio_manager.manage_portfolio.assert_called()
     pipeline._stage_hunt.assert_not_called()
     pipeline._stage_strategy_scan.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_unpaused_pipeline_still_scans_for_new_entries():
-    pipeline, ctx, bridge, log_calls = _make_pipeline(balance=100.0, max_drawdown_pct=0.20)
-    # No drawdown -- stays well within limits.
+async def test_unpaused_pipeline_still_scans_for_new_entries(tmp_path):
+    pipeline, venue, ctx = _make_pipeline(tmp_path)
+    venue.set_price(BTC, "YES", 0.40)         # equity 90: within the 20% limit
 
-    pipeline._stage_hunt = AsyncMock(return_value=None)  # _stage_hunt is now async (Phase 6a)
-    pipeline._stage_strategy_scan = MagicMock(side_effect=lambda: asyncio.sleep(0))
-    pipeline.portfolio_manager.manage_portfolio = MagicMock()
+    await _run_briefly(pipeline)
 
-    try:
-        await asyncio.wait_for(pipeline.run_forever(), timeout=0.3)
-    except asyncio.TimeoutError:
-        pass
-
-    assert ctx.drawdown_paused is False
+    assert ctx.account.drawdown_paused is False
     pipeline.portfolio_manager.manage_portfolio.assert_called()
     pipeline._stage_hunt.assert_called()
     pipeline._stage_strategy_scan.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_engine_status_shows_the_account_snapshot(tmp_path):
+    """The dashboard reads engine_status: it must carry the Account's cash
+    and position value, the same numbers the breaker used."""
+    pipeline, venue, ctx = _make_pipeline(tmp_path)
+    venue.set_price(BTC, "YES", 0.40)
+
+    await _run_briefly(pipeline)
+
+    status = dm.read_engine_status(ctx.db_path)
+    assert status["current_balance"] == pytest.approx(50.0)
+    assert status["open_position_value"] == pytest.approx(40.0)

@@ -11,7 +11,8 @@ from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.clob_venue import ClobUnavailable, ClobVenue
-from trading.decision_pipeline import _default_log_func, sync_live_account_state
+from trading.account import Account
+from trading.decision_pipeline import _default_log_func
 from trading.executor import TradeExecutor
 from trading.ledger import Ledger
 from trading.paper_venue import PaperVenue
@@ -59,12 +60,19 @@ def _build_venues(ctx: WalletContext) -> Tuple[Venue, Optional[Venue]]:
 
 def build_wallet_runtime(ctx: WalletContext) -> None:
     """Build this wallet's runtime components in dependency order and attach
-    them to ctx: executor -> scanner -> portfolio_manager -> (live balance
-    sync) -> budget_manager.
+    them to ctx: executor -> account -> scanner -> portfolio_manager ->
+    budget_manager.
     """
     ctx.ledger = Ledger(ctx.db_path)
     venue, standby_venue = _build_venues(ctx)
     ctx.executor = TradeExecutor(config=ctx.config, venue=venue, standby_venue=standby_venue)
+    ctx.account = Account(
+        venue=lambda: ctx.executor.venue,
+        bridge=ctx.bridge,
+        ledger=ctx.ledger,
+        max_drawdown_pct=ctx.config.max_drawdown_pct,
+        log_func=_default_log_func(ctx),
+    )
     ctx.scanner = PolymarketScannerHunter(
         bridge=ctx.bridge,
         executor=ctx.executor,
@@ -77,16 +85,12 @@ def build_wallet_runtime(ctx: WalletContext) -> None:
         hunter=ctx.scanner,
         db_path=ctx.db_path,
         ledger=ctx.ledger,
+        account=ctx.account,
     )
 
-    # Sync live balance before building BudgetManager so its initial_balance
-    # reflects the account's real collateral, not the DataBridge default of
-    # 0.0 (or, for run_engine.py's caller, whatever restore_wallet_state()
-    # already restored from trade history).
-    sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, _default_log_func(ctx))
-
+    # BudgetManager's watch-only check needs the account's real cash.
     ctx.budget_manager = BudgetManager(
         bridge=ctx.bridge,
         config=ctx.config,
-        initial_balance=float(ctx.bridge.current_balance),
+        initial_balance=ctx.account.refresh().cash,
     )

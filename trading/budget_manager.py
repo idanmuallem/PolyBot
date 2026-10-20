@@ -31,11 +31,11 @@ class BudgetManager:
         return float(self.strategy_limits.get(strategy_tag, self.daily_limit_usd))
 
     def _sync_bridge(self):
-        self.bridge.daily_spend = self.total_spent_today
+        # Spend only: cash is the Account's (trading/account.py), read from
+        # the Venue. Deriving it here from a startup balance minus spend was
+        # one of the writers behind the balance flicker.
+        self.bridge.spent_today = self.total_spent_today
         self.bridge.watch_only = self.watch_only
-        current_balance = max(0.0, self.base_balance - self.total_spent_today)
-        self.bridge.current_balance = current_balance
-        self.bridge.cash = current_balance
 
     def get_remaining_budget(self, strategy_tag: str = "crypto") -> float:
         spent = self.spent_by_strategy.get(strategy_tag, 0.0)
