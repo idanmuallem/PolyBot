@@ -1,7 +1,6 @@
 import asyncio
 
 import pytest
-from unittest.mock import MagicMock, patch
 
 from core.models import MarketData
 from core.trading_config import TradingConfig
@@ -29,10 +28,10 @@ def _dry_config(**overrides):
 
 
 def _make_executor(venue=None, **config_overrides):
-    """A TradeExecutor with a controlled TradingConfig (no real CLOB).
-    venue is the paper Venue (e.g. a FakeVenue); None is log-only dry-run."""
+    """A TradeExecutor with a controlled TradingConfig, trading on *venue*
+    (default: a FakeVenue with tok1/tok1_no listed at 0.50)."""
     from trading.executor import TradeExecutor
-    return TradeExecutor(config=_dry_config(**config_overrides), venue=venue)
+    return TradeExecutor(config=_dry_config(**config_overrides), venue=venue or _listed_venue())
 
 
 def _listed_venue(market_ref=None, yes_price=0.50, cash=1000.0):
@@ -273,50 +272,6 @@ def test_trade_count_increments_on_success():
     assert executor.trade_count_today == 1
 
 
-# ── _is_valid_order_response ──────────────────────────────────────────────────
-
-def test_valid_response_with_order_id():
-    from trading.executor import TradeExecutor
-    assert TradeExecutor._is_valid_order_response({"orderID": "abc123"}) is True
-
-
-def test_response_with_error_field_is_invalid():
-    from trading.executor import TradeExecutor
-    assert TradeExecutor._is_valid_order_response({"error": "insufficient_funds"}) is False
-
-
-def test_none_response_is_invalid():
-    from trading.executor import TradeExecutor
-    assert TradeExecutor._is_valid_order_response(None) is False
-
-
-# ── get_open_positions: live_ev matches pnl_ratio ────────────────────────────
-
-def test_get_open_positions_live_ev_normalization_at_boundary():
-    """A 1% gain (pnl_ratio=0.01) must produce live_ev=0.01."""
-    executor = _make_executor(trading_mode="live_run")
-    from unittest.mock import patch as _patch
-    raw_position = {
-        "asset": "tok1",
-        "avgPrice": "0.40",
-        "currentPrice": "0.404",   # +1% from 0.40
-        "currentValue": "4.04",
-        "size": "10",
-    }
-    mock_resp = MagicMock()
-    mock_resp.raise_for_status.return_value = None
-    mock_resp.json.return_value = [raw_position]
-
-    with _patch("trading.executor.requests.get", return_value=mock_resp), \
-         _patch.object(executor, "_resolve_positions_user_address", return_value="0xabc"):
-        positions = executor.get_open_positions()
-
-    assert positions, "expected one position"
-    assert abs(positions[0].live_ev - 0.01) < 0.001, (
-        f"live_ev should be ~0.01, got {positions[0].live_ev}"
-    )
-
-
 # ── Construction ──────────────────────────────────────────────────────────────
 
 def test_executor_constructs_without_pm_trader_or_filesystem(tmp_path, monkeypatch):
@@ -328,9 +283,11 @@ def test_executor_constructs_without_pm_trader_or_filesystem(tmp_path, monkeypat
     monkeypatch.setitem(sys.modules, "pm_trader", None)
     monkeypatch.setitem(sys.modules, "pm_trader.engine", None)
 
-    executor = _make_executor()
+    from trading.fake_venue import FakeVenue
+    venue = FakeVenue()
+    executor = _make_executor(venue=venue)
 
-    assert executor.venue is None
+    assert executor.venue is venue
     assert list(tmp_path.iterdir()) == []
 
 
@@ -339,10 +296,6 @@ def test_executor_constructs_without_pm_trader_or_filesystem(tmp_path, monkeypat
 def test_get_balance_dry_run_reads_venue_cash():
     venue = _listed_venue(cash=640.0)
     assert _make_executor(venue=venue, paper_balance_usd=500.0).get_balance() == 640.0
-
-
-def test_get_balance_dry_run_without_venue_returns_configured_paper_balance():
-    assert _make_executor(paper_balance_usd=500.0).get_balance() == 500.0
 
 
 def test_get_open_positions_dry_run_reads_venue_positions():
@@ -413,6 +366,8 @@ def test_dry_run_buy_the_venue_refuses_is_not_reported_as_success():
 
 
 class _ExplodingVenue:
+    name = "paper"
+
     def buy(self, *a, **kw):
         raise RuntimeError("Engine exploded")
 
@@ -423,11 +378,6 @@ class _ExplodingVenue:
 def test_dry_run_venue_raising_on_buy_does_not_raise_but_reports_failure():
     executor = _make_executor(venue=_ExplodingVenue())
     assert _evaluate(executor) is False
-
-
-def test_dry_run_without_venue_is_log_only_and_reports_success():
-    """No paper venue at all is the log-only dry-run mode (removed by #17)."""
-    assert _evaluate(_make_executor()) is True
 
 
 # ── Dry-run sells go through the Venue ────────────────────────────────────────
@@ -465,122 +415,141 @@ def test_dry_run_venue_raising_on_sell_is_not_reported_as_success():
     assert executor.sell_position("stuck_tok", 1000.0, 0.0005, log_func=lambda *a, **kw: None) is False
 
 
-def test_dry_run_sell_without_venue_is_log_only_and_reports_success():
-    assert _make_executor().sell_position("tok1", 10.0, 0.5, log_func=lambda *a, **kw: None) is True
-
-
 # ── execute_arbitrage_group (Phase 3: limit order timeout + partial fills) ──
 
-def _live_executor(**config_overrides):
-    """A TradeExecutor wired for the "live" branch of execute_arbitrage_group
-    without a real ClobClient — client is a bare MagicMock so _submit_order/
-    _get_order_filled_shares/cancel can be patched directly."""
-    executor = _make_executor(trading_mode="live_run", **config_overrides)
-    executor.client = MagicMock()
-    return executor
+def _live_executor(filled_by_token: dict):
+    """A TradeExecutor on a ClobVenue over a stub CLOB client: each leg's
+    order id is order_<token>, and get_order reports filled_by_token."""
+    from tests.unit.test_clob_venue import StubClobClient
+    from trading.clob_venue import ClobVenue
+    client = StubClobClient(
+        order_response=lambda order: {"orderID": f"order_{order.token_id}"},
+        filled={f"order_{token}": shares for token, shares in filled_by_token.items()},
+    )
+    executor = _make_executor(
+        venue=ClobVenue(client=client, proxy_address="0xabc", http_get=None),
+        trading_mode="live_run",
+    )
+    return executor, client
 
 
-def _mock_order_placement(fills_by_token: dict):
-    """Returns (fake_submit_order, fake_get_filled) matched by token_id via
-    a deterministic order_id, so tests can simulate arbitrary per-leg fills
-    without a real order book."""
-    def fake_submit_order(token_id, price, side, size):
-        return {"orderID": f"order_{token_id}"}
+def test_live_arbitrage_group_all_legs_fill_returns_success():
+    executor, client = _live_executor({"A": 3.0, "B": 2.0})
 
-    def fake_get_filled(order_id):
-        token_id = order_id.replace("order_", "")
-        return fills_by_token[token_id]
+    result = _run_arb(executor, [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 0.9},
+        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES", "bet_amount_usd": 0.8},
+    ])
 
-    return fake_submit_order, fake_get_filled
-
-
-def test_execute_arbitrage_group_all_legs_fill_returns_success():
-    executor = _live_executor()
-    legs = [
-        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
-        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES"},
-    ]
-    fake_submit, fake_get_filled = _mock_order_placement({"A": 3.0, "B": 2.0})
-
-    with patch.object(executor, "_submit_order", side_effect=fake_submit), \
-         patch.object(executor, "_get_order_filled_shares", side_effect=fake_get_filled):
-        result = asyncio.run(executor.execute_arbitrage_group(
-            legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
-        ))
-
+    assert client.orders == [("A", 0.3, "BUY", 3.0), ("B", 0.4, "BUY", 2.0)]
     assert result["success"] is True
     assert result["arb_sets"] == 2.0  # min(3.0, 2.0)
     assert result["unfilled"] == []
     assert result["fills"] == {"A": 3.0, "B": 2.0}
 
 
-def test_execute_arbitrage_group_zero_fill_leg_cancels_remaining():
-    executor = _live_executor()
-    legs = [
-        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
-        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES"},
-    ]
-    fake_submit, fake_get_filled = _mock_order_placement({"A": 3.0, "B": 0.0})
+def test_live_arbitrage_group_zero_fill_leg_cancels_every_order():
+    executor, client = _live_executor({"A": 3.0, "B": 0.0})
 
-    with patch.object(executor, "_submit_order", side_effect=fake_submit), \
-         patch.object(executor, "_get_order_filled_shares", side_effect=fake_get_filled):
-        result = asyncio.run(executor.execute_arbitrage_group(
-            legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
-        ))
+    result = _run_arb(executor, [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 0.9},
+        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES", "bet_amount_usd": 0.8},
+    ])
 
     assert result["success"] is False
     assert result["arb_sets"] == 0
     assert result["unfilled"] == ["B"]
-    # Both legs' resting orders get cancelled — no arbitrage without leg B.
-    assert executor.client.cancel.call_count == 2
-    cancelled_order_ids = {call.args[0] for call in executor.client.cancel.call_args_list}
-    assert cancelled_order_ids == {"order_A", "order_B"}
+    # Both legs' resting orders get cancelled -- no arbitrage without leg B.
+    assert sorted(client.cancelled) == ["order_A", "order_B"]
 
 
-def test_execute_arbitrage_group_uneven_fills_computes_surplus():
-    executor = _live_executor()
-    legs = [
-        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES"},
-        {"token_id": "B", "price": 0.30, "shares": 10.0, "side": "YES"},
-        {"token_id": "C", "price": 0.30, "shares": 5.0, "side": "YES"},
-    ]
-    fake_submit, fake_get_filled = _mock_order_placement({"A": 3.0, "B": 10.0, "C": 5.0})
+def test_live_arbitrage_group_uneven_fills_computes_surplus():
+    executor, _ = _live_executor({"A": 3.0, "B": 10.0, "C": 5.0})
 
-    with patch.object(executor, "_submit_order", side_effect=fake_submit), \
-         patch.object(executor, "_get_order_filled_shares", side_effect=fake_get_filled):
-        result = asyncio.run(executor.execute_arbitrage_group(
-            legs=legs, timeout_seconds=0.05, log_func=lambda *a, **kw: None,
-        ))
+    result = _run_arb(executor, [
+        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 0.9},
+        {"token_id": "B", "price": 0.30, "shares": 10.0, "side": "YES", "bet_amount_usd": 3.0},
+        {"token_id": "C", "price": 0.30, "shares": 5.0, "side": "YES", "bet_amount_usd": 1.5},
+    ])
 
     assert result["success"] is True
     assert result["arb_sets"] == 3.0
     assert result["surplus"] == {"B": 7.0, "C": 2.0}
 
 
-def test_execute_arbitrage_group_dry_run_simulates_full_fill_no_real_orders():
-    executor = _make_executor()  # default trading_mode="dry_run", client stays None
-    assert executor.client is None
+# ── Live buys and sells go through the ClobVenue ─────────────────────────────
 
-    legs = [
-        {"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 1.0},
-        {"token_id": "B", "price": 0.40, "shares": 2.0, "side": "YES", "bet_amount_usd": 1.0},
-    ]
-    log_calls = []
-    result = asyncio.run(executor.execute_arbitrage_group(
-        legs=legs, timeout_seconds=60.0,
-        log_func=lambda level, *a, **kw: log_calls.append(level),
-    ))
+def test_live_buy_posts_the_order_and_logs_live_trade_under_the_market_asset_type():
+    executor, client = _live_executor({})
+    rows = []
 
-    assert result["success"] is True
-    assert result["fills"] == {"A": 3.0, "B": 2.0}
-    assert result["arb_sets"] == 2.0
-    assert result["surplus"] == {"A": 1.0}
-    # Simulated, not real: no client, and the per-leg DRY-RUN path fired
-    # (same as execute_trade()'s existing dry-run behavior) plus a clear
-    # group-level structure log.
-    assert executor.client is None
-    assert log_calls.count("DRY-RUN") == 2
-    assert "ARBITRAGE-FILL" in log_calls
+    result = executor.evaluate_and_execute(
+        market=_valid_market(), fair_value=0.30, ev=0.50, current_poly_price=0.40,
+        bet_amount_usd=3.0, side="NO",
+        log_func=lambda level, asset, token, payload: rows.append((level, asset, token)),
+    )
+
+    assert result is True
+    assert client.orders == [("tok1_no", 0.6, "BUY", 5.0)]
+    assert ("LIVE-TRADE", "Crypto::BTCUSDT", "tok1_no") in rows
+    assert executor.trade_count_today == 1
+
+
+def test_live_rejected_buy_is_not_a_trade():
+    executor, client = _live_executor({})
+    client.order_response = {"error": "insufficient_funds"}
+
+    assert _evaluate(executor) is False
+    assert executor.trade_count_today == 0
+
+
+def test_live_sell_posts_a_sell_at_the_given_price():
+    executor, client = _live_executor({})
+    rows = []
+
+    assert executor.sell_position("tok1", 10.0, 0.55, log_func=lambda level, *a: rows.append(level)) is True
+    assert client.orders == [("tok1", 0.55, "SELL", 10.0)]
+    assert rows == ["SELL"]
+
+
+# ── Mode: the active Venue decides paper vs live ─────────────────────────────
+
+def _clob_venue():
+    from tests.unit.test_clob_venue import StubClobClient
+    from trading.clob_venue import ClobVenue
+    return ClobVenue(client=StubClobClient(balance="42"), proxy_address="0xabc", http_get=None)
+
+
+def test_dry_run_reflects_the_active_venue():
+    from trading.executor import TradeExecutor
+    assert _make_executor().dry_run is True
+    assert TradeExecutor(_dry_config(trading_mode="live_run"), venue=_clob_venue()).dry_run is False
+
+
+def test_switching_to_live_trades_on_the_standby_live_venue():
+    from trading.executor import TradeExecutor
+    paper, live = _listed_venue(cash=640.0), _clob_venue()
+    executor = TradeExecutor(_dry_config(), venue=paper, standby_venue=live)
+
+    executor.dry_run = False
+    assert executor.dry_run is False
+    assert executor.venue is live
+    assert executor.get_balance() == 42.0
+
+    executor.dry_run = True
+    assert executor.venue is paper
+    assert executor.get_balance() == 640.0
+
+
+def test_switching_to_live_without_a_live_venue_stays_on_paper():
+    """Live without a usable client never trades: the switch is refused."""
+    paper = _listed_venue()
+    executor = _make_executor(venue=paper)
+
+    executor.dry_run = False
+
+    assert executor.dry_run is True
+    assert executor.venue is paper
 
 
 # ── Paper arbitrage: limit orders through the Venue ─────────────────────────
@@ -662,18 +631,3 @@ def test_paper_limit_arbitrage_group_uneven_fills_computes_surplus():
     assert result["success"] is True
     assert result["arb_sets"] == pytest.approx(5.0)
     assert result["surplus"] == {"B": pytest.approx(5.0), "C": pytest.approx(2.0)}
-
-
-def test_execute_arbitrage_group_falls_back_to_simulation_without_venue():
-    """dry_run with no paper venue at all (log-only mode) must
-    still fall back to the log-only simulation, not the limit-order path
-    (which has nothing real to place orders against in that mode)."""
-    executor = _make_executor()  # trading_mode="dry_run", no venue
-    legs = [{"token_id": "A", "price": 0.30, "shares": 3.0, "side": "YES", "bet_amount_usd": 1.0}]
-
-    result = asyncio.run(executor.execute_arbitrage_group(
-        legs=legs, timeout_seconds=60.0, log_func=lambda *a, **kw: None,
-    ))
-
-    assert result["success"] is True
-    assert result["fills"] == {"A": 3.0}

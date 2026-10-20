@@ -13,6 +13,7 @@ from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
+from tests.venue_harness import open_book_venue
 from trading.executor import TradeExecutor
 from trading.risk_manager import PortfolioManager
 
@@ -45,7 +46,7 @@ def _make_pipeline(config=None, balance=100.0):
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
-        ctx.executor = TradeExecutor(config=ctx.config)
+        ctx.executor = TradeExecutor(config=ctx.config, venue=open_book_venue())
         ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,

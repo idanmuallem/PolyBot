@@ -116,3 +116,23 @@ def make_paper_venue(data_dir: Path, starting_balance: float) -> Tuple[object, P
     stub = PmTraderMarketStub()
     venue = PaperVenue(data_dir=data_dir, starting_balance=starting_balance, market_api=stub)
     return venue, stub
+
+
+def open_book_venue(cash: float = 1000.0):
+    """A FakeVenue where every order finds liquidity: a market buy fills at
+    the caller's price and a limit order at its limit price, for any
+    market, as if each were listed there. For tests about what the engine
+    does around a fill, not about the fill itself."""
+    from trading.fake_venue import FakeVenue
+
+    class OpenBookVenue(FakeVenue):
+        def buy(self, market, side, usd, price=None, log_func=None):
+            if price and market.token_for(side) not in self._prices:
+                self.set_price(market, side, price)
+            return super().buy(market, side, usd, price=price, log_func=log_func)
+
+        def place_limit_buy(self, market, side, usd, limit_price):
+            self.set_price(market, side, limit_price)
+            return super().place_limit_buy(market, side, usd, limit_price)
+
+    return OpenBookVenue(cash=cash)

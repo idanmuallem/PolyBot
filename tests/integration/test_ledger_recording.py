@@ -19,6 +19,8 @@ from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
+from trading.fake_venue import FakeVenue
+from trading.venue import MarketRef
 from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
 
@@ -43,7 +45,7 @@ def _make_pipeline(db_path, balance=100.0, venue=None):
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
-        ctx.executor = TradeExecutor(config=ctx.config, venue=venue)
+        ctx.executor = TradeExecutor(config=ctx.config, venue=venue or FakeVenue(cash=balance))
         ctx.scanner = PolymarketScannerHunter(bridge=bridge, executor=ctx.executor, config=config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=bridge, executor=ctx.executor, config=config,
@@ -66,10 +68,13 @@ def _market(price):
 
 
 def _enter(pipeline, price, prob):
+    market = _market(price)
+    if isinstance(pipeline.executor.venue, FakeVenue):
+        pipeline.executor.venue.list_market(MarketRef.from_market(market), price)
     hunter = MagicMock()
     hunter.get_live_truth.return_value = 97_000.0
     with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=prob):
-        candidate = pipeline._stage_evaluate_ev(_market(price), hunter)
+        candidate = pipeline._stage_evaluate_ev(market, hunter)
     assert candidate is not None
     approved_bet, risk_ctx = pipeline._stage_risk_and_budget(candidate)
     assert approved_bet > 0.0
@@ -114,6 +119,19 @@ def test_model_entry_is_recorded_with_its_entry_details(tmp_path):
     assert holding.asset_type == "Crypto::BTCUSDT"
     assert holding.venue == "paper"
     assert holding.strategy == "crypto"
+
+
+@freeze_time("2026-06-02T00:00:00+00:00")
+def test_live_entry_is_tagged_with_the_live_venue(tmp_path):
+    from tests.unit.test_clob_venue import StubClobClient
+    from trading.clob_venue import ClobVenue
+
+    db = str(tmp_path / "trades.db")
+    pipeline, ctx = _make_pipeline(db, venue=ClobVenue(client=StubClobClient(), proxy_address="", http_get=None))
+
+    _enter(pipeline, price=0.40, prob=0.70)
+
+    assert ctx.ledger.holding("tok1").venue == "live"
 
 
 @freeze_time("2026-06-02T00:00:00+00:00")

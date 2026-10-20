@@ -6,13 +6,19 @@ here, in MarketRef.token_for() and side_price(), and nowhere else.
 
 Adapters:
     - PaperVenue (trading/paper_venue.py) wraps pm_trader.
+    - ClobVenue (trading/clob_venue.py) wraps py_clob_client + the Data API.
     - FakeVenue (trading/fake_venue.py) is an in-memory venue for tests.
-Both pass the shared contract suite in tests/unit/test_venue_contract.py.
+PaperVenue and FakeVenue pass the shared contract suite in
+tests/unit/test_venue_contract.py; ClobVenue is tested against a stub client.
+
+Each adapter has a name, "paper" or "live": which one the engine trades on
+is the trading mode.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence
 
@@ -151,12 +157,46 @@ def report_resolution(
             logger.warning(f"on_resolved failed for {resolution.token_id}: {exc}")
 
 
+def paper_shares(usd: float, price: Optional[float]) -> Optional[float]:
+    """Shares *usd* buys at *price*, floored to 2 decimals; None without a price."""
+    if not price or float(price) <= 0:
+        return None
+    return math.floor((float(usd) / float(price)) * 100.0) / 100.0
+
+
+def log_paper_buy(
+    log_func: Optional[Callable], token_id: str, side: str, usd: float, price: Optional[float],
+) -> None:
+    """The DRY-RUN row a paper venue writes for every buy it attempts."""
+    shares = paper_shares(usd, price)
+    print(f"[DRY-RUN] Would buy {shares} of {token_id} ({side}) for ${usd}.")
+    if log_func is not None:
+        log_func("DRY-RUN", "Portfolio", token_id, {
+            "price": price, "shares": shares, "bet_amount_usd": usd, "side": side,
+        })
+
+
+def log_paper_sell(log_func: Optional[Callable], token_id: str, shares: float, price: Optional[float]) -> None:
+    """The DRY-RUN-SELL row a paper venue writes for every sale it attempts."""
+    msg = f"[DRY-RUN] Would SELL {shares} of {token_id} at ${price}"
+    print(msg)
+    if log_func is not None:
+        log_func("DRY-RUN-SELL", "Portfolio", token_id, {"message": msg, "price": price, "shares": shares})
+
+
 class Venue(Protocol):
     """The trading engine's view of a market venue.
 
     Every method is best-effort: none raises on an ordinary venue failure;
     each reports it through its return value instead.
+
+    buy/sell take the caller's per-share *price* for the side traded (live
+    orders are limit orders at that price; paper fills ignore it) and an
+    optional *log_func* for the venue's own order rows (DRY-RUN for paper,
+    LIVE-TRADE / SELL for live). Those rows use "Portfolio" as asset type.
     """
+
+    name: str  # "paper" or "live"
 
     def cash(self) -> float:
         """Deployable cash."""
@@ -164,10 +204,16 @@ class Venue(Protocol):
     def open_positions(self) -> List[Position]:
         """Currently open positions, reflecting every buy/sell made so far."""
 
-    def buy(self, market: MarketRef, side: str, usd: float) -> bool:
-        """Market-buy *usd* worth of *side*. True only if the fill landed."""
+    def buy(
+        self, market: MarketRef, side: str, usd: float,
+        price: Optional[float] = None, log_func: Optional[Callable] = None,
+    ) -> bool:
+        """Buy *usd* worth of *side*. True only if the order landed."""
 
-    def sell(self, token_id: str, shares: float) -> bool:
+    def sell(
+        self, token_id: str, shares: float,
+        price: Optional[float] = None, log_func: Optional[Callable] = None,
+    ) -> bool:
         """Sell *shares* of *token_id*. True only if the sale landed."""
 
     def place_limit_buy(

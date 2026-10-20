@@ -87,6 +87,7 @@ def wired_wallet_context(tmp_path, dry_run_config, bridge):
     build your own context with the mocks attached directly instead of
     using this fixture.
     """
+    from tests.venue_harness import open_book_venue
     from trading.executor import TradeExecutor
     from polymarket import PolymarketScannerHunter
     from trading.risk_manager import PortfolioManager
@@ -99,7 +100,7 @@ def wired_wallet_context(tmp_path, dry_run_config, bridge):
         bridge=bridge,
         db_path=str(tmp_path / "test.db"),
     )
-    ctx.executor = TradeExecutor(config=ctx.config)
+    ctx.executor = TradeExecutor(config=ctx.config, venue=open_book_venue())
     ctx.scanner = PolymarketScannerHunter(
         bridge=ctx.bridge,
         executor=ctx.executor,

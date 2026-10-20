@@ -19,6 +19,7 @@ from core.polymarket_client import PolymarketClient
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.decision_pipeline import sync_live_account_state
+from tests.venue_harness import open_book_venue
 from trading.executor import TradeExecutor
 from trading.risk_manager import PortfolioManager
 
@@ -28,7 +29,7 @@ def _wire_ctx(ctx: WalletContext, log_func) -> None:
     order, matching how ui/dashboard.py and core/wallet_manager.py wire a
     real WalletContext. Must run with any TradeExecutor patches already
     active, since it constructs a real TradeExecutor."""
-    ctx.executor = TradeExecutor(config=ctx.config)
+    ctx.executor = TradeExecutor(config=ctx.config, venue=open_book_venue())
     ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
     ctx.portfolio_manager = PortfolioManager(
         bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
