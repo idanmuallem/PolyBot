@@ -3,13 +3,14 @@ the Ledger, tagged strategy `arbitrage` with the basket's group_id, and
 paper arbitrage fills show up in dashboard stats and transactions (#14).
 
 Driven through the pipeline's arbitrage group execution path with the
-paper engine's limit-order calls faked and a real Ledger on tmp_path,
-until a tick-level seam with a FakeVenue exists (#15). Resolutions are
+executor trading on a FakeVenue and a real Ledger on tmp_path. A leg's fill
+is set by its listed price: $1 at a listed price p buys 1/p shares, and an
+unlisted leg never fills. #19 moves this to a tick-level test. Resolutions are
 covered at the Ledger seam (tests/unit/test_ledger.py): a resolution of an
 arbitrage leg inherits its strategy and group_id from the open position.
 """
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -21,9 +22,11 @@ from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
+from trading.fake_venue import FakeVenue
 from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
 from trading.strategies.base import StrategySignal
+from trading.venue import MarketRef
 
 GROUP = "event_sum:evt1"
 _ARBITRAGE = SimpleNamespace(strategy_type="arbitrage")
@@ -48,8 +51,7 @@ def _make_pipeline(db_path, balance=100.0):
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
-        ctx.executor = TradeExecutor(config=ctx.config)
-        ctx.executor.paper = None
+        ctx.executor = TradeExecutor(config=ctx.config, venue=FakeVenue(cash=1000.0))
         ctx.scanner = PolymarketScannerHunter(bridge=bridge, executor=ctx.executor, config=config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=bridge, executor=ctx.executor, config=config,
@@ -59,26 +61,6 @@ def _make_pipeline(db_path, balance=100.0):
         ctx.budget_manager = BudgetManager(bridge=bridge, config=config, initial_balance=balance)
         pipeline = SequentialTradingPipeline(ctx=ctx, log_func=log_func, delay=0.01)
     return pipeline, ctx
-
-
-def _paper_engine(fills_by_token: dict, sell_ok=True):
-    """Fake pm_trader limit-order surface: each leg fills the given shares."""
-    condition_to_token = {}
-
-    def place_limit_buy(slug, condition_id, token_id, side, amount_usd, limit_price, no_token_id=None):
-        cond = f"cond_{token_id}"
-        condition_to_token[cond] = token_id
-        return {"id": f"order_{token_id}", "market_condition_id": cond, "outcome": side.lower()}
-
-    paper = MagicMock()
-    paper.place_limit_buy.side_effect = place_limit_buy
-    paper.check_pending_limit_orders.return_value = []
-    paper.get_position_shares.side_effect = (
-        lambda cond, outcome: fills_by_token.get(condition_to_token.get(cond), 0.0)
-    )
-    paper.cancel_limit_order.return_value = True
-    paper.execute_sell.return_value = sell_ok
-    return paper
 
 
 def _signal(token_id, price, bet_amount_usd=1.0):
@@ -94,8 +76,16 @@ def _signal(token_id, price, bet_amount_usd=1.0):
     )
 
 
-async def _run(pipeline, signals, fills, sell_ok=True):
-    pipeline.executor.paper = _paper_engine(fills, sell_ok=sell_ok)
+async def _run(pipeline, signals, listed_prices, sell_ok=True):
+    """List each leg's market on the FakeVenue at *listed_prices* {token: price}
+    (unlisted legs never fill), then execute the basket."""
+    venue = pipeline.executor.venue
+    for signal in signals:
+        price = listed_prices.get(signal.market.market_id)
+        if price is not None:
+            venue.list_market(MarketRef.from_market(signal.market), price)
+    if not sell_ok:
+        venue.sell = lambda token_id, shares: False
     await pipeline._execute_strategy_group(_ARBITRAGE, GROUP, signals)
 
 
@@ -107,14 +97,15 @@ def _kinds(ledger):
 async def test_filled_basket_records_every_leg_as_an_arbitrage_entry(tmp_path):
     pipeline, ctx = _make_pipeline(str(tmp_path / "trades.db"))
 
-    await _run(pipeline, [_signal("tokA", 0.30), _signal("tokB", 0.35)], {"tokA": 2.5, "tokB": 2.5})
+    # $1 per leg at $0.40 fills 2.5 shares each.
+    await _run(pipeline, [_signal("tokA", 0.40), _signal("tokB", 0.40)], {"tokA": 0.40, "tokB": 0.40})
 
     rows = ctx.ledger.transactions()
     assert sorted((r["kind"], r["token_id"]) for r in rows) == [("BUY", "tokA"), ("BUY", "tokB")]
     assert {(r["strategy"], r["group_id"], r["venue"]) for r in rows} == {("arbitrage", GROUP, "paper")}
     held = {h.token_id: h for h in ctx.ledger.open_positions()}
     assert held["tokA"].shares == pytest.approx(2.5)
-    assert held["tokA"].entry_price == pytest.approx(0.30)
+    assert held["tokA"].entry_price == pytest.approx(0.40)
     assert held["tokA"].condition_id == "cond_tokA"
     assert held["tokB"].shares == pytest.approx(2.5)
 
@@ -124,7 +115,7 @@ async def test_paper_arbitrage_fills_appear_in_dashboard_stats_and_transactions(
     db = str(tmp_path / "trades.db")
     pipeline, _ = _make_pipeline(db)
 
-    await _run(pipeline, [_signal("tokA", 0.30), _signal("tokB", 0.35)], {"tokA": 2.5, "tokB": 2.5})
+    await _run(pipeline, [_signal("tokA", 0.40), _signal("tokB", 0.40)], {"tokA": 0.40, "tokB": 0.40})
 
     assert dm.get_trade_stats(db)["total_trades"] == 2
     tx = dm.fetch_transactions(db)
@@ -136,7 +127,8 @@ async def test_paper_arbitrage_fills_appear_in_dashboard_stats_and_transactions(
 async def test_surplus_trim_is_recorded_as_a_sale_leaving_the_matched_set_held(tmp_path):
     pipeline, ctx = _make_pipeline(str(tmp_path / "trades.db"))
 
-    await _run(pipeline, [_signal("tokA", 0.30), _signal("tokB", 0.35)], {"tokA": 5.0, "tokB": 2.5})
+    # tokA fills 5 shares at $0.20, tokB 2.5 at $0.40: 2.5 tokA are surplus.
+    await _run(pipeline, [_signal("tokA", 0.30), _signal("tokB", 0.40)], {"tokA": 0.20, "tokB": 0.40})
 
     sale = [t for t in ctx.ledger.transactions() if t["kind"] == "SELL"]
     assert len(sale) == 1
@@ -150,9 +142,9 @@ async def test_surplus_trim_is_recorded_as_a_sale_leaving_the_matched_set_held(t
 async def test_dashboard_labels_arbitrage_trim_and_unwind_sales(tmp_path):
     db = str(tmp_path / "trades.db")
     trimmed, _ = _make_pipeline(db)
-    await _run(trimmed, [_signal("tokA", 0.30), _signal("tokB", 0.35)], {"tokA": 5.0, "tokB": 2.5})
+    await _run(trimmed, [_signal("tokA", 0.30), _signal("tokB", 0.40)], {"tokA": 0.20, "tokB": 0.40})
     unwound, _ = _make_pipeline(db)
-    await _run(unwound, [_signal("tokC", 0.30), _signal("tokD", 0.35)], {"tokC": 3.0})
+    await _run(unwound, [_signal("tokC", 0.30), _signal("tokD", 0.35)], {"tokC": 0.25})
 
     labels = set(dm.fetch_transactions(db)["Type"])
     assert {"SELL (Arb Trim)", "SELL (Arb Unwind)"} <= labels
@@ -162,9 +154,10 @@ async def test_dashboard_labels_arbitrage_trim_and_unwind_sales(tmp_path):
 async def test_incomplete_basket_unwind_is_recorded_and_leaves_nothing_held(tmp_path):
     pipeline, ctx = _make_pipeline(str(tmp_path / "trades.db"))
 
-    await _run(pipeline, [_signal("tokA", 0.30), _signal("tokB", 0.35)], {"tokA": 3.0})
+    # tokA fills 4 shares at $0.25; tokB is never listed, so never fills.
+    await _run(pipeline, [_signal("tokA", 0.30), _signal("tokB", 0.35)], {"tokA": 0.25})
 
-    assert _kinds(ctx.ledger) == [("BUY", "tokA", 3.0), ("SELL", "tokA", 3.0)]
+    assert _kinds(ctx.ledger) == [("BUY", "tokA", 4.0), ("SELL", "tokA", 4.0)]
     assert ctx.ledger.transactions()[0]["reason"] == "ARBITRAGE-UNWIND"
     assert {t["group_id"] for t in ctx.ledger.transactions()} == {GROUP}
     assert ctx.ledger.open_positions() == []
@@ -174,8 +167,8 @@ async def test_incomplete_basket_unwind_is_recorded_and_leaves_nothing_held(tmp_
 async def test_unprofitable_basket_unwind_is_recorded_and_leaves_nothing_held(tmp_path):
     pipeline, ctx = _make_pipeline(str(tmp_path / "trades.db"))
 
-    # $1 per leg at ~$0.49 bought only 1.8 shares: real cost ~$0.556/share.
-    await _run(pipeline, [_signal("tokA", 0.49), _signal("tokB", 0.49)], {"tokA": 1.8, "tokB": 1.8})
+    # $1 per leg at $0.50 buys 2 shares each: the basket costs its full $1 payout.
+    await _run(pipeline, [_signal("tokA", 0.50), _signal("tokB", 0.50)], {"tokA": 0.50, "tokB": 0.50})
 
     sales = [t for t in ctx.ledger.transactions() if t["kind"] == "SELL"]
     assert sorted(t["token_id"] for t in sales) == ["tokA", "tokB"]
@@ -187,9 +180,9 @@ async def test_unprofitable_basket_unwind_is_recorded_and_leaves_nothing_held(tm
 async def test_failed_unwind_sale_is_not_recorded_so_the_leg_stays_held(tmp_path):
     pipeline, ctx = _make_pipeline(str(tmp_path / "trades.db"))
 
-    await _run(pipeline, [_signal("tokA", 0.30), _signal("tokB", 0.35)], {"tokA": 3.0}, sell_ok=False)
+    await _run(pipeline, [_signal("tokA", 0.30), _signal("tokB", 0.35)], {"tokA": 0.25}, sell_ok=False)
 
-    assert _kinds(ctx.ledger) == [("BUY", "tokA", 3.0)]
+    assert _kinds(ctx.ledger) == [("BUY", "tokA", 4.0)]
     assert [h.token_id for h in ctx.ledger.open_positions()] == ["tokA"]
 
 
@@ -206,9 +199,10 @@ async def test_partial_basket_completion_adds_only_the_missing_leg(tmp_path):
                  shares=3.0, value=0.90, pnl_ratio=0.0, side="YES"),
     ]
 
-    await _run(pipeline, [_signal("tokA", 0.30), _signal("tokB", 0.35)], {"tokB": 2.85})
+    # Only tokB is bought: $1 at $0.40 fills 2.5 shares.
+    await _run(pipeline, [_signal("tokA", 0.30), _signal("tokB", 0.40)], {"tokB": 0.40})
 
     buys = [t for t in ctx.ledger.transactions() if t["kind"] == "BUY"]
     assert sorted(t["token_id"] for t in buys) == ["tokA", "tokB"]
     held = {h.token_id: (h.shares, h.group_id) for h in ctx.ledger.open_positions()}
-    assert held == {"tokA": (pytest.approx(3.0), GROUP), "tokB": (pytest.approx(2.85), GROUP)}
+    assert held == {"tokA": (pytest.approx(3.0), GROUP), "tokB": (pytest.approx(2.5), GROUP)}
