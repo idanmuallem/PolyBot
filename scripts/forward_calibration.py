@@ -35,7 +35,7 @@ import numpy as np
 
 
 def _parse_payload(text) -> dict:
-    # Mirror ui/data_manager._parse_payload_value: rows are stored as
+    # Mirror trading/ledger_backfill.parse_payload: rows are stored as
     # str(payload) (Python repr, single-quoted), NOT json.dumps - so json
     # fails and ast.literal_eval is the real path. Try both for safety.
     if isinstance(text, dict):

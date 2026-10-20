@@ -93,7 +93,7 @@ def _backfill(conn) -> int:
             params = (cutoff,)
         rows = [
             _Row(r["timestamp"], str(r["level"] or ""), r["asset_type"], str(r["token_id"] or ""),
-                 _parse(r["payload"]))
+                 parse_payload(r["payload"]))
             for r in conn.execute(sql + " ORDER BY id", params).fetchall()
         ]
         recorded = _Replay(ledger, rows).run()
@@ -255,8 +255,12 @@ class _Replay:
         self.recorded += 1
 
 
-def _parse(raw) -> dict:
-    """A hunt_history payload: JSON, or the Python repr log_event writes."""
+def parse_payload(raw) -> dict:
+    """A hunt_history payload: JSON, or the Python repr log_event writes.
+
+    The one hunt_history payload decoder. Besides this backfill, only the
+    dashboard's diagnostics views (event table, terminal feed, EV chart,
+    equity curve) use it; trading code never reads log payloads."""
     text = str(raw or "").strip()
     if not text:
         return {}

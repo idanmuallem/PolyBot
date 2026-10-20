@@ -84,68 +84,6 @@ def test_log_event_updates_ev_samples(db):
     assert bridge.ev_samples[0] == 0.42
 
 
-def test_log_event_updates_opportunity_map(db):
-    bridge = DataBridge()
-    payload = {"ev": 0.60, "post_prob": 0.70, "market_name": "BTC >100k"}
-    dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok1", payload, db_path=db)
-
-    assert "tok1" in bridge.opportunity_map
-    assert bridge.opportunity_map["tok1"]["ev"] == 0.60
-
-
-def test_log_event_opportunity_map_carries_wang_and_strategy_fields(db):
-    bridge = DataBridge()
-    payload = {
-        "ev": 0.60, "post_prob": 0.70, "market_name": "BTC >100k",
-        "pre_prob": 0.55, "wang_lambda": 0.12, "wang_fair_value": 0.62,
-        "wang_edge": 0.08, "strategy_type": "model",
-        "kelly_fraction_used": 0.25, "correlation_exposure": 0.4,
-    }
-    dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok1", payload, db_path=db)
-
-    entry = bridge.opportunity_map["tok1"]
-    assert entry["pre_prob"] == 0.55
-    assert entry["wang_lambda"] == 0.12
-    assert entry["wang_fair_value"] == 0.62
-    assert entry["wang_edge"] == 0.08
-    assert entry["strategy_type"] == "model"
-    assert entry["kelly_fraction_used"] == 0.25
-    assert entry["correlation_exposure"] == 0.4
-
-
-def test_log_event_opportunity_map_omits_missing_wang_fields(db):
-    bridge = DataBridge()
-    dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok1", {"ev": 0.5, "post_prob": 0.5}, db_path=db)
-
-    entry = bridge.opportunity_map["tok1"]
-    assert "pre_prob" not in entry
-    assert "wang_edge" not in entry
-
-
-def test_log_event_caps_opportunity_map(db):
-    bridge = DataBridge()
-    for i in range(dm.OPPORTUNITY_MAP_CAP + 50):
-        dm.log_event(bridge, "REJECTED", "Crypto::BTC", f"tok{i}", {"ev": 0.1}, db_path=db)
-
-    assert len(bridge.opportunity_map) == dm.OPPORTUNITY_MAP_CAP
-    # oldest tokens were evicted, most recent one is still present
-    assert "tok0" not in bridge.opportunity_map
-    assert f"tok{dm.OPPORTUNITY_MAP_CAP + 49}" in bridge.opportunity_map
-
-
-def test_log_event_re_touching_a_token_protects_it_from_eviction(db):
-    bridge = DataBridge()
-    dm.log_event(bridge, "TRACK", "Crypto::BTC", "keep-me", {"ev": 0.1}, db_path=db)
-    for i in range(dm.OPPORTUNITY_MAP_CAP):
-        dm.log_event(bridge, "REJECTED", "Crypto::BTC", f"tok{i}", {"ev": 0.1}, db_path=db)
-        if i == dm.OPPORTUNITY_MAP_CAP // 2:
-            # re-touch partway through the flood — should move to the back
-            # of the eviction order and survive
-            dm.log_event(bridge, "TRACK", "Crypto::BTC", "keep-me", {"ev": 0.2}, db_path=db)
-
-    assert "keep-me" in bridge.opportunity_map
-
-
 def test_log_event_non_dict_payload_does_not_crash(db):
     bridge = DataBridge()
     dm.log_event(bridge, "INFO", "Crypto::BTC", "tok1", "plain string payload", db_path=db)
@@ -452,8 +390,24 @@ def test_get_level_counts_groups_by_level(db):
     assert counts["REJECTED"] == 1
 
 
-# ── get_recent_opportunity_map / get_latest_ev_by_token: replaces
-#    bridge.opportunity_map ─────────────────────────────────────────────────────
+# ── get_position_market_names: Portfolio view labels, from the Ledger ───────
+
+def test_get_position_market_names_reads_open_ledger_holdings(db):
+    ledger = Ledger(db)
+    ledger.record_entry(token_id="tok1", condition_id="c1", side="YES", shares=10.0, price=0.4,
+                        venue="paper", strategy="crypto", market_name="Will BTC hit 100k?")
+    ledger.record_entry(token_id="sold", condition_id="c2", side="NO", shares=5.0, price=0.3,
+                        venue="paper", strategy="crypto", market_name="Gone")
+    ledger.record_exit(token_id="sold", shares=5.0, price=0.5, reason="TAKE-PROFIT", venue="paper")
+    bridge = DataBridge()
+    dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok2",
+                 {"ev": 0.5, "market_name": "Only in the event log"}, db_path=db)
+
+    assert dm.get_position_market_names(db) == {"tok1": "Will BTC hit 100k?"}
+
+
+# ── get_recent_opportunity_map / get_latest_ev_by_token: the EV-by-market
+#    chart (diagnostics, not position data) ────────────────────────────────────
 
 def test_get_recent_opportunity_map_empty_db(db):
     assert dm.get_recent_opportunity_map(db) == {}

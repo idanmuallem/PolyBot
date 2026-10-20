@@ -110,25 +110,27 @@ def test_correlation_matrix_ignores_analytics_for_closed_positions():
 
 # ── render_positions: Market/Side/Invested/Entry/Current/P&L columns ─────────
 
-def _render_positions_captured(positions, opportunity_map=None):
+def _render_positions_captured(positions, market_names=None, unrealized_pnl=0.0):
     captured = {}
+    metrics = (MagicMock(), MagicMock(), MagicMock())
 
     def _capture_dataframe(styled, **kwargs):
         captured["styled"] = styled
 
-    with patch.object(components.st, "columns", return_value=(MagicMock(), MagicMock(), MagicMock())), \
+    with patch.object(components.st, "columns", return_value=metrics), \
          patch.object(components.st, "dataframe", side_effect=_capture_dataframe):
-        components.render_positions(positions, opportunity_map)
+        components.render_positions(positions, market_names=market_names,
+                                    unrealized_pnl=unrealized_pnl)
 
     assert "styled" in captured
+    captured["styled"].data.attrs["metrics"] = metrics
     return captured["styled"].data
 
 
 def test_render_positions_has_exactly_the_redesigned_columns():
     positions = [_position_row(token_id="tok1")]
-    opportunity_map = {"tok1": {"market_name": "Will Bitcoin Reach $85,000?"}}
 
-    df = _render_positions_captured(positions, opportunity_map)
+    df = _render_positions_captured(positions, {"tok1": "Will Bitcoin Reach $85,000?"})
 
     assert list(df.columns) == ["Market", "Side", "Invested", "Entry Price", "Current Price", "P&L"]
     # No token_id/market_id/wang-edge leakage into the display.
@@ -137,12 +139,11 @@ def test_render_positions_has_exactly_the_redesigned_columns():
     assert "Wang Edge (entry)" not in df.columns
 
 
-def test_render_positions_uses_market_name_from_opportunity_map():
+def test_render_positions_uses_market_name_from_ledger_names():
     positions = [_position_row(token_id="tok1", shares=10.0, initial_price=0.40,
                                 current_price=0.50, pnl_ratio=0.25)]
-    opportunity_map = {"tok1": {"market_name": "Will Bitcoin Reach $85,000?"}}
 
-    df = _render_positions_captured(positions, opportunity_map)
+    df = _render_positions_captured(positions, {"tok1": "Will Bitcoin Reach $85,000?"})
 
     assert df.loc[0, "Market"] == "Will Bitcoin Reach $85,000?"
     assert df.loc[0, "Side"] == "YES"
@@ -153,9 +154,9 @@ def test_render_positions_uses_market_name_from_opportunity_map():
 
 
 def test_render_positions_falls_back_to_formatted_slug_when_no_market_name():
-    """No opportunity_map entry on record for this token — fall back to
-    reformatting the slug (market_id in paper mode) into something readable
-    rather than showing the raw hyphenated id."""
+    """No market name on record for this token: fall back to reformatting
+    the slug (market_id in paper mode) into something readable rather than
+    showing the raw hyphenated id."""
     positions = [_position_row(token_id="unknown_tok")]
 
     df = _render_positions_captured(positions, {})
@@ -163,12 +164,23 @@ def test_render_positions_falls_back_to_formatted_slug_when_no_market_name():
     assert df.loc[0, "Market"] == "Mkt1"  # market_id="mkt1" from the _position_row fixture
 
 
-def test_render_positions_handles_missing_analytics_gracefully():
+def test_render_positions_shows_the_engine_published_unrealized_pnl():
+    """The Unrealized PnL stat is the engine's number (computed once, by
+    Ledger.unrealized_pnl), not a second computation from the rows."""
+    positions = [_position_row(token_id="tok1", shares=10.0, initial_price=0.40,
+                                current_price=0.50)]
+
+    df = _render_positions_captured(positions, {}, unrealized_pnl=-2.5)
+
+    df.attrs["metrics"][2].metric.assert_called_once_with("Unrealized PnL", components.fmt_dollars(-2.5))
+
+
+def test_render_positions_handles_missing_names_gracefully():
     positions = [_position_row(token_id="unknown_tok")]
 
     with patch.object(components.st, "columns", return_value=(MagicMock(), MagicMock(), MagicMock())), \
          patch.object(components.st, "dataframe") as mock_dataframe:
-        components.render_positions(positions, {})  # must not raise
+        components.render_positions(positions)  # must not raise
 
     mock_dataframe.assert_called_once()
 

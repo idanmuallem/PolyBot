@@ -8,10 +8,11 @@ from core.bridge import DataBridge
 from core.models import Position
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
+from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
 
 
-def _make_pm(take_profit=0.20, stop_loss=-0.50, min_hold_ev=-0.10):
+def _make_pm(take_profit=0.20, stop_loss=-0.50, min_hold_ev=-0.10, ledger=None):
     bridge = DataBridge()
     bridge.current_balance = 50.0
     bridge.current_portfolio = []
@@ -27,8 +28,21 @@ def _make_pm(take_profit=0.20, stop_loss=-0.50, min_hold_ev=-0.10):
     ctx = WalletContext(wallet_id="test_wallet", config=config, bridge=bridge, db_path="test_wallet_trades.db")
     executor = MagicMock()
     executor.get_open_positions.return_value = []
-    pm = PortfolioManager(bridge=ctx.bridge, executor=executor, config=ctx.config, db_path=ctx.db_path)
+    pm = PortfolioManager(bridge=ctx.bridge, executor=executor, config=ctx.config,
+                          db_path=ctx.db_path, ledger=ledger)
     return pm, bridge, executor
+
+
+@pytest.fixture
+def ledger(tmp_path):
+    return Ledger(str(tmp_path / "trades.db"))
+
+
+def _enter(ledger, token_id, side="YES", strategy="crypto", **details):
+    """Record an entry fill for token_id in the Ledger with the given
+    entry details (pre_prob, post_prob, wang_edge, asset_type, ...)."""
+    ledger.record_entry(token_id=token_id, condition_id=f"cond-{token_id}", side=side,
+                        shares=10.0, price=0.40, venue="paper", strategy=strategy, **details)
 
 
 def _pos(pnl_ratio=0.0, live_ev=0.0, token_id="tok1", price=0.50, shares=10.0, value=5.0, side="YES"):
@@ -268,12 +282,12 @@ def test_no_exit_within_bounds():
 
 # ── manage_portfolio: Wang edge decay exit ────────────────────────────────────
 
-def test_wang_edge_decay_triggers_exit():
-    pm, bridge, executor = _make_pm()
+def test_wang_edge_decay_triggers_exit(ledger):
+    pm, bridge, executor = _make_pm(ledger=ledger)
     # pre_prob=0.55 -> Wang fair_value (base_lambda=0.183) ≈ 0.6212;
     # pricing the position exactly at that fair value collapses the edge to 0.
     pos = _pos(pnl_ratio=0.05, live_ev=0.0, token_id="decayed_tok", price=0.6212104251426875)
-    bridge.opportunity_map = {"decayed_tok": {"pre_prob": 0.55}}
+    _enter(ledger, "decayed_tok", pre_prob=0.55)
     executor.get_open_positions.side_effect = [[pos], []]
     executor.sell_position.return_value = True
 
@@ -284,11 +298,11 @@ def test_wang_edge_decay_triggers_exit():
     assert "WANG-EDGE-DECAY" in log_levels
 
 
-def test_healthy_wang_edge_does_not_trigger_exit():
-    pm, bridge, executor = _make_pm()
+def test_healthy_wang_edge_does_not_trigger_exit(ledger):
+    pm, bridge, executor = _make_pm(ledger=ledger)
     # Same pre_prob, but priced well below fair value -> healthy edge.
     pos = _pos(pnl_ratio=0.05, live_ev=0.0, token_id="healthy_tok", price=0.35)
-    bridge.opportunity_map = {"healthy_tok": {"pre_prob": 0.55}}
+    _enter(ledger, "healthy_tok", pre_prob=0.55)
     executor.get_open_positions.return_value = [pos]
 
     log_levels = []
@@ -300,20 +314,18 @@ def test_healthy_wang_edge_does_not_trigger_exit():
 
 # ── manage_portfolio: ENABLE_ARBITRAGE gate ───────────────────────────────────
 
-def test_arbitrage_position_skipped_entirely_when_disabled():
+def test_arbitrage_position_skipped_entirely_when_disabled(ledger):
     """With ENABLE_ARBITRAGE=False, an arbitrage-tagged position must not be
     touched by manage_portfolio() at all -- not exited, not even stashed into
     position_analytics -- while a crypto position in the same book is still
     handled normally in the same loop."""
-    pm, bridge, executor = _make_pm()
+    pm, bridge, executor = _make_pm(ledger=ledger)
     pm.enable_arbitrage = False
 
     arb_pos = _pos(pnl_ratio=0.99, token_id="arb_tok")        # would hit TAKE-PROFIT if processed
     crypto_pos = _pos(pnl_ratio=0.25, token_id="crypto_tok")  # genuinely hits TAKE-PROFIT
-    bridge.opportunity_map = {
-        "arb_tok": {"asset_type": "Arbitrage::EventSum"},
-        "crypto_tok": {"asset_type": "Crypto::BTCUSDT"},
-    }
+    _enter(ledger, "arb_tok", strategy="arbitrage", asset_type="Arbitrage::EventSum")
+    _enter(ledger, "crypto_tok", asset_type="Crypto::BTCUSDT")
     executor.get_open_positions.side_effect = [[arb_pos, crypto_pos], []]
     executor.sell_position.return_value = True
 
@@ -331,14 +343,14 @@ def test_arbitrage_position_skipped_entirely_when_disabled():
     assert "crypto_tok" in bridge.position_analytics
 
 
-def test_arbitrage_position_processed_normally_when_enabled():
+def test_arbitrage_position_processed_normally_when_enabled(ledger):
     """Sanity check: the gate only fires when the flag is off -- the same
     arbitrage-tagged position is exited normally when ENABLE_ARBITRAGE is on."""
-    pm, bridge, executor = _make_pm()
+    pm, bridge, executor = _make_pm(ledger=ledger)
     assert pm.enable_arbitrage is True
 
     arb_pos = _pos(pnl_ratio=0.99, token_id="arb_tok")
-    bridge.opportunity_map = {"arb_tok": {"asset_type": "Arbitrage::EventSum"}}
+    _enter(ledger, "arb_tok", strategy="arbitrage", asset_type="Arbitrage::EventSum")
     executor.get_open_positions.side_effect = [[arb_pos], []]
     executor.sell_position.return_value = True
 
@@ -350,7 +362,7 @@ def test_arbitrage_position_processed_normally_when_enabled():
 
 
 def test_wang_edge_decay_skipped_without_raw_probability():
-    # No opportunity_map entry and no DB row -> nothing to re-evaluate;
+    # No Ledger holding -> nothing to re-evaluate;
     # falls through to the existing P&L-based checks untouched.
     pm, bridge, executor = _make_pm()
     pos = _pos(pnl_ratio=0.10, live_ev=0.0, token_id="unknown_tok")
@@ -363,12 +375,12 @@ def test_wang_edge_decay_skipped_without_raw_probability():
     assert "WANG-EDGE-DECAY" not in log_levels
 
 
-def test_take_profit_still_wins_over_decayed_edge():
+def test_take_profit_still_wins_over_decayed_edge(ledger):
     # Hard limits are checked first: a position hitting take-profit exits as
     # TAKE-PROFIT even though its Wang edge has also collapsed to zero.
-    pm, bridge, executor = _make_pm(take_profit=0.20)
+    pm, bridge, executor = _make_pm(take_profit=0.20, ledger=ledger)
     pos = _pos(pnl_ratio=0.25, live_ev=0.0, token_id="tp_tok", price=0.6212104251426875)
-    bridge.opportunity_map = {"tp_tok": {"pre_prob": 0.55}}
+    _enter(ledger, "tp_tok", pre_prob=0.55)
     executor.get_open_positions.side_effect = [[pos], []]
     executor.sell_position.return_value = True
 
@@ -380,15 +392,15 @@ def test_take_profit_still_wins_over_decayed_edge():
     assert "WANG-EDGE-DECAY" not in log_levels
 
 
-def test_wang_edge_decay_translates_no_side_probability():
+def test_wang_edge_decay_translates_no_side_probability(ledger):
     # pre_prob is always recorded in YES-space; for a NO position the
     # "probability my side wins" is 1 - pre_prob. p=0.30 (YES) ->
     # 0.70 (NO) -> Wang fair_value ≈ 0.7603 for that translated probability;
     # pricing the NO leg exactly there collapses its edge to 0.
-    pm, bridge, executor = _make_pm()
+    pm, bridge, executor = _make_pm(ledger=ledger)
     pos = _pos(pnl_ratio=0.05, live_ev=0.0, token_id="no_tok",
                price=0.7603411908017963, side="NO")
-    bridge.opportunity_map = {"no_tok": {"pre_prob": 0.30}}
+    _enter(ledger, "no_tok", side="NO", pre_prob=0.30)
     executor.get_open_positions.side_effect = [[pos], []]
     executor.sell_position.return_value = True
 
@@ -406,14 +418,12 @@ def test_wang_decay_threshold_is_half_wang_min_edge():
 
 # ── Correlation exposure (trading/correlation.py wiring) ─────────────────────
 
-def test_get_book_asset_types_resolves_via_opportunity_map():
-    pm, bridge, executor = _make_pm()
+def test_get_book_asset_types_resolves_via_ledger(ledger):
+    pm, bridge, executor = _make_pm(ledger=ledger)
     pos_a = _pos(token_id="tokA", price=0.5)
     pos_b = _pos(token_id="tokB", price=0.5)
-    bridge.opportunity_map = {
-        "tokA": {"asset_type": "Crypto::BTCUSDT"},
-        "tokB": {"asset_type": "Weather::Miami"},
-    }
+    _enter(ledger, "tokA", asset_type="Crypto::BTCUSDT")
+    _enter(ledger, "tokB", asset_type="Weather::Miami")
     executor.get_open_positions.return_value = [pos_a, pos_b]
 
     pm._refresh_portfolio()
@@ -422,10 +432,10 @@ def test_get_book_asset_types_resolves_via_opportunity_map():
     assert set(asset_types) == {"Crypto::BTCUSDT", "Weather::Miami"}
 
 
-def test_correlation_exposure_for_averages_against_book():
-    pm, bridge, executor = _make_pm()
+def test_correlation_exposure_for_averages_against_book(ledger):
+    pm, bridge, executor = _make_pm(ledger=ledger)
     pos = _pos(token_id="tokA", price=0.5)
-    bridge.opportunity_map = {"tokA": {"asset_type": "Crypto::BTCUSDT"}}
+    _enter(ledger, "tokA", asset_type="Crypto::BTCUSDT")
     executor.get_open_positions.return_value = [pos]
     pm._refresh_portfolio()
 
@@ -443,14 +453,29 @@ def test_correlation_exposure_zero_with_no_open_positions():
     assert pm.correlation_exposure_for("Crypto::BTCUSDT") == 0.0
 
 
+# ── Unrealized P&L (one computation, Ledger.unrealized_pnl) ──────────────────
+
+def test_unrealized_pnl_marks_ledger_entries_to_venue_prices(ledger):
+    """Entry price comes from the Ledger (0.40), not the venue's own average
+    price (0.45); the venue supplies only the current mark."""
+    pm, bridge, executor = _make_pm(ledger=ledger)
+    executor.dry_run = True
+    _enter(ledger, "tokA")  # 10 shares @ 0.40, paper
+    pos = Position(market_id="m", token_id="tokA", initial_price=0.45, current_price=0.50,
+                   shares=10.0, value=5.0, pnl_ratio=0.11)
+    executor.get_open_positions.return_value = [pos]
+
+    pm.manage_portfolio(lambda *a, **kw: None)
+
+    assert bridge.unrealized_pnl == pytest.approx(1.0)
+
+
 # ── Position analytics snapshot (dashboard edge-decay tracking) ──────────────
 
-def test_manage_portfolio_stashes_position_analytics():
-    pm, bridge, executor = _make_pm()
+def test_manage_portfolio_stashes_position_analytics(ledger):
+    pm, bridge, executor = _make_pm(ledger=ledger)
     pos = _pos(pnl_ratio=0.05, token_id="analytics_tok", price=0.40)
-    bridge.opportunity_map = {
-        "analytics_tok": {"pre_prob": 0.50, "wang_edge": 0.10, "asset_type": "Crypto::BTCUSDT"},
-    }
+    _enter(ledger, "analytics_tok", pre_prob=0.50, wang_edge=0.10, asset_type="Crypto::BTCUSDT")
     executor.get_open_positions.return_value = [pos]
 
     pm.manage_portfolio(lambda *a, **kw: None)
@@ -477,12 +502,12 @@ def test_position_analytics_none_without_raw_probability():
 
 # ── optimize_for_candidate ────────────────────────────────────────────────────
 
-def test_cull_weak_position():
-    pm, bridge, executor = _make_pm()
+def test_cull_weak_position(ledger):
+    pm, bridge, executor = _make_pm(ledger=ledger)
     # Position: post_prob=0.10, current_price=0.50 → live_ev=-0.80
     # Candidate: ev=0.55; 0.55 >= -0.80 + 0.10 → cull ✓
     pos = _pos(pnl_ratio=0.0, token_id="weak_tok", price=0.50, shares=10.0, value=5.0)
-    bridge.opportunity_map = {"weak_tok": {"post_prob": 0.10}}
+    _enter(ledger, "weak_tok", post_prob=0.10)
     executor.get_open_positions.return_value = [pos]
     executor.sell_position.return_value = True
 
@@ -494,12 +519,12 @@ def test_cull_weak_position():
     executor.sell_position.assert_called_once()
 
 
-def test_no_cull_competitive_position():
-    pm, bridge, executor = _make_pm()
+def test_no_cull_competitive_position(ledger):
+    pm, bridge, executor = _make_pm(ledger=ledger)
     # Position: post_prob=0.80, current_price=0.50 → live_ev=0.60
     # Candidate: ev=0.55; 0.55 < 0.60 + 0.10=0.70 → don't cull ✓
     pos = _pos(pnl_ratio=0.0, token_id="comp_tok", price=0.50, shares=10.0, value=5.0)
-    bridge.opportunity_map = {"comp_tok": {"post_prob": 0.80}}
+    _enter(ledger, "comp_tok", post_prob=0.80)
     executor.get_open_positions.return_value = [pos]
 
     freed = pm.optimize_for_candidate(

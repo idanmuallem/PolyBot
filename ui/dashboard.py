@@ -176,9 +176,8 @@ def _render_global_kpis() -> None:
 
     # Total PnL = Balance - Total Deposits: the true all-in figure (realized
     # + unrealized + fees + slippage), not just the open-positions-only
-    # unrealized P&L (still computed engine-side by
-    # PortfolioManager._refresh_portfolio() for anything that wants the
-    # narrower figure). Shares _compute_balance_snapshot() with the Balance
+    # unrealized P&L (computed once, engine-side, by Ledger.unrealized_pnl
+    # and shown in the Portfolio view via engine_status). Shares _compute_balance_snapshot() with the Balance
     # view's own stats row so this KPI is numerically guaranteed to equal
     # "Current Balance - Total Deposits".
     c2.metric("Total PnL", fmt_dollars(balance - total_deposits))
@@ -256,8 +255,12 @@ def _render_hunter_view() -> None:
 def _render_portfolio_view() -> None:
     st.markdown("### Portfolio")
     positions = data_manager.read_open_positions(wallet_ctx.db_path)
-    opportunity_map = data_manager.get_recent_opportunity_map(wallet_ctx.db_path)
-    render_positions(positions, opportunity_map)
+    status = data_manager.read_engine_status(wallet_ctx.db_path) or {}
+    render_positions(
+        positions,
+        market_names=data_manager.get_position_market_names(wallet_ctx.db_path),
+        unrealized_pnl=float(status.get("unrealized_pnl") or 0.0),
+    )
     st.markdown("#### EV by Market")
     render_ev_chart(data_manager.get_latest_ev_by_token(wallet_ctx.db_path, limit=15))
     st.markdown("#### Transactions")

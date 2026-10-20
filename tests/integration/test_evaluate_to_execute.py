@@ -491,14 +491,16 @@ def test_candidate_kelly_fraction_used_matches_config():
 
 
 @freeze_time("2026-06-02T00:00:00+00:00")
-def test_correlation_exposure_reflects_open_book():
+def test_correlation_exposure_reflects_open_book(tmp_path):
+    from trading.ledger import Ledger
+
     pipeline, bridge, _ = _wang_pipeline()
-    # SimpleNamespace, not MagicMock: a bare Position-like object whose
-    # missing attributes are genuinely absent (MagicMock auto-vivifies any
-    # attribute access, which would short-circuit the opportunity_map lookup
-    # this test is actually exercising).
+    # The book's asset types come from the Ledger's entry details.
+    ledger = Ledger(str(tmp_path / "trades.db"))
+    ledger.record_entry(token_id="existing_tok", condition_id="c0", side="YES", shares=10.0,
+                        price=0.30, venue="paper", strategy="crypto", asset_type="Crypto::BTCUSDT")
+    pipeline.ctx.portfolio_manager.ledger = ledger
     bridge.current_portfolio = [SimpleNamespace(token_id="existing_tok")]
-    bridge.opportunity_map = {"existing_tok": {"asset_type": "Crypto::BTCUSDT"}}
     market = _market(price=0.30, expiry_days=10, asset_type="Crypto::BTCUSDT")
     mock_hunter = MagicMock()
     mock_hunter.get_live_truth.return_value = 97_000.0

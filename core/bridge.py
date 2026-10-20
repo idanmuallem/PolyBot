@@ -30,8 +30,6 @@ class DataBridge:
         self.peak_equity = 0.0
         self.current_drawdown_pct = 0.0
         self.position_analytics = {}  # token_id -> Wang edge-decay/asset_type snapshot (see PortfolioManager)
-        self.opportunity_map = {}
-        self.market_name_by_token = {}
         self.current_portfolio = []
         self.open_position_value = 0.0
         self.open_positions_value = 0.0

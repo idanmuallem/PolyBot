@@ -1,6 +1,3 @@
-import json
-import os
-import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -9,22 +6,6 @@ from ui import data_manager
 
 from brains.pricing_engine import PricingEngine
 from trading.correlation import CorrelationTracker
-
-
-def _parse_payload(payload_value) -> dict:
-    if isinstance(payload_value, dict):
-        return payload_value
-    text = str(payload_value or "").strip()
-    if not text:
-        return {}
-    try:
-        return json.loads(text)
-    except Exception:
-        try:
-            import ast
-            return ast.literal_eval(text)
-        except Exception:
-            return {}
 
 
 class PortfolioManager:
@@ -92,18 +73,12 @@ class PortfolioManager:
         total_open_value = sum(float(getattr(p, "value", 0.0) or 0.0) for p in positions)
         self.bridge.open_position_value = float(total_open_value)
         self.bridge.open_positions_value = float(total_open_value)
-        # Unrealized only — open positions' (current - entry) x shares. The
-        # top-level "Total PnL" KPI (ui/dashboard.py::_render_global_kpis)
-        # uses the broader Balance - Total Deposits figure instead (realized
-        # + unrealized + fees + slippage); this narrower figure stays
-        # available under its own name for callers that specifically want it
-        # (e.g. ui/components.py's Portfolio-view "Unrealized PnL" stat,
-        # computed independently there but conceptually the same number).
-        self.bridge.unrealized_pnl = sum(
-            (float(getattr(p, "current_price", 0.0) or 0.0) - float(getattr(p, "initial_price", 0.0) or 0.0))
-            * float(getattr(p, "shares", 0.0) or 0.0)
-            for p in positions
-        )
+        # Unrealized only: Ledger entry prices marked to the venue's current
+        # prices (Ledger.unrealized_pnl, the one place it is computed). The
+        # engine publishes it via engine_status; the dashboard's Portfolio
+        # view shows that number rather than recomputing it. The top-level
+        # "Total PnL" KPI uses Balance - Total Deposits instead.
+        self.bridge.unrealized_pnl = self._unrealized_pnl(positions)
 
         # Paper tracking mark-to-market snapshot (Phase 3)
         if getattr(self.executor, "dry_run", True):
@@ -115,155 +90,68 @@ class PortfolioManager:
                     data_manager.insert_paper_snapshot(self.db_path, cash, positions_value)
                 self._last_snapshot_at = now
 
+    def _unrealized_pnl(self, positions) -> float:
+        if self.ledger is None:
+            return 0.0
+        marks = {
+            str(self._position_field(p, "token_id", "") or ""):
+                float(self._position_field(p, "current_price", 0.0) or 0.0)
+            for p in positions
+        }
+        try:
+            return float(self.ledger.unrealized_pnl(marks, venue=self._venue()))
+        except Exception as exc:
+            print(f"[PORTFOLIO] Unrealized P&L unavailable: {exc}")
+            return 0.0
+
     @staticmethod
     def _position_field(position, field_name, default=None):
         if isinstance(position, dict):
             return position.get(field_name, default)
         return getattr(position, field_name, default)
 
-    def _fair_value_from_db(self, token_id: str, market_id: str):
-        """Look up latest fair value for a position from the trade history DB."""
-        if not self.db_path or not os.path.exists(self.db_path):
+    def _entry(self, position):
+        """This position's entry details as the Ledger recorded them (a
+        trading.ledger.Holding), or None when the Ledger has no open
+        holding for its token (or there is no Ledger)."""
+        if self.ledger is None:
+            return None
+        token_id = str(self._position_field(position, "token_id", "") or "")
+        if not token_id:
             return None
         try:
-            with sqlite3.connect(self.db_path, timeout=5) as conn:
-                cursor = conn.cursor()
-                for lookup_id in (token_id, market_id):
-                    if not lookup_id:
-                        continue
-                    cursor.execute(
-                        """
-                        SELECT payload FROM hunt_history
-                        WHERE token_id = ?
-                          AND level IN ('AUTO-TRADE', 'LIVE-TRADE', 'DRY-RUN', 'PAPER-TRADE', 'TRACK')
-                        ORDER BY id DESC LIMIT 10
-                        """,
-                        (lookup_id,),
-                    )
-                    for (payload_raw,) in cursor.fetchall():
-                        payload = _parse_payload(payload_raw)
-                        for key in ("fair_value", "post_prob"):
-                            if payload.get(key) is not None:
-                                try:
-                                    return float(payload[key])
-                                except Exception:
-                                    continue
-        except Exception:
-            pass
-        return None
+            return self.ledger.holding(token_id)
+        except Exception as exc:
+            print(f"[PORTFOLIO] Ledger lookup failed for {token_id}: {exc}")
+            return None
+
+    def _entry_field(self, position, field_name: str):
+        entry = self._entry(position)
+        return getattr(entry, field_name, None) if entry is not None else None
 
     def _resolve_position_fair_value(self, position):
-        # 1. Direct attribute
-        direct = self._position_field(position, "fair_value")
-        if direct is not None:
-            try:
-                return float(direct)
-            except Exception:
-                pass
-
-        # 2. Bridge opportunity map
-        token_id = str(self._position_field(position, "token_id", "") or "")
-        market_id = str(self._position_field(position, "market_id", "") or "")
-        for key in (token_id, market_id):
-            snapshot = getattr(self.bridge, "opportunity_map", {}).get(key, {}) if key else {}
-            for payload_key in ("fair_value", "post_prob"):
-                val = snapshot.get(payload_key) if isinstance(snapshot, dict) else None
-                if val is not None:
-                    try:
-                        return float(val)
-                    except Exception:
-                        pass
-
-        # 3. DB fallback
-        return self._fair_value_from_db(token_id, market_id)
-
-    def _field_from_db(self, token_id: str, market_id: str, field_key: str, caster=float):
-        """Look up a single field from this position's most recent
-        trade-history row (same table/scan _fair_value_from_db uses),
-        converting it with `caster` (float by default; pass str for text
-        fields like asset_type)."""
-        if not self.db_path or not os.path.exists(self.db_path):
-            return None
-        try:
-            with sqlite3.connect(self.db_path, timeout=5) as conn:
-                cursor = conn.cursor()
-                for lookup_id in (token_id, market_id):
-                    if not lookup_id:
-                        continue
-                    cursor.execute(
-                        """
-                        SELECT payload FROM hunt_history
-                        WHERE token_id = ?
-                          AND level IN ('AUTO-TRADE', 'LIVE-TRADE', 'DRY-RUN', 'PAPER-TRADE', 'TRACK')
-                        ORDER BY id DESC LIMIT 10
-                        """,
-                        (lookup_id,),
-                    )
-                    for (payload_raw,) in cursor.fetchall():
-                        payload = _parse_payload(payload_raw)
-                        if payload.get(field_key) is not None:
-                            try:
-                                return caster(payload[field_key])
-                            except Exception:
-                                continue
-        except Exception:
-            pass
-        return None
-
-    def _resolve_position_field(self, position, payload_key: str, direct_key: Optional[str] = None, caster=float):
-        """Generic 3-tier lookup shared by the pre_prob/asset_type/
-        entry-wang_edge resolvers below: direct attribute -> bridge
-        opportunity_map (fast path, populated by ui/data_manager.log_event)
-        -> trade-history DB (slow path, works even across process restarts).
-        """
-        if direct_key:
-            direct = self._position_field(position, direct_key)
-            if direct is not None:
-                try:
-                    return caster(direct)
-                except Exception:
-                    pass
-
-        token_id = str(self._position_field(position, "token_id", "") or "")
-        market_id = str(self._position_field(position, "market_id", "") or "")
-
-        for key in (token_id, market_id):
-            snapshot = getattr(self.bridge, "opportunity_map", {}).get(key, {}) if key else {}
-            val = snapshot.get(payload_key) if isinstance(snapshot, dict) else None
-            if val is not None:
-                try:
-                    return caster(val)
-                except Exception:
-                    pass
-
-        return self._field_from_db(token_id, market_id, payload_key, caster=caster)
+        """The model's fair value (post_prob) recorded at entry."""
+        return self._entry_field(position, "post_prob")
 
     def _resolve_position_raw_probability(self, position):
-        """Look up the brain's raw probability estimate (p_true) recorded for
-        this position at entry (see decision_pipeline.py's TRACK payload,
-        Phase 3) — needed to re-derive the Wang edge without re-running the
-        brain/hunter for a position that's already open.
-        """
-        return self._resolve_position_field(position, "pre_prob")
+        """The brain's raw probability estimate (p_true) recorded at entry,
+        needed to re-derive the Wang edge without re-running the brain for
+        a position that's already open."""
+        return self._entry_field(position, "pre_prob")
 
     def _resolve_position_asset_type(self, position):
-        """Look up this position's asset_type (e.g. "Crypto::BTCUSDT") —
-        needed for correlation exposure, since Position itself doesn't carry it."""
-        val = self._resolve_position_field(position, "asset_type", direct_key="asset_type", caster=str)
-        return val or None
+        """This position's asset_type (e.g. "Crypto::BTCUSDT"), needed for
+        correlation exposure, since Position itself doesn't carry it."""
+        return self._entry_field(position, "asset_type") or None
 
     def _is_arbitrage_position(self, position) -> bool:
-        """True if this position's resolved asset_type marks it as an
-        arbitrage leg (e.g. "Arbitrage::EventSum", see trading/strategies/
-        event_sum.py). Used only by manage_portfolio()'s ENABLE_ARBITRAGE
-        gate below — not an exit decision itself, and not needed by any
-        crypto-only caller (correlation exposure, dashboard analytics, ...)."""
-        asset_type = self._resolve_position_asset_type(position)
-        return bool(asset_type) and asset_type.startswith("Arbitrage::")
+        """True if the Ledger tags this position as an arbitrage leg. Used
+        only by manage_portfolio()'s ENABLE_ARBITRAGE gate below."""
+        return self._entry_field(position, "strategy") == "arbitrage"
 
     def _resolve_position_entry_wang_edge(self, position):
-        """Look up the Wang edge recorded at entry, for the dashboard's edge-decay display."""
-        return self._resolve_position_field(position, "wang_edge")
+        """The Wang edge recorded at entry, for the dashboard's edge-decay display."""
+        return self._entry_field(position, "wang_edge")
 
     def _recompute_position_wang_edge(self, position) -> Optional[dict]:
         """Re-derive the CURRENT Wang edge for an open position from its
@@ -328,7 +216,9 @@ class PortfolioManager:
         return "paper" if getattr(self.executor, "dry_run", True) else "live"
 
     def _record_sale(self, position, reason: str) -> None:
-        """Record one confirmed sale of this position in the Ledger."""
+        """Record one confirmed sale of this position in the Ledger. Strategy
+        (crypto | arbitrage) and group_id come from the Ledger's own open
+        holding for the token."""
         if self.ledger is None:
             return
         self.ledger.record_exit(
@@ -337,7 +227,6 @@ class PortfolioManager:
             price=float(self._position_field(position, "current_price", 0.0) or 0.0),
             reason=reason,
             venue=self._venue(),
-            strategy="arbitrage" if self._is_arbitrage_position(position) else "crypto",
             entry_price=float(self._position_field(position, "initial_price", 0.0) or 0.0),
             side=str(self._position_field(position, "side", "") or "") or None,
         )
@@ -461,7 +350,6 @@ class PortfolioManager:
             if self.ledger is not None:
                 self.ledger.record_resolution(
                     token_id=token_id, shares=shares, payout_price=None, venue="live",
-                    strategy="arbitrage" if self._is_arbitrage_position(position) else "crypto",
                     entry_price=initial_price,
                     side=str(self._position_field(position, "side", "") or "") or None,
                 )

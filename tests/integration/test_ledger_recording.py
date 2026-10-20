@@ -205,6 +205,21 @@ def test_take_profit_sale_is_recorded_once(tmp_path):
     assert len(ledger.transactions()) == 2
 
 
+def test_sale_of_arbitrage_leg_keeps_its_ledger_strategy_tag(tmp_path):
+    """The strategy tag on a sale comes from the Ledger holding, not from
+    hunt_history payloads: an arbitrage leg with no asset_type on record is
+    still sold as arbitrage, in its basket."""
+    pm, executor, ledger, db = _portfolio(tmp_path, [_held(current=0.80)])
+    ledger.record_entry(token_id="tok1", condition_id="cond1", side="YES", shares=10.0,
+                        price=0.40, venue="paper", strategy="arbitrage", group_id="g1")
+    executor.sell_position.return_value = True
+
+    pm.manage_portfolio(lambda *a: None)
+
+    sale = ledger.transactions()[0]
+    assert (sale["kind"], sale["strategy"], sale["group_id"]) == ("SELL", "arbitrage", "g1")
+
+
 def test_failed_sale_is_not_recorded(tmp_path):
     pm, executor, ledger, db = _portfolio(tmp_path, [_held(current=0.80)])
     ledger.record_entry(token_id="tok1", condition_id="cond1", side="YES", shares=10.0,
@@ -233,8 +248,8 @@ def test_free_up_capital_sale_is_recorded(tmp_path):
 def test_portfolio_cull_sale_is_recorded(tmp_path):
     pm, executor, ledger, db = _portfolio(tmp_path, [_held(current=0.50)])
     ledger.record_entry(token_id="tok1", condition_id="cond1", side="YES", shares=10.0,
-                        price=0.40, venue="paper", strategy="crypto")
-    pm.bridge.opportunity_map["tok1"] = {"post_prob": 0.50}  # live_ev ~ 0: weak
+                        price=0.40, venue="paper", strategy="crypto",
+                        post_prob=0.50)  # live_ev ~ 0 at 0.50: weak
     executor.sell_position.return_value = True
 
     pm.optimize_for_candidate(new_candidate_ev=1.0, log_func=lambda *a: None)

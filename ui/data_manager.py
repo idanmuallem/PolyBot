@@ -6,27 +6,7 @@ from datetime import datetime
 import pandas as pd
 
 from trading.ledger import Ledger, init_schema as init_ledger_schema
-from trading.ledger_backfill import backfill_hunt_history
-
-
-# ---------------------------------------------------------------------------
-# Payload parsing
-# ---------------------------------------------------------------------------
-
-def _parse_payload_value(payload_value) -> dict:
-    if isinstance(payload_value, dict):
-        return payload_value
-    text = str(payload_value or "").strip()
-    if not text:
-        return {}
-    try:
-        return json.loads(text)
-    except Exception:
-        try:
-            import ast
-            return ast.literal_eval(text)
-        except Exception:
-            return {}
+from trading.ledger_backfill import backfill_hunt_history, parse_payload
 
 
 # ---------------------------------------------------------------------------
@@ -313,18 +293,12 @@ def get_level_counts(db_path: str) -> dict:
 
 def get_recent_opportunity_map(db_path: str, scan_limit: int = 500) -> dict:
     """token_id -> most-recent EV-carrying hunt_history payload (market_name,
-    ev, post_prob, asset_type). Replaces the old in-memory
-    bridge.opportunity_map, which was itself built from exactly these same
-    payloads (see the old log_event()) — so this is a direct re-derivation
-    from hunt_history, not a new source of truth. Used both for the
-    EV-by-market chart (get_latest_ev_by_token) and to label open positions
-    with a readable market name (render_positions — Position itself only
-    carries token_id/market_id, not a question/name).
+    ev, post_prob, asset_type), for the EV-by-market chart
+    (get_latest_ev_by_token). Diagnostics only: position fields (names,
+    entry details) come from the Ledger, never from here.
 
-    `market_name` is left as-is from the payload (possibly missing/None) —
-    callers that need a guaranteed display string apply their own fallback
-    (get_latest_ev_by_token falls back to the token_id itself; ui/components.py's
-    _readable_market_name falls back to a reformatted market_id/token_id slug).
+    `market_name` is left as-is from the payload (possibly missing/None);
+    get_latest_ev_by_token falls back to the token_id itself.
     """
     try:
         with _open_db(db_path) as conn:
@@ -340,7 +314,7 @@ def get_recent_opportunity_map(db_path: str, scan_limit: int = 500) -> dict:
         token_id = str(token_id)
         if token_id in seen:
             continue
-        payload = _parse_payload_value(payload_raw)
+        payload = parse_payload(payload_raw)
         if not isinstance(payload, dict) or "ev" not in payload:
             continue
         try:
@@ -386,7 +360,7 @@ def get_terminal_feed(db_path: str, limit: int = 20) -> list[str]:
 
     lines = []
     for level, asset_type, payload_raw in rows:
-        payload = _parse_payload_value(payload_raw)
+        payload = parse_payload(payload_raw)
         reason = str(payload.get("reason", "")).strip() if isinstance(payload, dict) else ""
         market_name = str(payload.get("market_name", "")).strip() if isinstance(payload, dict) else ""
         ev_value = payload.get("ev") if isinstance(payload, dict) else None
@@ -399,19 +373,6 @@ def get_terminal_feed(db_path: str, limit: int = 20) -> list[str]:
 # ---------------------------------------------------------------------------
 # Event logging
 # ---------------------------------------------------------------------------
-
-# bridge.opportunity_map keeps one entry per token_id ever seen with an "ev"
-# in its payload (REJECTED/TRACK/AUTO-TRADE/...), and — unlike the hunter's
-# own cooldown cache (PolymarketScannerHunter.seen_markets, pruned by age
-# every scan) — nothing ever removed an entry. Over a long-running engine
-# process that's an unbounded, ever-growing dict: the confirmed cause of the
-# Aug 29 2026 OOM (run_engine.py's RSS reached ~416MB on a 916MB host after
-# ~29h). Cap it the same way ev_samples below is capped, evicting the
-# least-recently-touched token first. risk_manager's opportunity_map lookups
-# already fall back to a DB query on a miss, so evicting a still-open
-# position's entry only costs a slower lookup, not correctness.
-OPPORTUNITY_MAP_CAP = 500
-
 
 def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -438,39 +399,6 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
     except Exception as e:
         print(f"[DASHBOARD] Log DB error: {e}")
 
-    if isinstance(payload, dict) and "ev" in payload:
-        try:
-            entry = {
-                "token_id": str(token_id),
-                "asset_type": str(asset_type),
-                "ev": float(payload.get("ev", 0.0)),
-                "post_prob": float(payload.get("post_prob", 0.0)),
-                "market_name": str(
-                    payload.get("market_name")
-                    or bridge.market_name_by_token.get(str(token_id), bridge.market_question)
-                ),
-            }
-            # Phase 7: carry the Wang/strategy/risk analytics fields through
-            # too, so PortfolioManager's in-memory lookups (pre_prob,
-            # wang_edge, asset_type for correlation) hit this fast path
-            # instead of always falling back to a DB query.
-            for key in (
-                "pre_prob", "wang_lambda", "wang_fair_value", "wang_edge",
-                "strategy_type", "kelly_fraction_used", "correlation_exposure",
-            ):
-                if payload.get(key) is not None:
-                    entry[key] = payload[key]
-            token_key = str(token_id)
-            # Pop-then-set moves this key to the end of the dict's insertion
-            # order (Python dicts preserve it) so eviction below always drops
-            # the least-recently-touched token, not an arbitrary one.
-            bridge.opportunity_map.pop(token_key, None)
-            bridge.opportunity_map[token_key] = entry
-            if len(bridge.opportunity_map) > OPPORTUNITY_MAP_CAP:
-                del bridge.opportunity_map[next(iter(bridge.opportunity_map))]
-        except Exception:
-            pass
-
     if bridge.event_count - bridge.last_summary_at >= 10:
         bridge.last_summary_at = bridge.event_count
         live = bridge.level_counts.get("LIVE-TRADE", 0)
@@ -479,7 +407,7 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
         avg_ev = sum(bridge.ev_samples) / len(bridge.ev_samples) if bridge.ev_samples else 0.0
         max_ev = max(bridge.ev_samples) if bridge.ev_samples else 0.0
         # TODO(log-noise): this periodic stdout dump (with its own "=" * 90
-        # separators) duplicates data already in bridge/opportunity_map and
+        # separators) duplicates data already in bridge and
         # isn't part of the DB-backed structured log flow — worth deciding
         # whether it earns its keep or should move behind a log-level flag.
         print("=" * 90)
@@ -552,7 +480,7 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
         if "token_id" in out.columns else "-"
     )
 
-    parsed = out["payload"].apply(_parse_payload_value) if "payload" in out.columns else pd.Series([{}] * len(out))
+    parsed = out["payload"].apply(parse_payload) if "payload" in out.columns else pd.Series([{}] * len(out))
     for col, series in _extract_payload_columns(parsed).items():
         out[col] = series
 
@@ -600,6 +528,16 @@ def get_trade_stats(db_path: str) -> dict:
     """Dashboard trade stats, read from the Ledger (trading/ledger.py) —
     hunt_history is a diagnostics log, not a trade record."""
     return Ledger(db_path).trade_stats()
+
+
+def get_position_market_names(db_path: str) -> dict:
+    """token_id -> market name recorded at entry, for every open Ledger
+    holding. Labels the Portfolio view's positions."""
+    try:
+        holdings = Ledger(db_path).open_positions()
+    except Exception:
+        return {}
+    return {h.token_id: h.market_name for h in holdings if h.market_name}
 
 
 def get_closed_trade_deltas(db_path: str) -> list:
@@ -676,7 +614,7 @@ def get_equity_curve(db_path: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["timestamp", "total_equity"])
 
-    payloads = df["payload"].apply(_parse_payload_value)
+    payloads = df["payload"].apply(parse_payload)
     df["total_equity"] = payloads.apply(
         lambda p: float(p["total_equity"]) if isinstance(p, dict) and p.get("total_equity") is not None else None
     )
