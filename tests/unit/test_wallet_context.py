@@ -134,3 +134,99 @@ def test_dry_run_wallets_get_isolated_paper_venues(tmp_path):
     assert ctx_a.bridge.current_balance == pytest.approx(300.0)
     assert (tmp_path / "alpha" / "paper_trading" / "paper.db").exists()
     assert (tmp_path / "beta" / "paper_trading" / "paper.db").exists()
+
+
+# ── build_wallet_runtime: the configured mode picks the Venue ────────────────
+
+def _stub_venues(monkeypatch, paper=None, live=None):
+    """Replace venue construction: paper/live are a Venue to hand back, or an
+    Exception for that venue failing to build."""
+    import trading.clob_venue as clob_venue
+    import trading.paper_venue as paper_venue
+
+    def build(result):
+        def _build(*_args, **_kwargs):
+            if isinstance(result, Exception):
+                raise result
+            return result
+        return _build
+
+    monkeypatch.setattr(paper_venue.PaperVenue, "for_wallet", classmethod(lambda cls, ctx: build(paper)()))
+    monkeypatch.setattr(clob_venue.ClobVenue, "from_config", classmethod(lambda cls, config: build(live)()))
+
+
+def _live_stub():
+    from tests.unit.test_clob_venue import StubClobClient
+    from trading.clob_venue import ClobVenue
+    return ClobVenue(client=StubClobClient(balance="55"), proxy_address="", http_get=None)
+
+
+def test_live_run_without_a_usable_clob_client_fails_at_startup(tmp_path, monkeypatch):
+    import pytest
+    from core.wallet_manager import build_wallet_runtime
+    from trading.clob_venue import ClobUnavailable
+    from trading.fake_venue import FakeVenue
+
+    _stub_venues(monkeypatch, paper=FakeVenue(), live=ClobUnavailable("could not derive CLOB API credentials"))
+    ctx = _make_ctx("w", str(tmp_path / "trades.db"), trading_mode="live_run")
+
+    with pytest.raises(ClobUnavailable, match="live_run.*credentials"):
+        build_wallet_runtime(ctx)
+
+
+def test_live_run_trades_on_the_clob_with_paper_on_standby(tmp_path, monkeypatch):
+    from core.wallet_manager import build_wallet_runtime
+    from trading.fake_venue import FakeVenue
+
+    paper, live = FakeVenue(cash=300.0), _live_stub()
+    _stub_venues(monkeypatch, paper=paper, live=live)
+    ctx = _make_ctx("w", str(tmp_path / "trades.db"), trading_mode="live_run")
+
+    build_wallet_runtime(ctx)
+
+    assert ctx.executor.dry_run is False
+    assert ctx.executor.get_balance() == 55.0
+    ctx.executor.dry_run = True
+    assert ctx.executor.get_balance() == 300.0
+
+
+def test_dry_run_trades_on_paper_and_can_switch_live_when_a_client_is_available(tmp_path, monkeypatch):
+    from core.wallet_manager import build_wallet_runtime
+    from trading.fake_venue import FakeVenue
+
+    _stub_venues(monkeypatch, paper=FakeVenue(cash=300.0), live=_live_stub())
+    ctx = _make_ctx("w", str(tmp_path / "trades.db"), trading_mode="dry_run")
+
+    build_wallet_runtime(ctx)
+
+    assert ctx.executor.dry_run is True
+    assert ctx.bridge.current_balance == 300.0
+    ctx.executor.dry_run = False
+    assert ctx.executor.get_balance() == 55.0
+
+
+def test_dry_run_without_a_clob_client_still_starts_but_cannot_go_live(tmp_path, monkeypatch):
+    from core.wallet_manager import build_wallet_runtime
+    from trading.clob_venue import ClobUnavailable
+    from trading.fake_venue import FakeVenue
+
+    _stub_venues(monkeypatch, paper=FakeVenue(cash=300.0), live=ClobUnavailable("missing keys"))
+    ctx = _make_ctx("w", str(tmp_path / "trades.db"), trading_mode="dry_run")
+
+    build_wallet_runtime(ctx)
+    ctx.executor.dry_run = False
+
+    assert ctx.executor.dry_run is True
+    assert ctx.executor.get_balance() == 300.0
+
+
+def test_dry_run_without_a_paper_engine_fails_at_startup(tmp_path, monkeypatch):
+    """No log-only dry-run mode: paper trading needs its paper venue."""
+    import pytest
+    from core.wallet_manager import build_wallet_runtime
+
+    _stub_venues(monkeypatch, paper=RuntimeError("pm_trader missing"), live=_live_stub())
+    ctx = _make_ctx("w", str(tmp_path / "trades.db"), trading_mode="dry_run")
+
+    with pytest.raises(RuntimeError, match="paper.*pm_trader missing"):
+        build_wallet_runtime(ctx)

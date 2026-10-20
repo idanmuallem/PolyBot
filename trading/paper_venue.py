@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from core.models import Position
-from trading.venue import LimitOrder, MarketRef, Resolution, normalize_side, report_resolution
+from trading.venue import (
+    LimitOrder, MarketRef, Resolution, log_paper_buy, log_paper_sell, normalize_side, report_resolution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,8 @@ class PaperVenue:
     engine's data, so sell() can find the slug the engine needs, including
     after a restart.
     """
+
+    name = "paper"
 
     def __init__(self, data_dir: Path, starting_balance: float, market_api: Any = None):
         """Open (or create) the paper account in *data_dir*.
@@ -148,7 +152,11 @@ class PaperVenue:
         self._positions_cache_at = now
         return positions
 
-    def buy(self, market: MarketRef, side: str, usd: float) -> bool:
+    def buy(
+        self, market: MarketRef, side: str, usd: float,
+        price: Optional[float] = None, log_func: Optional[Callable] = None,
+    ) -> bool:
+        log_paper_buy(log_func, market.token_for(side), normalize_side(side), usd, price)
         slug_or_id = self._slug_or_id(market, "skipping paper fill")
         if not slug_or_id:
             return False
@@ -169,7 +177,11 @@ class PaperVenue:
         )
         return True
 
-    def sell(self, token_id: str, shares: float) -> bool:
+    def sell(
+        self, token_id: str, shares: float,
+        price: Optional[float] = None, log_func: Optional[Callable] = None,
+    ) -> bool:
+        log_paper_sell(log_func, str(token_id), shares, price)
         mapping = self._token_map.get(str(token_id))
         if not mapping:
             logger.warning(f"[PAPER] No slug mapping for token {token_id} -- skipping paper sell")

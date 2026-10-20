@@ -397,9 +397,9 @@ The bot supports two trading modes controlled by a single environment variable:
 | `TRADING_MODE` | Behaviour |
 |---|---|
 | `dry_run` (default) | Simulates trades with virtual balance (`PAPER_BALANCE_USD`), real fee rates, full position tracking — no real orders submitted |
-| `live_run` | Submits real orders to Polymarket CLOB with real funds |
+| `live_run` | Submits real orders to Polymarket CLOB with real funds. The engine refuses to start without a usable CLOB client (private key, proxy address, derivable API credentials) |
 
-The sidebar toggle in the dashboard switches between Dry Run and Live Run at runtime without a restart.
+The sidebar toggle in the dashboard switches between Dry Run and Live Run at runtime without a restart. Switching to Live Run only takes effect if a CLOB client could be built at startup; otherwise the engine stays on paper.
 
 > Start with `TRADING_MODE=dry_run` to observe and validate the engine's decisions before committing real funds.
 
