@@ -526,32 +526,6 @@ def test_dry_run_reflects_the_active_venue():
     assert TradeExecutor(_dry_config(trading_mode="live_run"), venue=_clob_venue()).dry_run is False
 
 
-def test_switching_to_live_trades_on_the_standby_live_venue():
-    from trading.executor import TradeExecutor
-    paper, live = _listed_venue(cash=640.0), _clob_venue()
-    executor = TradeExecutor(_dry_config(), venue=paper, standby_venue=live)
-
-    executor.dry_run = False
-    assert executor.dry_run is False
-    assert executor.venue is live
-    assert executor.get_balance() == 42.0
-
-    executor.dry_run = True
-    assert executor.venue is paper
-    assert executor.get_balance() == 640.0
-
-
-def test_switching_to_live_without_a_live_venue_stays_on_paper():
-    """Live without a usable client never trades: the switch is refused."""
-    paper = _listed_venue()
-    executor = _make_executor(venue=paper)
-
-    executor.dry_run = False
-
-    assert executor.dry_run is True
-    assert executor.venue is paper
-
-
 # ── Paper arbitrage: limit orders through the Venue ─────────────────────────
 #
 # Paper-mode arbitrage places limit orders (capping the price paid per leg)

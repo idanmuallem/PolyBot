@@ -11,8 +11,6 @@ from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.clob_venue import ClobUnavailable, ClobVenue
-from trading.account import Account
-from trading.decision_pipeline import _default_log_func
 from trading.executor import TradeExecutor
 from trading.ledger import Ledger
 from trading.paper_venue import PaperVenue
@@ -26,8 +24,9 @@ def _build_venues(ctx: WalletContext) -> Tuple[Venue, Optional[Venue]]:
     The configured mode's Venue must build: live_run without a usable CLOB
     client raises ClobUnavailable, and dry_run without a paper engine raises
     (there is no log-only mode). The other mode's Venue is built if it can
-    be, so the dashboard can switch modes at runtime; if it can't, switching
-    to that mode is refused.
+    be, so the dashboard can switch modes at runtime (the pipeline swaps the
+    executor's Venue at a tick boundary); if it can't, switching to that mode
+    is refused.
     """
     paper: Optional[Venue] = None
     paper_error: Optional[Exception] = None
@@ -60,19 +59,13 @@ def _build_venues(ctx: WalletContext) -> Tuple[Venue, Optional[Venue]]:
 
 def build_wallet_runtime(ctx: WalletContext) -> None:
     """Build this wallet's runtime components in dependency order and attach
-    them to ctx: executor -> account -> scanner -> portfolio_manager ->
+    them to ctx: venues -> executor -> scanner -> portfolio_manager ->
     budget_manager.
     """
     ctx.ledger = Ledger(ctx.db_path)
     venue, standby_venue = _build_venues(ctx)
-    ctx.executor = TradeExecutor(config=ctx.config, venue=venue, standby_venue=standby_venue)
-    ctx.account = Account(
-        venue=lambda: ctx.executor.venue,
-        bridge=ctx.bridge,
-        ledger=ctx.ledger,
-        max_drawdown_pct=ctx.config.max_drawdown_pct,
-        log_func=_default_log_func(ctx),
-    )
+    ctx.venues = {v.name: v for v in (venue, standby_venue) if v is not None}
+    ctx.executor = TradeExecutor(config=ctx.config, venue=venue)
     ctx.scanner = PolymarketScannerHunter(
         bridge=ctx.bridge,
         executor=ctx.executor,
@@ -85,12 +78,12 @@ def build_wallet_runtime(ctx: WalletContext) -> None:
         hunter=ctx.scanner,
         db_path=ctx.db_path,
         ledger=ctx.ledger,
-        account=ctx.account,
     )
 
-    # BudgetManager's watch-only check needs the account's real cash.
+    # BudgetManager's watch-only check needs the account's real cash. The
+    # Account itself is built by the pipeline, which owns the active Venue.
     ctx.budget_manager = BudgetManager(
         bridge=ctx.bridge,
         config=ctx.config,
-        initial_balance=ctx.account.refresh().cash,
+        initial_balance=float(venue.cash()),
     )

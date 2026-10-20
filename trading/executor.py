@@ -3,7 +3,7 @@ Trade execution engine: order sizing, gating and logging on top of a Venue.
 
 The executor trades on one Venue at a time (trading/venue.py): a PaperVenue
 in paper mode, a ClobVenue in live mode. It never branches on the mode
-itself; dry_run only reports (and switches) which Venue is active.
+itself; dry_run only reports which Venue is active.
 """
 
 import asyncio
@@ -31,34 +31,21 @@ def _venue_name(venue: Any) -> str:
 class TradeExecutor:
     """Gates, sizes and places trades on the active Venue.
 
-    venue is the Venue traded on now. standby_venue, if given, is the other
-    mode's Venue: setting dry_run swaps to it (the runtime paper <-> live
-    switch). A switch to a mode with no Venue is refused, so live trading
-    without a usable CLOB client never happens.
+    venue is the Venue traded on now. The pipeline owns which Venue that is
+    and swaps it at a tick boundary (SequentialTradingPipeline
+    ._apply_mode_request()); the executor never switches it itself.
     """
 
-    def __init__(self, config: TradingConfig, venue: Venue, standby_venue: Optional[Venue] = None):
+    def __init__(self, config: TradingConfig, venue: Venue):
         self.config = config
         self.trade_count_today = 0
         self.trades_by_strategy: Dict[str, int] = {}
         self.venue = venue
-        self.standby_venue = standby_venue
 
     @property
     def dry_run(self) -> bool:
         """True while trading on a paper venue."""
         return _venue_name(self.venue) != "live"
-
-    @dry_run.setter
-    def dry_run(self, value: bool) -> None:
-        wanted = "paper" if value else "live"
-        if _venue_name(self.venue) == wanted:
-            return
-        if self.standby_venue is not None and _venue_name(self.standby_venue) == wanted:
-            self.venue, self.standby_venue = self.standby_venue, self.venue
-            print(f"[MODE] Now trading on the {wanted} venue")
-            return
-        logging.warning(f"[MODE] No {wanted} venue available -- staying on {_venue_name(self.venue)}")
 
     def get_balance(self) -> float:
         """Deployable cash on the active venue."""

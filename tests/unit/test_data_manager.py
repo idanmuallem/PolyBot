@@ -141,6 +141,21 @@ def test_get_closed_trade_deltas_reads_the_ledger(db):
     assert dm.get_closed_trade_deltas(db_path=db) == pytest.approx([0.25])
 
 
+def test_dashboard_trade_views_filter_by_venue(db):
+    """Paper and live history never mix: each view can be asked for one venue."""
+    _ledger_with_round_trip(db)  # paper
+    Ledger(db).record_entry(
+        token_id="tok2", condition_id="c2", side="NO", shares=4.0, price=0.25,
+        venue="live", strategy="crypto", market_name="Will ETH hit 5k?",
+    )
+
+    assert dm.get_trade_stats(db_path=db, venue="paper")["total_trades"] == 2
+    assert dm.get_trade_stats(db_path=db, venue="live")["total_trades"] == 1
+    assert dm.get_closed_trade_deltas(db_path=db, venue="live") == []
+    assert list(dm.fetch_transactions(db_path=db, venue="live")["Market Name"]) == ["Will ETH hit 5k?"]
+    assert len(dm.fetch_transactions(db_path=db)) == 3
+
+
 def test_fetch_transactions_empty_db(db):
     df = dm.fetch_transactions(db_path=db)
     assert df.empty

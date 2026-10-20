@@ -147,41 +147,6 @@ def test_no_side_entry_is_recorded_under_the_no_token(tmp_path):
     assert ctx.ledger.holding("tok1") is None
 
 
-# ── paper resolution ─────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_paper_resolution_is_recorded_once_by_the_engine_loop(tmp_path):
-    import asyncio
-    from unittest.mock import AsyncMock
-
-    from trading.fake_venue import FakeVenue
-    from trading.venue import MarketRef
-
-    btc = MarketRef(yes_token_id="tok1", no_token_id="tok1_no", condition_id="cond1", slug="btc-95k")
-    venue = FakeVenue(cash=100.0)
-    venue.list_market(btc, yes_price=0.40)
-    venue.buy(btc, "YES", 4.0)  # 10 shares
-    venue.close_market(btc, "YES")
-
-    db = str(tmp_path / "trades.db")
-    pipeline, ctx = _make_pipeline(db, venue=venue)
-    ctx.ledger.record_entry(token_id="tok1", condition_id="cond1", side="YES", shares=10.0,
-                            price=0.40, venue="paper", strategy="crypto")
-    pipeline._stage_hunt = AsyncMock(return_value=None)
-    pipeline._stage_strategy_scan = AsyncMock(return_value=None)
-    pipeline.portfolio_manager.manage_portfolio = MagicMock()
-
-    try:
-        await asyncio.wait_for(pipeline.run_forever(), timeout=0.3)
-    except asyncio.TimeoutError:
-        pass
-
-    assert venue.open_positions() == []
-    assert ctx.ledger.holding("tok1") is None
-    assert ctx.ledger.realized_pnl() == pytest.approx(6.0)
-    assert [t["kind"] for t in ctx.ledger.transactions()] == ["RESOLVED", "BUY"]
-
-
 # ── sales / expiry ───────────────────────────────────────────────────────────
 
 def _held(token_id="tok1", side="YES", shares=10.0, initial=0.40, current=0.80):

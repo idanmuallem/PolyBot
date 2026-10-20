@@ -524,10 +524,11 @@ def fetch_latest_history(db_path: str, limit: int = 50) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def get_trade_stats(db_path: str) -> dict:
+def get_trade_stats(db_path: str, venue: str | None = None) -> dict:
     """Dashboard trade stats, read from the Ledger (trading/ledger.py) —
-    hunt_history is a diagnostics log, not a trade record."""
-    return Ledger(db_path).trade_stats()
+    hunt_history is a diagnostics log, not a trade record. *venue*
+    ("paper" / "live") limits them to one venue; None is all venues."""
+    return Ledger(db_path).trade_stats(venue=venue)
 
 
 def get_position_market_names(db_path: str) -> dict:
@@ -540,10 +541,11 @@ def get_position_market_names(db_path: str) -> dict:
     return {h.token_id: h.market_name for h in holdings if h.market_name}
 
 
-def get_closed_trade_deltas(db_path: str) -> list:
+def get_closed_trade_deltas(db_path: str, venue: str | None = None) -> list:
     """Per-share $ P&L (exit price - entry price) for every confirmed
-    close (sale or paid-out resolution) in the Ledger."""
-    return Ledger(db_path).closed_trade_deltas()
+    close (sale or paid-out resolution) in the Ledger, optionally on one
+    venue."""
+    return Ledger(db_path).closed_trade_deltas(venue=venue)
 
 
 _SELL_REASON_LABELS = {
@@ -567,11 +569,12 @@ def _transaction_type_label(trade: dict) -> str:
     return "EXPIRED"  # RESOLVED (paid out) or EXPIRED (unconfirmed)
 
 
-def fetch_transactions(db_path: str, limit: int = 100) -> pd.DataFrame:
-    """Every buy, sale, resolution and expiry in the Ledger, newest first —
-    backs the "Transactions" table folded into the Portfolio view."""
+def fetch_transactions(db_path: str, limit: int = 100, venue: str | None = None) -> pd.DataFrame:
+    """Every buy, sale, resolution and expiry in the Ledger (optionally on
+    one venue), newest first — backs the "Transactions" table folded into
+    the Portfolio view."""
     try:
-        trades = Ledger(db_path).transactions(limit=limit)
+        trades = Ledger(db_path).transactions(limit=limit, venue=venue)
     except Exception:
         return pd.DataFrame(columns=_TRANSACTIONS_COLUMNS)
 
