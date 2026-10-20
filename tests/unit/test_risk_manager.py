@@ -8,6 +8,7 @@ from core.bridge import DataBridge
 from core.models import Position
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
+from trading.gate import Ok
 from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
 
@@ -115,11 +116,11 @@ def test_exit_position_stops_retrying_after_max_attempts():
     log_calls = []
     log_func = lambda level, asset_type, token_id, payload: log_calls.append(payload)
 
-    for _ in range(pm.MAX_EXIT_ATTEMPTS + 5):
+    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS + 5):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
 
-    assert executor.sell_position.call_count == pm.MAX_EXIT_ATTEMPTS
-    assert len(log_calls) == pm.MAX_EXIT_ATTEMPTS
+    assert executor.sell_position.call_count == pm.gate.MAX_EXIT_ATTEMPTS
+    assert len(log_calls) == pm.gate.MAX_EXIT_ATTEMPTS
     assert log_calls[-1]["gave_up_after_max_attempts"] is True
     assert "gave_up_after_max_attempts" not in log_calls[0]
 
@@ -130,13 +131,15 @@ def test_exit_position_retry_count_resets_after_a_successful_sell():
     log_func = lambda *a, **kw: None
 
     executor.sell_position.return_value = False
-    pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
-    pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
-    assert pm._exit_attempt_counts["flaky_tok"] == 2
-
+    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS - 1):
+        pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
     executor.sell_position.return_value = True
     pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
-    assert "flaky_tok" not in pm._exit_attempt_counts
+
+    executor.sell_position.return_value = False
+    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS - 1):
+        pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
+    assert isinstance(pm.gate.can_exit(pos), Ok)
 
 
 def test_gave_up_in_live_mode_logs_expired_flag():
@@ -151,7 +154,7 @@ def test_gave_up_in_live_mode_logs_expired_flag():
     log_calls = []
     log_func = lambda level, asset_type, token_id, payload: log_calls.append((level, payload))
 
-    for _ in range(pm.MAX_EXIT_ATTEMPTS):
+    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
 
     expired_calls = [p for level, p in log_calls if level == "EXPIRED"]
@@ -174,7 +177,7 @@ def test_gave_up_in_dry_run_mode_does_not_log_expired():
     log_levels = []
     log_func = lambda level, *a, **kw: log_levels.append(level)
 
-    for _ in range(pm.MAX_EXIT_ATTEMPTS):
+    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
 
     assert "EXPIRED" not in log_levels
@@ -202,10 +205,10 @@ def test_loss_type_exit_sets_cooldown(level):
     pos = _pos(pnl_ratio=-0.30, token_id="churny_tok")
     executor.sell_position.return_value = True
 
-    assert pm.exit_cooldown_until("churny_tok") is None
+    assert pm.gate.exit_cooldown_until("churny_tok") is None
     pm._exit_position(pos, level, -0.5, {}, lambda *a, **kw: None)
 
-    cooldown_until = pm.exit_cooldown_until("churny_tok")
+    cooldown_until = pm.gate.exit_cooldown_until("churny_tok")
     # frozen "now" (2026-06-02T00:00:00Z) plus the default 24h cooldown window
     assert cooldown_until == datetime(2026, 6, 3, 0, 0, tzinfo=timezone.utc)
 
@@ -220,7 +223,7 @@ def test_take_profit_exit_does_not_set_cooldown():
 
     pm._exit_position(pos, "TAKE-PROFIT", 0.20, {}, lambda *a, **kw: None)
 
-    assert pm.exit_cooldown_until("tp_tok") is None
+    assert pm.gate.exit_cooldown_until("tp_tok") is None
 
 
 @freeze_time("2026-06-02T00:00:00+00:00")
@@ -233,7 +236,7 @@ def test_failed_sell_does_not_set_cooldown():
 
     pm._exit_position(pos, "STOP-LOSS", -0.5, {}, lambda *a, **kw: None)
 
-    assert pm.exit_cooldown_until("unsellable_tok") is None
+    assert pm.gate.exit_cooldown_until("unsellable_tok") is None
 
 
 def test_exit_cooldown_expires_and_is_pruned():
@@ -243,17 +246,15 @@ def test_exit_cooldown_expires_and_is_pruned():
 
     with freeze_time("2026-06-02T00:00:00+00:00"):
         pm._exit_position(pos, "EV-CONVERGENCE", -0.10, {}, lambda *a, **kw: None)
-        assert pm.exit_cooldown_until("churny_tok") is not None
-        assert "churny_tok" in pm._exit_cooldowns
+        assert pm.gate.exit_cooldown_until("churny_tok") is not None
 
     # Just under the 24h window: still blocked.
     with freeze_time("2026-06-02T23:59:00+00:00"):
-        assert pm.exit_cooldown_until("churny_tok") is not None
+        assert pm.gate.exit_cooldown_until("churny_tok") is not None
 
-    # Past the 24h window: expired, and pruned from the dict on access.
+    # Past the 24h window: expired.
     with freeze_time("2026-06-03T01:00:00+00:00"):
-        assert pm.exit_cooldown_until("churny_tok") is None
-        assert "churny_tok" not in pm._exit_cooldowns
+        assert pm.gate.exit_cooldown_until("churny_tok") is None
 
 
 def test_ev_convergence_triggered():
@@ -553,3 +554,41 @@ def test_free_up_capital_sells_weakest_first():
 
     # Weakest position (pnl_ratio=-0.30) is sold first
     assert sold_tokens[0] == "weak"
+
+
+# ── Every exit path goes through the Gate ────────────────────────────────────
+
+def test_dead_position_retry_cap_spans_cull_swap_and_rule_exits(ledger):
+    """Regression (98748ae), extended to the cull and swap paths: a position
+    that can never sell is tried at most MAX_EXIT_ATTEMPTS times in total,
+    whichever exit path makes the attempt. Cull and swap used to bypass the
+    cap and retry it forever."""
+    pm, bridge, executor = _make_pm(ledger=ledger)
+    _enter(ledger, "dead_tok", post_prob=0.50)
+    executor.get_open_positions.return_value = [_pos(pnl_ratio=-1.0, token_id="dead_tok")]
+    executor.sell_position.return_value = False
+    noop = lambda *a, **kw: None
+
+    for _ in range(3):
+        pm.optimize_for_candidate(new_candidate_ev=1.0, log_func=noop)  # portfolio cull
+        pm.free_up_capital(1_000.0, noop)                                # opportunity swap
+        pm.manage_portfolio(noop)                                        # stop-loss
+
+    assert executor.sell_position.call_count == 5
+    assert pm.gate.can_exit(_pos(token_id="dead_tok")).reason == "exit_attempts_exhausted"
+
+
+@freeze_time("2026-06-02T00:00:00+00:00")
+@pytest.mark.parametrize("path", ["cull", "swap"])
+def test_cull_and_swap_sales_start_the_post_exit_cooldown(ledger, path):
+    pm, bridge, executor = _make_pm(ledger=ledger)
+    _enter(ledger, "weak_tok", post_prob=0.50)
+    executor.get_open_positions.return_value = [_pos(pnl_ratio=-0.10, token_id="weak_tok")]
+    executor.sell_position.return_value = True
+
+    if path == "cull":
+        pm.optimize_for_candidate(new_candidate_ev=1.0, log_func=lambda *a: None)
+    else:
+        pm.free_up_capital(1_000.0, lambda *a: None)
+
+    assert pm.gate.exit_cooldown_until("weak_tok") == datetime(2026, 6, 3, tzinfo=timezone.utc)

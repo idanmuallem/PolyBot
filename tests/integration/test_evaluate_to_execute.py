@@ -52,7 +52,7 @@ def _make_pipeline(config=None, balance=100.0, ledger=None):
         ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
-            hunter=ctx.scanner, db_path=ctx.db_path,
+            hunter=ctx.scanner, db_path=ctx.db_path, ledger=ledger,
         )
         sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
         ctx.budget_manager = BudgetManager(
