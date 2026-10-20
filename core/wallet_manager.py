@@ -11,7 +11,22 @@ from trading.budget_manager import BudgetManager
 from trading.decision_pipeline import _default_log_func, sync_live_account_state
 from trading.executor import TradeExecutor
 from trading.ledger import Ledger
+from trading.paper_venue import PaperVenue
 from trading.risk_manager import PortfolioManager
+
+
+def _paper_venue(ctx: WalletContext):
+    """This wallet's PaperVenue in dry-run, else None. A paper engine that
+    can't open leaves dry-run log-only (that mode is removed by #17)."""
+    if not ctx.config.is_dry_run:
+        return None
+    try:
+        venue = PaperVenue.for_wallet(ctx)
+        print("[PAPER] Paper trading engine initialized")
+        return venue
+    except Exception as exc:
+        print(f"[PAPER] Paper engine init failed: {exc} -- DRY-RUN log-only mode")
+        return None
 
 
 def build_wallet_runtime(ctx: WalletContext) -> None:
@@ -20,7 +35,7 @@ def build_wallet_runtime(ctx: WalletContext) -> None:
     sync) -> budget_manager.
     """
     ctx.ledger = Ledger(ctx.db_path)
-    ctx.executor = TradeExecutor(config=ctx.config)
+    ctx.executor = TradeExecutor(config=ctx.config, venue=_paper_venue(ctx))
     ctx.scanner = PolymarketScannerHunter(
         bridge=ctx.bridge,
         executor=ctx.executor,

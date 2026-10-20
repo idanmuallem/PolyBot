@@ -1,0 +1,193 @@
+"""Venue: the one port for "talk to the market".
+
+Callers name a market (MarketRef) and a side ("YES"/"NO"); the Venue owns
+turning that into the token actually traded. That YES->NO translation lives
+here, in MarketRef.token_for() and side_price(), and nowhere else.
+
+Adapters:
+    - PaperVenue (trading/paper_venue.py) wraps pm_trader.
+    - FakeVenue (trading/fake_venue.py) is an in-memory venue for tests.
+Both pass the shared contract suite in tests/unit/test_venue_contract.py.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence
+
+from core.models import Position
+
+logger = logging.getLogger(__name__)
+
+
+def normalize_side(side: Optional[str]) -> str:
+    """"YES" or "NO" (anything not NO counts as YES, matching legacy callers)."""
+    return "NO" if str(side or "YES").strip().upper() == "NO" else "YES"
+
+
+def side_price(yes_price: float, side: Optional[str]) -> float:
+    """Price of one share of *side*, given the market's YES price."""
+    if normalize_side(side) == "NO":
+        return max(1e-6, 1.0 - float(yes_price))
+    return float(yes_price)
+
+
+@dataclass(frozen=True)
+class MarketRef:
+    """What a Venue needs to identify one binary market.
+
+    yes_token_id is the market's canonical (YES) token. no_token_id is the
+    NO outcome's token, when known. condition_id/slug are what the paper
+    engine resolves markets by.
+    """
+
+    yes_token_id: str
+    no_token_id: Optional[str] = None
+    condition_id: Optional[str] = None
+    slug: Optional[str] = None
+
+    def token_for(self, side: Optional[str]) -> str:
+        """The token a *side* order trades. A NO order with no known NO
+        token falls back to the YES token id (legacy behaviour)."""
+        if normalize_side(side) == "NO" and self.no_token_id:
+            return str(self.no_token_id)
+        return str(self.yes_token_id)
+
+    @classmethod
+    def from_market(cls, market: Any) -> "MarketRef":
+        """From a MarketData (or anything shaped like one)."""
+        return cls(
+            yes_token_id=str(market.market_id),
+            no_token_id=_opt_str(getattr(market, "no_market_id", None)),
+            condition_id=_opt_str(getattr(market, "condition_id", None)),
+            slug=_opt_str(getattr(market, "slug", None)),
+        )
+
+    @classmethod
+    def from_leg(cls, leg: Mapping[str, Any]) -> "MarketRef":
+        """From an arbitrage-leg dict ({token_id, no_token_id, condition_id, slug, ...})."""
+        return cls(
+            yes_token_id=str(leg["token_id"]),
+            no_token_id=_opt_str(leg.get("no_token_id")),
+            condition_id=_opt_str(leg.get("condition_id")),
+            slug=_opt_str(leg.get("slug")),
+        )
+
+
+def _opt_str(value: Any) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+@dataclass(frozen=True)
+class LimitOrder:
+    """A resting limit order as handed back by Venue.place_limit_buy().
+
+    id is unique per venue; token_id is the token the order buys. details
+    is adapter-private data needed to poll the order later.
+    """
+
+    id: Any
+    token_id: str
+    details: Dict[str, Any] = field(default_factory=dict, compare=False)
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """One position settled by its market closing."""
+
+    token_id: str
+    side: str
+    shares: float
+    payout_price: float      # 1.0 for a winning share, 0.0 for a losing one
+    entry_price: float
+    market_name: str
+    realized_pnl: float
+
+    @property
+    def payout(self) -> float:
+        return self.shares * self.payout_price
+
+
+def report_resolution(
+    resolution: Resolution,
+    log_func: Optional[Callable] = None,
+    on_resolved: Optional[Callable[[dict], Any]] = None,
+) -> None:
+    """Hand one settled position to the engine's callbacks. Neither callback
+    failing may stop the venue settling the rest.
+
+    log_func gets an "EXPIRED" hunt_history row shaped like
+    PortfolioManager._exit_position()'s exit rows ("price" is the per-share
+    payout). on_resolved gets the record the engine writes to the Ledger.
+    """
+    if log_func is not None:
+        try:
+            log_func("EXPIRED", "Portfolio", resolution.token_id, {
+                "shares": resolution.shares,
+                "price": round(resolution.payout_price, 4),
+                "initial_price": round(resolution.entry_price, 4),
+                "side": resolution.side,
+                "market_name": resolution.market_name,
+                "payout": round(resolution.payout, 2),
+                "realized_pnl": round(resolution.realized_pnl, 4),
+                "sold": True,
+            })
+        except Exception as exc:
+            logger.warning(f"Failed to log resolved position {resolution.token_id}: {exc}")
+    if on_resolved is not None:
+        try:
+            on_resolved({
+                "token_id": resolution.token_id,
+                "shares": resolution.shares,
+                "payout_price": resolution.payout_price,
+                "entry_price": resolution.entry_price,
+                "side": resolution.side,
+                "market_name": resolution.market_name,
+            })
+        except Exception as exc:
+            logger.warning(f"on_resolved failed for {resolution.token_id}: {exc}")
+
+
+class Venue(Protocol):
+    """The trading engine's view of a market venue.
+
+    Every method is best-effort: none raises on an ordinary venue failure;
+    each reports it through its return value instead.
+    """
+
+    def cash(self) -> float:
+        """Deployable cash."""
+
+    def open_positions(self) -> List[Position]:
+        """Currently open positions, reflecting every buy/sell made so far."""
+
+    def buy(self, market: MarketRef, side: str, usd: float) -> bool:
+        """Market-buy *usd* worth of *side*. True only if the fill landed."""
+
+    def sell(self, token_id: str, shares: float) -> bool:
+        """Sell *shares* of *token_id*. True only if the sale landed."""
+
+    def place_limit_buy(
+        self, market: MarketRef, side: str, usd: float, limit_price: float,
+    ) -> Optional[LimitOrder]:
+        """Place a resting limit buy. None if it couldn't be placed."""
+
+    def poll_limit_orders(self, orders: Sequence[LimitOrder]) -> Dict[Any, float]:
+        """Advance pending limit orders against the book; return shares held
+        per order id for the token each order buys."""
+
+    def cancel_limit_order(self, order: LimitOrder) -> bool:
+        """Cancel a still-pending order. False if it wasn't pending."""
+
+    def resolve_closed_markets(
+        self,
+        resolve_arbitrage: bool = True,
+        log_func: Optional[Callable] = None,
+        on_resolved: Optional[Callable[[dict], Any]] = None,
+    ) -> int:
+        """Settle open positions in closed markets; return how many.
+        resolve_arbitrage=False leaves limit-order (arbitrage) positions
+        alone. Each settled position goes through report_resolution()."""

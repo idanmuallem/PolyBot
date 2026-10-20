@@ -20,6 +20,7 @@ from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
 from core.polymarket_client import PolymarketClient
 from trading.strategies import EventSumStrategy, Strategy
+from trading.venue import MarketRef, normalize_side
 from ui import data_manager
 
 
@@ -380,10 +381,7 @@ class SequentialTradingPipeline:
 
     @staticmethod
     def _leg_token_id(signal) -> str:
-        return (
-            signal.market.market_id if signal.side == "YES"
-            else str(getattr(signal.market, "no_market_id", None) or signal.market.market_id)
-        )
+        return MarketRef.from_market(signal.market).token_for(signal.side)
 
     def _held_token_map(self) -> dict:
         """token_id -> live Position for every currently open real position,
@@ -829,8 +827,8 @@ class SequentialTradingPipeline:
         # Prevent buying a market already in the portfolio. A NO-side paper
         # fill is recorded under the NO token's own id, not this market's
         # YES-canonical token_id used above for hunting/evaluation -- see
-        # PaperAdapter.execute_buy()'s `outcome == "no"` branch in
-        # trading/paper_adapter.py, which maps the fill to no_token_id.
+        # MarketRef.token_for() in trading/venue.py: a NO buy is
+        # held under no_token_id.
         # Matching only token_id here meant this check silently never fired
         # for any NO-side holding (confirmed in production: every held
         # position was a NO-side paper fill, so the restart-proof check
@@ -1124,10 +1122,8 @@ class SequentialTradingPipeline:
         a NO-side buy is of the NO token at 1 - YES price."""
         if self.ledger is None:
             return
-        side = str(candidate.side or "YES").upper()
-        token_id = candidate.token_id
-        if side == "NO":
-            token_id = str(getattr(candidate.market, "no_market_id", None) or candidate.token_id)
+        side = normalize_side(candidate.side)
+        token_id = MarketRef.from_market(candidate.market).token_for(side)
         price = float(candidate.entry_price)
         shares = math.floor((float(approved_bet) / price) * 100.0) / 100.0 if price > 0 else 0.0
         self.ledger.record_entry(
@@ -1178,7 +1174,7 @@ class SequentialTradingPipeline:
 
     def _record_paper_resolution(self, resolved: dict) -> None:
         """Record one paper market resolution (see
-        PaperAdapter.resolve_closed_markets(on_resolved=...)) in the Ledger."""
+        PaperVenue.resolve_closed_markets(on_resolved=...)) in the Ledger."""
         if self.ledger is None:
             return
         self.ledger.record_resolution(
@@ -1270,32 +1266,23 @@ class SequentialTradingPipeline:
                 now = time.time()
                 if now - getattr(self, "_last_resolve_check_at", 0.0) >= 900.0:  # 15 minutes
                     self._last_resolve_check_at = now
-                    paper = getattr(self.executor, "paper", None)
-                    if paper is not None:
+                    venue = getattr(self.executor, "venue", None)
+                    if venue is not None:
                         try:
-                            # NOT asyncio.to_thread: pm_trader.Engine opens its
-                            # sqlite3 connection (check_same_thread defaults to
-                            # True, and the installed package exposes no way to
-                            # override it) in whatever thread first constructs
-                            # PaperAdapter — the polybot-engine thread that also
-                            # runs this loop. to_thread hands the call to a
-                            # ThreadPoolExecutor worker thread instead, which
-                            # sqlite3 then refuses ("SQLite objects created in a
-                            # thread can only be used in that same thread"),
-                            # failing resolve_all() on every call. Calling it
-                            # directly keeps it on the connection's owning
-                            # thread; the resulting blocking network calls
-                            # (resolve_all() checks each open position's market
-                            # via the Gamma API) are accepted here the same way
-                            # _get_order_filled_shares()/_cancel_order() accept
-                            # blocking calls elsewhere in this sequential loop —
-                            # this only runs once per 15 minutes.
+                            # NOT asyncio.to_thread: PaperVenue's pm_trader
+                            # sqlite3 connection is bound to the thread that
+                            # first used it -- this loop's thread (see
+                            # trading/paper_venue.py). to_thread hands the
+                            # call to a worker thread, which sqlite3 refuses,
+                            # failing every resolution (28c7637). The blocking
+                            # network calls this makes are accepted the same
+                            # way other blocking calls are in this sequential
+                            # loop -- it only runs once per 15 minutes.
                             #
                             # resolve_arbitrage=config.enable_arbitrage: the
                             # ENABLE_ARBITRAGE kill switch also covers this
-                            # cleanup path, not just new-trade entry — see
-                            # PaperAdapter.resolve_closed_markets().
-                            paper.resolve_closed_markets(
+                            # cleanup path, not just new-trade entry.
+                            venue.resolve_closed_markets(
                                 resolve_arbitrage=self.config.enable_arbitrage,
                                 log_func=self.log_func,
                                 on_resolved=self._record_paper_resolution,

@@ -10,7 +10,7 @@ predicts correctness - the question entry_k's value should eventually be set
 from.
 
 How the data is joined (see trading/decision_pipeline.py and
-trading/paper_adapter.py):
+trading/paper_venue.py):
   - Entry: a "TRACK" hunt_history row per executed trade, payload carrying
     pre_prob (brain raw), market_price_yes (market implied prob at entry),
     post_prob, wang_lambda (= entry_k), model_used, spot, tte_days.

@@ -47,7 +47,7 @@ def _underpriced_event(event_id="evt1", n=3, price=0.30, expiry_days=None, title
     return {"id": event_id, "title": title, "markets": markets}
 
 
-def _make_pipeline(balance=100.0, config=None):
+def _make_pipeline(balance=100.0, config=None, venue=None):
     from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
 
     bridge = DataBridge()
@@ -71,18 +71,7 @@ def _make_pipeline(balance=100.0, config=None):
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
-        ctx.executor = TradeExecutor(config=ctx.config)
-        # These tests exercise arbitrage-group execution mechanics (budget
-        # gating, TTE filtering, scan ordering, ...) with MarketData
-        # fixtures that don't carry a slug/condition_id — not real
-        # paper-engine fidelity. A real PaperAdapter (constructed
-        # unconditionally by TradeExecutor.__init__ whenever pm_trader is
-        # importable) would now honestly report those buys as failed (see
-        # trading/executor.py's dry-run branches and
-        # _simulate_full_fill_arbitrage_group's fill accounting), which
-        # isn't what these tests are about. See tests/unit/test_executor.py's
-        # _make_executor() for the same rationale.
-        ctx.executor.paper = None
+        ctx.executor = TradeExecutor(config=ctx.config, venue=venue)
         ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
@@ -652,30 +641,21 @@ async def test_arbitrage_unwinds_when_group_incomplete():
     assert "event_sum:evt1" in pipeline._exhausted_arb_groups
 
 
-# ── End-to-end: real _execute_paper_limit_arbitrage_group, not a mocked
-# execute_arbitrage_group result — confirms the whole chain (limit-order
-# placement/polling in executor.py -> execute_arbitrage_group's dispatch ->
-# _execute_strategy_group's post-fill verification/unwind) works together,
-# not just each piece in isolation.
+# ── End-to-end: real _execute_paper_limit_arbitrage_group against a
+# FakeVenue, not a mocked execute_arbitrage_group result — confirms the
+# whole chain (limit orders on the Venue -> execute_arbitrage_group's
+# dispatch -> _execute_strategy_group's post-fill verification/unwind)
+# works together, not just each piece in isolation.
 
-def _mock_paper_limit_orders(fills_by_token: dict):
-    condition_to_token = {}
-
-    def fake_place_limit_buy(slug, condition_id, token_id, side, amount_usd, limit_price, no_token_id=None):
-        cond = f"cond_{token_id}"
-        condition_to_token[cond] = token_id
-        return {"id": f"order_{token_id}", "market_condition_id": cond, "outcome": side.lower()}
-
-    def fake_get_position_shares(condition_id, outcome):
-        token_id = condition_to_token.get(condition_id)
-        return fills_by_token.get(token_id, 0.0)
-
-    paper = MagicMock()
-    paper.place_limit_buy.side_effect = fake_place_limit_buy
-    paper.check_pending_limit_orders.return_value = []
-    paper.get_position_shares.side_effect = fake_get_position_shares
-    paper.cancel_limit_order.return_value = True
-    return paper
+def _venue_listing(prices: dict):
+    """A FakeVenue on which each listed token's YES side trades at its price;
+    unlisted tokens never fill."""
+    from trading.fake_venue import FakeVenue
+    from trading.venue import MarketRef
+    venue = FakeVenue(cash=100.0)
+    for token_id, price in prices.items():
+        venue.set_price(MarketRef(yes_token_id=token_id), "YES", price)
+    return venue
 
 
 @pytest.mark.asyncio
@@ -685,21 +665,19 @@ async def test_paper_limit_orders_end_to_end_some_legs_fill_others_dont():
     voids the group (arb_sets=0, per its own unfilled-leg rule), and that
     correctly flows into _execute_strategy_group's incomplete-group unwind —
     the leg that did fill gets sold back, not held as a naked position."""
-    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
-    pipeline.executor.paper = _mock_paper_limit_orders({"tokA": 3.33})  # tokB never fills
+    venue = _venue_listing({"tokA": 0.30})  # tokB never fills
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0, venue=venue)
     pipeline.config.arbitrage_order_timeout_seconds = 0.05  # keep the poll loop's deadline short
 
-    with patch.object(pipeline.executor, "sell_position", return_value=True) as mock_sell:
-        await pipeline._execute_strategy_group(
-            _FAKE_ARBITRAGE_STRATEGY, "event_sum:evt1",
-            [_signal("tokA", 0.30), _signal("tokB", 0.35)],
-        )
+    await pipeline._execute_strategy_group(
+        _FAKE_ARBITRAGE_STRATEGY, "event_sum:evt1",
+        [_signal("tokA", 0.30), _signal("tokB", 0.35)],
+    )
 
-    pipeline.executor.paper.place_limit_buy.assert_called()
-    assert pipeline.executor.paper.place_limit_buy.call_count == 2
-    mock_sell.assert_called_once()
-    assert mock_sell.call_args.args[0] == "tokA"
-    assert mock_sell.call_args.args[1] == pytest.approx(3.33)
+    assert [(op, token) for op, token, _shares, _usd in venue.fills] == [("buy", "tokA"), ("sell", "tokA")]
+    assert venue.fills[1][2] == pytest.approx(1.0 / 0.30, abs=1e-3)
+    # Only rounding dust remains (the unwind sells the fill rounded to 4dp).
+    assert sum(p.shares for p in venue.open_positions()) < 1e-3
 
     assert not [c for c in log_calls if c["level"] == "STRATEGY-LEG"]
     assert any(
@@ -711,8 +689,8 @@ async def test_paper_limit_orders_end_to_end_some_legs_fill_others_dont():
 
 @pytest.mark.asyncio
 async def test_paper_limit_orders_end_to_end_all_legs_fill():
-    pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
-    pipeline.executor.paper = _mock_paper_limit_orders({"tokA": 3.33, "tokB": 2.85})
+    venue = _venue_listing({"tokA": 0.30, "tokB": 0.35})
+    pipeline, bridge, log_calls = _make_pipeline(balance=100.0, venue=venue)
     pipeline.config.arbitrage_order_timeout_seconds = 0.05
 
     await pipeline._execute_strategy_group(
@@ -724,3 +702,4 @@ async def test_paper_limit_orders_end_to_end_all_legs_fill():
     assert len(leg_entries) == 2
     assert all(c["payload"]["executed"] for c in leg_entries)
     assert "event_sum:evt1" in pipeline._filled_arb_groups
+    assert sorted(p.token_id for p in venue.open_positions()) == ["tokA", "tokB"]

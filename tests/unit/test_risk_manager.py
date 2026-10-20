@@ -149,7 +149,7 @@ def test_gave_up_in_live_mode_logs_expired_flag():
 
 def test_gave_up_in_dry_run_mode_does_not_log_expired():
     """Paper mode's real resolutions are logged separately by
-    PaperAdapter.resolve_closed_markets(); a paper position that's merely
+    PaperVenue.resolve_closed_markets(); a paper position that's merely
     unsellable (e.g. a broken token mapping — not a market resolution)
     should not be mislabeled EXPIRED here."""
     pm, bridge, executor = _make_pm()

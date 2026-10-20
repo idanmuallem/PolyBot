@@ -454,7 +454,7 @@ class PortfolioManager:
         # redemption), so it's excluded from get_trade_stats()/
         # get_closed_trade_deltas()'s P&L aggregation, just surfaced as a
         # visibility flag in the Transactions ledger. Paper mode's
-        # equivalent (PaperAdapter.resolve_closed_markets) already logs a
+        # equivalent (PaperVenue.resolve_closed_markets) already logs a
         # sold=True EXPIRED row with a real payout, so this branch would
         # only ever double up on that — hence live-mode only.
         if gave_up and not getattr(self.executor, "dry_run", True):

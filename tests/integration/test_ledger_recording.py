@@ -23,7 +23,7 @@ from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
 
 
-def _make_pipeline(db_path, balance=100.0):
+def _make_pipeline(db_path, balance=100.0, venue=None):
     from trading.decision_pipeline import SequentialTradingPipeline, sync_live_account_state
 
     dm.init_db(db_path)
@@ -43,8 +43,7 @@ def _make_pipeline(db_path, balance=100.0):
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):
-        ctx.executor = TradeExecutor(config=ctx.config)
-        ctx.executor.paper = None  # log-only dry-run: no pm_trader in these tests
+        ctx.executor = TradeExecutor(config=ctx.config, venue=venue)
         ctx.scanner = PolymarketScannerHunter(bridge=bridge, executor=ctx.executor, config=config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=bridge, executor=ctx.executor, config=config,
@@ -138,29 +137,29 @@ async def test_paper_resolution_is_recorded_once_by_the_engine_loop(tmp_path):
     import asyncio
     from unittest.mock import AsyncMock
 
+    from trading.fake_venue import FakeVenue
+    from trading.venue import MarketRef
+
+    btc = MarketRef(yes_token_id="tok1", no_token_id="tok1_no", condition_id="cond1", slug="btc-95k")
+    venue = FakeVenue(cash=100.0)
+    venue.list_market(btc, yes_price=0.40)
+    venue.buy(btc, "YES", 4.0)  # 10 shares
+    venue.close_market(btc, "YES")
+
     db = str(tmp_path / "trades.db")
-    pipeline, ctx = _make_pipeline(db)
+    pipeline, ctx = _make_pipeline(db, venue=venue)
     ctx.ledger.record_entry(token_id="tok1", condition_id="cond1", side="YES", shares=10.0,
                             price=0.40, venue="paper", strategy="crypto")
     pipeline._stage_hunt = AsyncMock(return_value=None)
     pipeline._stage_strategy_scan = AsyncMock(return_value=None)
     pipeline.portfolio_manager.manage_portfolio = MagicMock()
 
-    def fake_resolve(resolve_arbitrage, log_func, on_resolved):
-        on_resolved({"token_id": "tok1", "shares": 10.0, "payout_price": 1.0, "entry_price": 0.40,
-                     "side": "YES", "market_name": "BTC"})
-        return 1
-
-    paper = MagicMock()
-    paper.resolve_closed_markets.side_effect = fake_resolve
-    pipeline.executor.paper = paper
-
     try:
         await asyncio.wait_for(pipeline.run_forever(), timeout=0.3)
     except asyncio.TimeoutError:
         pass
 
-    assert paper.resolve_closed_markets.call_count == 1  # 15-minute throttle
+    assert venue.open_positions() == []
     assert ctx.ledger.holding("tok1") is None
     assert ctx.ledger.realized_pnl() == pytest.approx(6.0)
     assert [t["kind"] for t in ctx.ledger.transactions()] == ["RESOLVED", "BUY"]
