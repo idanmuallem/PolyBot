@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from polymarket import PolymarketScannerHunter
     from trading.risk_manager import PortfolioManager
     from trading.budget_manager import BudgetManager
+    from trading.ledger import Ledger
 
 
 @dataclass
@@ -49,3 +50,4 @@ class WalletContext:
     scanner: Optional["PolymarketScannerHunter"] = None
     portfolio_manager: Optional["PortfolioManager"] = None
     budget_manager: Optional["BudgetManager"] = None
+    ledger: Optional["Ledger"] = None  # typed trades/positions record (trading/ledger.py)

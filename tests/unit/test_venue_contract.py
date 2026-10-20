@@ -226,3 +226,36 @@ def test_resolution_can_skip_arbitrage_positions(venue_and_exchange):
 
     assert venue.resolve_closed_markets(resolve_arbitrage=True) == 1
     assert venue.open_positions() == []
+
+
+def test_resolution_reports_each_settled_position_to_on_resolved(venue_and_exchange):
+    """on_resolved is how the engine records a resolution in the Ledger."""
+    venue, exchange = venue_and_exchange
+    exchange.list_market(BTC, yes_price=0.40)
+    venue.buy(BTC, "NO", 30.0)  # 50 NO shares at 0.60
+    exchange.close_market(BTC, "NO")
+    resolved = []
+
+    venue.resolve_closed_markets(on_resolved=resolved.append)
+
+    assert len(resolved) == 1
+    record = resolved[0]
+    assert record["token_id"] == "btc-no"
+    assert record["shares"] == pytest.approx(50.0)
+    assert record["payout_price"] == pytest.approx(1.0)
+    assert record["entry_price"] == pytest.approx(0.60)
+    assert record["side"] == "NO"
+    assert record["market_name"]
+
+
+def test_on_resolved_failure_does_not_stop_resolution(venue_and_exchange):
+    venue, exchange = venue_and_exchange
+    exchange.list_market(BTC, yes_price=0.40)
+    venue.buy(BTC, "YES", 20.0)
+    exchange.close_market(BTC, "YES")
+
+    def boom(record):
+        raise RuntimeError("ledger down")
+
+    assert venue.resolve_closed_markets(on_resolved=boom) == 1
+    assert venue.open_positions() == []

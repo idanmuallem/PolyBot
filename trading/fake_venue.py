@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from core.models import Position
-from trading.venue import LimitOrder, MarketRef, normalize_side
+from trading.venue import LimitOrder, MarketRef, Resolution, normalize_side, report_resolution
 
 MIN_ORDER_USD = 1.0  # same floor pm_trader enforces
 
@@ -131,7 +131,10 @@ class FakeVenue:
         return self._pending.pop(order.id, None) is not None
 
     def resolve_closed_markets(
-        self, resolve_arbitrage: bool = True, log_func: Optional[Callable] = None,
+        self,
+        resolve_arbitrage: bool = True,
+        log_func: Optional[Callable] = None,
+        on_resolved: Optional[Callable[[dict], Any]] = None,
     ) -> int:
         resolved = 0
         for token, holding in list(self._holdings.items()):
@@ -143,17 +146,15 @@ class FakeVenue:
             self._cash += payout
             del self._holdings[token]
             resolved += 1
-            if log_func is not None:
-                log_func("EXPIRED", "Portfolio", token, {
-                    "shares": holding.shares,
-                    "price": payout_price,
-                    "initial_price": round(holding.cost / holding.shares, 4) if holding.shares else 0.0,
-                    "side": holding.side,
-                    "market_name": holding.market.slug or token,
-                    "payout": round(payout, 2),
-                    "realized_pnl": round(payout - holding.cost, 4),
-                    "sold": True,
-                })
+            report_resolution(Resolution(
+                token_id=token,
+                side=holding.side,
+                shares=holding.shares,
+                payout_price=payout_price,
+                entry_price=holding.cost / holding.shares if holding.shares else 0.0,
+                market_name=holding.market.slug or token,
+                realized_pnl=payout - holding.cost,
+            ), log_func, on_resolved)
         return resolved
 
     # -- internals ----------------------------------------------------------

@@ -12,10 +12,13 @@ Both pass the shared contract suite in tests/unit/test_venue_contract.py.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence
 
 from core.models import Position
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_side(side: Optional[str]) -> str:
@@ -91,6 +94,63 @@ class LimitOrder:
     details: Dict[str, Any] = field(default_factory=dict, compare=False)
 
 
+@dataclass(frozen=True)
+class Resolution:
+    """One position settled by its market closing."""
+
+    token_id: str
+    side: str
+    shares: float
+    payout_price: float      # 1.0 for a winning share, 0.0 for a losing one
+    entry_price: float
+    market_name: str
+    realized_pnl: float
+
+    @property
+    def payout(self) -> float:
+        return self.shares * self.payout_price
+
+
+def report_resolution(
+    resolution: Resolution,
+    log_func: Optional[Callable] = None,
+    on_resolved: Optional[Callable[[dict], Any]] = None,
+) -> None:
+    """Hand one settled position to the engine's callbacks. Neither callback
+    failing may stop the venue settling the rest.
+
+    log_func gets an "EXPIRED" hunt_history row shaped like
+    PortfolioManager._exit_position()'s exit rows ("price" is the per-share
+    payout). on_resolved gets the record the engine writes to the Ledger.
+    """
+    if log_func is not None:
+        try:
+            log_func("EXPIRED", "Portfolio", resolution.token_id, {
+                "shares": resolution.shares,
+                "price": round(resolution.payout_price, 4),
+                "initial_price": round(resolution.entry_price, 4),
+                "side": resolution.side,
+                "market_name": resolution.market_name,
+                "payout": round(resolution.payout, 2),
+                "realized_pnl": round(resolution.realized_pnl, 4),
+                "sold": True,
+            })
+        except Exception as exc:
+            logger.warning(f"Failed to log resolved position {resolution.token_id}: {exc}")
+    if on_resolved is not None:
+        try:
+            on_resolved({
+                "token_id": resolution.token_id,
+                "shares": resolution.shares,
+                "payout_price": resolution.payout_price,
+                "entry_price": resolution.entry_price,
+                "side": resolution.side,
+                "market_name": resolution.market_name,
+            })
+        except Exception as exc:
+            logger.warning(f"on_resolved failed for {resolution.token_id}: {exc}")
+
+
 class Venue(Protocol):
     """The trading engine's view of a market venue.
 
@@ -123,8 +183,11 @@ class Venue(Protocol):
         """Cancel a still-pending order. False if it wasn't pending."""
 
     def resolve_closed_markets(
-        self, resolve_arbitrage: bool = True, log_func: Optional[Callable] = None,
+        self,
+        resolve_arbitrage: bool = True,
+        log_func: Optional[Callable] = None,
+        on_resolved: Optional[Callable[[dict], Any]] = None,
     ) -> int:
         """Settle open positions in closed markets; return how many.
         resolve_arbitrage=False leaves limit-order (arbitrage) positions
-        alone. log_func gets one EXPIRED row per settled position."""
+        alone. Each settled position goes through report_resolution()."""

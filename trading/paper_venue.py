@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from core.models import Position
-from trading.venue import LimitOrder, MarketRef, normalize_side
+from trading.venue import LimitOrder, MarketRef, Resolution, normalize_side, report_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -254,21 +254,21 @@ class PaperVenue:
             return False
 
     def resolve_closed_markets(
-        self, resolve_arbitrage: bool = True, log_func: Optional[Callable] = None,
+        self,
+        resolve_arbitrage: bool = True,
+        log_func: Optional[Callable] = None,
+        on_resolved: Optional[Callable[[dict], Any]] = None,
     ) -> int:
         """Settle paper positions in closed markets. Returns count resolved.
 
         resolve_arbitrage=False is the ENABLE_ARBITRAGE kill switch: markets
         whose position came from place_limit_buy() are skipped entirely.
-
-        log_func, when given, gets one "EXPIRED" hunt_history row per
-        resolved position, shaped like PortfolioManager._exit_position()'s
-        exit rows so it flows through the same trade-stats aggregation.
-        "price" is the per-share payout (1.0 winner, 0.0 loser).
+        Each settled position goes to log_func/on_resolved via
+        report_resolution() (trading/venue.py).
         """
         try:
             # pm_trader zeroes a position's shares when it resolves it, so
-            # snapshot them first for the EXPIRED rows.
+            # snapshot them first.
             shares_before = {
                 (p.market_condition_id, p.outcome): float(p.shares)
                 for p in self.engine.db.get_open_positions()
@@ -288,8 +288,7 @@ class PaperVenue:
                 f"[PAPER] RESOLVED {r.position.market_slug} "
                 f"{r.position.outcome} -> payout=${r.payout:.2f}"
             )
-            if log_func is not None:
-                self._log_resolved_position(r, log_func, shares_before)
+            report_resolution(self._resolution(r, shares_before), log_func, on_resolved)
         return len(results)
 
     # ------------------------------------------------------------------
@@ -337,27 +336,20 @@ class PaperVenue:
             )
         return f"__unmapped__:{slug}:{outcome}"
 
-    def _log_resolved_position(self, resolve_result, log_func, shares_before: dict) -> None:
+    def _resolution(self, resolve_result, shares_before: dict) -> Resolution:
         position = resolve_result.position
         shares = shares_before.get(
             (position.market_condition_id, position.outcome), float(position.shares or 0.0),
         )
-        payout_price = (float(resolve_result.payout) / shares) if shares else 0.0
-        token_id = self._token_for_position(position.market_slug, position.outcome)
-
-        try:
-            log_func("EXPIRED", "Portfolio", token_id, {
-                "shares": shares,
-                "price": round(payout_price, 4),
-                "initial_price": round(float(position.avg_entry_price or 0.0), 4),
-                "side": str(position.outcome or "").upper(),
-                "market_name": position.market_question or position.market_slug,
-                "payout": round(float(resolve_result.payout), 2),
-                "realized_pnl": round(float(position.realized_pnl or 0.0), 4),
-                "sold": True,
-            })
-        except Exception as exc:
-            logger.warning(f"[PAPER] Failed to log resolved position {token_id}: {exc}")
+        return Resolution(
+            token_id=self._token_for_position(position.market_slug, position.outcome),
+            side=str(position.outcome or "").upper(),
+            shares=shares,
+            payout_price=(float(resolve_result.payout) / shares) if shares else 0.0,
+            entry_price=float(position.avg_entry_price or 0.0),
+            market_name=position.market_question or position.market_slug,
+            realized_pnl=float(position.realized_pnl or 0.0),
+        )
 
     def _resolve_non_arbitrage_closed_markets(self) -> list:
         """Engine.resolve_all()'s closed-market loop, minus any market whose
