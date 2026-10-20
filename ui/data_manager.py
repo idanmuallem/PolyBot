@@ -5,6 +5,8 @@ from datetime import datetime
 
 import pandas as pd
 
+from trading.ledger import Ledger, init_schema as init_ledger_schema
+
 
 # ---------------------------------------------------------------------------
 # Payload parsing
@@ -122,6 +124,9 @@ def init_db(db_path: str):
         # file's header, so this only needs to be set once — but init_db()
         # is called by both processes at startup, so issuing it here is
         # cheap and idempotent rather than a real per-connection cost.
+        # Ledger tables (trades / positions) — see trading/ledger.py.
+        init_ledger_schema(conn)
+
         conn.execute("PRAGMA journal_mode=WAL")
 
 
@@ -583,179 +588,21 @@ def fetch_latest_history(db_path: str, limit: int = 50) -> pd.DataFrame:
 
 
 def get_trade_stats(db_path: str) -> dict:
-    _empty = {
-        "win_rate": 0.0, "total_trades": 0, "avg_win": 0.0, "avg_loss": 0.0,
-        "total_yes_trades": 0, "yes_win_rate": 0.0, "total_no_trades": 0, "no_win_rate": 0.0,
-    }
-    # EXEC_LEVELS (entries) and CLOSE_LEVELS (exits) together are every level
-    # a real trade action can be logged under — CLOSE_LEVELS matches every
-    # exit reason PortfolioManager._exit_position() can produce, plus
-    # EXPIRED (market resolution — see PaperAdapter.resolve_closed_markets()
-    # for paper mode and PortfolioManager._exit_position()'s gave-up branch
-    # for live mode; see get_closed_trade_deltas()'s docstring for the same
-    # list).
-    EXEC_LEVELS = {"LIVE-TRADE", "DRY-RUN", "PAPER-TRADE"}
-    CLOSE_LEVELS = {"TAKE-PROFIT", "STOP-LOSS", "WANG-EDGE-DECAY", "EV-CONVERGENCE", "EXPIRED"}
-
-    try:
-        with _open_db(db_path) as conn:
-            df = pd.read_sql_query(
-                "SELECT level, payload FROM hunt_history WHERE level IN "
-                "('LIVE-TRADE','DRY-RUN','PAPER-TRADE','TAKE-PROFIT','STOP-LOSS','WANG-EDGE-DECAY','EV-CONVERGENCE','EXPIRED')",
-                conn,
-            )
-    except Exception:
-        return _empty
-
-    if df.empty:
-        return _empty
-
-    total_trades = yes_trades = no_trades = 0
-    yes_wins = no_wins = yes_losses = no_losses = 0
-    realized_win: list = []
-    realized_loss: list = []
-
-    for level, payload_raw in zip(df["level"], df["payload"]):
-        payload = _parse_payload_value(payload_raw)
-        if not isinstance(payload, dict):
-            continue
-
-        side = str(payload.get("side", "")).upper()
-        gross = float(payload.get("price", 0.0) or 0.0) * float(payload.get("shares", 0.0) or 0.0)
-
-        # One row per genuine entry execution. AUTO-TRADE is deliberately
-        # excluded: evaluate_and_execute() logs AUTO-TRADE immediately before
-        # calling execute_trade(), which logs exactly one of these three for
-        # the same trade — counting both double-counted every real trade
-        # (see trading/executor.py: evaluate_and_execute() then
-        # execute_trade()).
-        if level in EXEC_LEVELS:
-            total_trades += 1
-            if side == "YES":
-                yes_trades += 1
-            elif side == "NO":
-                no_trades += 1
-            continue
-
-        # sell_position() now honestly reports failure (see
-        # trading/executor.py) rather than the old hardcoded True, so a
-        # position that can't actually be sold gets retried on every loop
-        # tick indefinitely, logging a fresh sold: false row each time.
-        # Those aren't real closed trades — price and shares are still
-        # present on a failed attempt (they describe the position being
-        # evaluated, not the sale's outcome).
-        if level not in CLOSE_LEVELS or not payload.get("sold"):
-            continue
-
-        if level == "TAKE-PROFIT":
-            # Win/loss is implied by the level itself — TAKE-PROFIT only
-            # logs once pnl_ratio has already cleared the profit threshold.
-            is_win = True
-        elif level == "STOP-LOSS":
-            is_win = False
-        else:
-            # WANG-EDGE-DECAY/EV-CONVERGENCE trigger off estimated edge/EV
-            # collapsing, not a P&L threshold, so the close isn't inherently
-            # a win or a loss — derive it from the realized price move on
-            # the held side, the same way get_closed_trade_deltas() does.
-            price = payload.get("price")
-            initial_price = payload.get("initial_price")
-            if price is None or initial_price is None:
-                continue
-            try:
-                delta = float(price) - float(initial_price)
-            except (TypeError, ValueError):
-                continue
-            if delta == 0:
-                continue
-            is_win = delta > 0
-
-        if gross <= 0:
-            continue
-
-        total_trades += 1
-        if is_win:
-            realized_win.append(gross)
-            if side == "YES":
-                yes_wins += 1
-            elif side == "NO":
-                no_wins += 1
-        else:
-            realized_loss.append(gross)
-            if side == "YES":
-                yes_losses += 1
-            elif side == "NO":
-                no_losses += 1
-
-    denom = len(realized_win) + len(realized_loss)
-    yes_denom = yes_wins + yes_losses
-    no_denom = no_wins + no_losses
-
-    return {
-        "win_rate":        round(len(realized_win) / denom * 100.0, 2) if denom > 0 else 0.0,
-        "total_trades":    total_trades,
-        "avg_win":         round(sum(realized_win) / len(realized_win), 2) if realized_win else 0.0,
-        "avg_loss":        round(sum(realized_loss) / len(realized_loss), 2) if realized_loss else 0.0,
-        "total_yes_trades": yes_trades,
-        "yes_win_rate":    round(yes_wins / yes_denom * 100.0, 2) if yes_denom > 0 else 0.0,
-        "total_no_trades": no_trades,
-        "no_win_rate":     round(no_wins / no_denom * 100.0, 2) if no_denom > 0 else 0.0,
-    }
+    """Dashboard trade stats, read from the Ledger (trading/ledger.py) —
+    hunt_history is a diagnostics log, not a trade record."""
+    return Ledger(db_path).trade_stats()
 
 
 def get_closed_trade_deltas(db_path: str) -> list:
-    """Per-share $ P&L (exit price - entry price) for every closed position,
-    across every exit reason PortfolioManager._exit_position() logs
-    (TAKE-PROFIT, STOP-LOSS, WANG-EDGE-DECAY, EV-CONVERGENCE) plus EXPIRED
-    (market resolution) — not just the take-profit/stop-loss subset
-    get_trade_stats() uses for win/loss counts.
-
-    Needs both "price" (exit) and "initial_price" (entry) in the payload;
-    rows logged before initial_price was added to that payload won't have
-    it and are silently skipped, same as any other missing/malformed field.
-
-    Requires payload["sold"] to be truthy. _exit_position() logs one of
-    these levels on every exit ATTEMPT, whether or not the sell actually
-    succeeded (sell_position()'s return value is now honest — see
-    trading/executor.py — rather than the old hardcoded True). A position
-    that can't actually be sold (e.g. a missing paper-adapter token
-    mapping) gets retried on every loop tick indefinitely, logging a fresh
-    sold: false row each time; without this filter those repeated failed
-    attempts against one still-open position would swamp this average,
-    since they're not real closed trades at all.
-    """
-    try:
-        with _open_db(db_path) as conn:
-            rows = conn.execute(
-                "SELECT payload FROM hunt_history WHERE level IN "
-                "('TAKE-PROFIT','STOP-LOSS','WANG-EDGE-DECAY','EV-CONVERGENCE','EXPIRED')"
-            ).fetchall()
-    except Exception:
-        return []
-
-    deltas = []
-    for (payload_raw,) in rows:
-        payload = _parse_payload_value(payload_raw)
-        if not isinstance(payload, dict):
-            continue
-        if not payload.get("sold"):
-            continue
-        price = payload.get("price")
-        initial_price = payload.get("initial_price")
-        if price is None or initial_price is None:
-            continue
-        try:
-            deltas.append(float(price) - float(initial_price))
-        except (TypeError, ValueError):
-            continue
-    return deltas
+    """Per-share $ P&L (exit price - entry price) for every confirmed
+    close (sale or paid-out resolution) in the Ledger."""
+    return Ledger(db_path).closed_trade_deltas()
 
 
-_TRANSACTION_TYPE_LABELS = {
-    "LIVE-TRADE": "BUY", "DRY-RUN": "BUY", "PAPER-TRADE": "BUY",
+_SELL_REASON_LABELS = {
     "TAKE-PROFIT": "SELL (Take-Profit)", "STOP-LOSS": "SELL (Stop-Loss)",
     "WANG-EDGE-DECAY": "SELL (Edge Decay)", "EV-CONVERGENCE": "SELL (EV Converged)",
-    "EXPIRED": "EXPIRED",
+    "PORTFOLIO-CULL": "SELL (Cull)", "OPPORTUNITY-SWAP": "SELL (Swap)",
 }
 
 _TRANSACTIONS_COLUMNS = [
@@ -764,74 +611,37 @@ _TRANSACTIONS_COLUMNS = [
 ]
 
 
+def _transaction_type_label(trade: dict) -> str:
+    if trade["kind"] == "BUY":
+        return "BUY"
+    if trade["kind"] == "SELL":
+        return _SELL_REASON_LABELS.get(trade.get("reason") or "", "SELL")
+    return "EXPIRED"  # RESOLVED (paid out) or EXPIRED (unconfirmed)
+
+
 def fetch_transactions(db_path: str, limit: int = 100) -> pd.DataFrame:
-    """Every buy (entry) and sell/expiry (exit) row as one ledger, newest
-    first — backs the "Transactions" table folded into the Portfolio view.
-
-    Buys are EXEC_LEVELS (LIVE-TRADE/DRY-RUN/PAPER-TRADE); exits are
-    CLOSE_LEVELS (see get_trade_stats()) plus EXPIRED market resolutions
-    (PaperAdapter.resolve_closed_markets() in paper mode,
-    PortfolioManager._exit_position()'s gave-up branch in live mode).
-
-    A non-EXPIRED exit row without payload["sold"] is a failed sell retry,
-    not a real closed trade — dropped, same filter get_closed_trade_deltas()
-    applies. EXPIRED rows are always kept even when sold is False: that's
-    the live-mode "gave up, likely resolved, no confirmed payout" flag,
-    which is a one-time event (not a retry loop) worth surfacing even
-    without a known P&L (see _exit_position()'s EXPIRED branch).
-    """
-    levels_sql = "'" + "','".join(_TRANSACTION_TYPE_LABELS.keys()) + "'"
+    """Every buy, sale, resolution and expiry in the Ledger, newest first —
+    backs the "Transactions" table folded into the Portfolio view."""
     try:
-        with _open_db(db_path) as conn:
-            rows = conn.execute(
-                f"SELECT timestamp, level, token_id, payload FROM hunt_history "
-                f"WHERE level IN ({levels_sql}) ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+        trades = Ledger(db_path).transactions(limit=limit)
     except Exception:
         return pd.DataFrame(columns=_TRANSACTIONS_COLUMNS)
 
     records = []
-    for timestamp, level, token_id, payload_raw in rows:
-        payload = _parse_payload_value(payload_raw)
-        if not isinstance(payload, dict):
-            continue
-
-        is_buy = level in ("LIVE-TRADE", "DRY-RUN", "PAPER-TRADE")
-        if not is_buy and level != "EXPIRED" and not payload.get("sold"):
-            continue
-
-        shares = payload.get("shares")
-        price = payload.get("price")
-        initial_price = payload.get("initial_price")
-        amount = payload.get("bet_amount_usd", payload.get("bet_usd"))
-        if amount is None and price is not None and shares is not None:
-            try:
-                amount = float(price) * float(shares)
-            except (TypeError, ValueError):
-                amount = None
-
-        pnl_per_share = None
-        if not is_buy and price is not None and initial_price is not None:
-            try:
-                pnl_per_share = float(price) - float(initial_price)
-            except (TypeError, ValueError):
-                pnl_per_share = None
-
-        if is_buy:
+    for t in trades:
+        if t["kind"] == "BUY":
             status = "Confirmed"
         else:
-            status = "Sold" if payload.get("sold") else "Unconfirmed"
-
+            status = "Sold" if t["confirmed"] else "Unconfirmed"
         records.append({
-            "Time": timestamp,
-            "Type": _TRANSACTION_TYPE_LABELS.get(level, level),
-            "Side": str(payload.get("side", "-") or "-").upper(),
-            "Market Name": payload.get("market_name") or str(token_id),
-            "Price": price,
-            "Shares": shares,
-            "Amount ($)": amount,
-            "P&L ($/share)": pnl_per_share,
+            "Time": t["time"],
+            "Type": _transaction_type_label(t),
+            "Side": str(t.get("side") or "-").upper(),
+            "Market Name": t.get("market_name") or str(t["token_id"]),
+            "Price": t["price"],
+            "Shares": t["shares"],
+            "Amount ($)": t["amount_usd"],
+            "P&L ($/share)": t["pnl_per_share"],
             "Status": status,
         })
 

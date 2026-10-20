@@ -10,6 +10,7 @@ from polymarket import PolymarketScannerHunter
 from trading.budget_manager import BudgetManager
 from trading.decision_pipeline import _default_log_func, sync_live_account_state
 from trading.executor import TradeExecutor
+from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
 
 
@@ -18,6 +19,7 @@ def build_wallet_runtime(ctx: WalletContext) -> None:
     them to ctx: executor -> scanner -> portfolio_manager -> (live balance
     sync) -> budget_manager.
     """
+    ctx.ledger = Ledger(ctx.db_path)
     ctx.executor = TradeExecutor(config=ctx.config)
     ctx.scanner = PolymarketScannerHunter(
         bridge=ctx.bridge,
@@ -30,6 +32,7 @@ def build_wallet_runtime(ctx: WalletContext) -> None:
         config=ctx.config,
         hunter=ctx.scanner,
         db_path=ctx.db_path,
+        ledger=ctx.ledger,
     )
 
     # Sync live balance before building BudgetManager so its initial_balance

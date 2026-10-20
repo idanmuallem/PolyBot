@@ -121,6 +121,9 @@ class SequentialTradingPipeline:
 
         self.executor = ctx.executor
         self.hunter = ctx.scanner
+        # Typed trade record (trading/ledger.py). The engine is its only
+        # writer; None (e.g. a bare test context) means not recording.
+        self.ledger = getattr(ctx, "ledger", None)
 
         # Constraint-based strategies (arbitrage) — model-free, run independently
         # of the brain/PricingEngine path above. See _stage_strategy_scan().
@@ -1105,6 +1108,48 @@ class SequentialTradingPipeline:
             "desired_bet": desired_bet,
         }
 
+    def _record_model_entry(self, candidate: CandidateTrade, approved_bet: float) -> None:
+        """Record one model entry fill in the Ledger, with its entry details.
+        Token, price and shares mirror TradeExecutor.evaluate_and_execute():
+        a NO-side buy is of the NO token at 1 - YES price."""
+        if self.ledger is None:
+            return
+        side = str(candidate.side or "YES").upper()
+        token_id = candidate.token_id
+        if side == "NO":
+            token_id = str(getattr(candidate.market, "no_market_id", None) or candidate.token_id)
+        price = float(candidate.entry_price)
+        shares = math.floor((float(approved_bet) / price) * 100.0) / 100.0 if price > 0 else 0.0
+        self.ledger.record_entry(
+            token_id=token_id,
+            condition_id=getattr(candidate.market, "condition_id", None),
+            side=side,
+            shares=shares,
+            price=price,
+            venue="paper" if getattr(self.executor, "dry_run", True) else "live",
+            strategy="crypto",
+            asset_type=candidate.asset_type,
+            market_name=candidate.question,
+            pre_prob=float(candidate.pre_prob),
+            post_prob=float(candidate.post_prob),
+            wang_edge=candidate.wang_edge,
+        )
+
+    def _record_paper_resolution(self, resolved: dict) -> None:
+        """Record one paper market resolution (see
+        PaperAdapter.resolve_closed_markets(on_resolved=...)) in the Ledger."""
+        if self.ledger is None:
+            return
+        self.ledger.record_resolution(
+            token_id=resolved["token_id"],
+            shares=float(resolved["shares"]),
+            payout_price=float(resolved["payout_price"]),
+            venue="paper",
+            entry_price=resolved.get("entry_price"),
+            side=resolved.get("side"),
+            market_name=resolved.get("market_name"),
+        )
+
     def _stage_execute(self, candidate: CandidateTrade, approved_bet: float, risk_context: dict):
         executed = self.executor.evaluate_and_execute(
             market=candidate.market,
@@ -1118,6 +1163,7 @@ class SequentialTradingPipeline:
         )
 
         if executed:
+            self._record_model_entry(candidate, approved_bet)
             self.budget_manager.record_trade(float(approved_bet), strategy_tag="crypto")
             self.spent_today = float(self.budget_manager.total_spent_today)
             self._set_spend(self.spent_today)
@@ -1211,6 +1257,7 @@ class SequentialTradingPipeline:
                             paper.resolve_closed_markets(
                                 resolve_arbitrage=self.config.enable_arbitrage,
                                 log_func=self.log_func,
+                                on_resolved=self._record_paper_resolution,
                             )
                         except Exception as e:
                             self.log_func("PAPER-ERROR", "Engine", "resolve_all", {"error": str(e)})

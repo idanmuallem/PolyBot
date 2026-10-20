@@ -6,6 +6,7 @@ import pytest
 
 import ui.data_manager as dm
 from core.bridge import DataBridge
+from trading.ledger import Ledger
 
 
 @pytest.fixture
@@ -153,7 +154,17 @@ def test_log_event_non_dict_payload_does_not_crash(db):
     assert rows[0][0] == "plain string payload"
 
 
-# ── get_trade_stats ───────────────────────────────────────────────────────────
+# ── trade stats / transactions: read from the Ledger ─────────────────────────
+
+def _ledger_with_round_trip(db):
+    ledger = Ledger(db)
+    ledger.record_entry(
+        token_id="tok1", condition_id="c1", side="YES", shares=10.0, price=0.40,
+        venue="paper", strategy="crypto", market_name="Will BTC hit 100k?",
+    )
+    ledger.record_exit(token_id="tok1", shares=10.0, price=0.65, reason="TAKE-PROFIT", venue="paper")
+    return ledger
+
 
 def test_get_trade_stats_empty_db(db):
     stats = dm.get_trade_stats(db_path=db)
@@ -161,190 +172,35 @@ def test_get_trade_stats_empty_db(db):
     assert stats["win_rate"] == 0.0
 
 
-def test_get_trade_stats_counts_sides(db):
-    bridge = DataBridge()
-    dm.log_event(bridge, "DRY-RUN", "Crypto::BTC", "tok_yes", {"side": "YES", "price": 0.5, "shares": 2}, db_path=db)
-    dm.log_event(bridge, "DRY-RUN", "Crypto::ETH", "tok_no", {"side": "NO", "price": 0.5, "shares": 2}, db_path=db)
-
-    stats = dm.get_trade_stats(db_path=db)
-    assert stats["total_trades"] == 2
-    assert stats["total_yes_trades"] == 1
-    assert stats["total_no_trades"] == 1
-
-
-def test_get_trade_stats_does_not_double_count_auto_trade(db):
-    """evaluate_and_execute() logs AUTO-TRADE immediately before calling
-    execute_trade(), which logs exactly one of DRY-RUN/PAPER-TRADE/LIVE-TRADE
-    for the same trade. AUTO-TRADE must not also be counted, or every real
-    trade is counted twice."""
-    bridge = DataBridge()
-    dm.log_event(bridge, "AUTO-TRADE", "Crypto::BTC", "tok_yes",
-                 {"side": "YES", "price": 0.5, "shares": 2}, db_path=db)
-    dm.log_event(bridge, "DRY-RUN", "Crypto::BTC", "tok_yes",
-                 {"side": "YES", "price": 0.5, "shares": 2}, db_path=db)
-
-    stats = dm.get_trade_stats(db_path=db)
-    assert stats["total_trades"] == 1
-
-
-def test_get_trade_stats_counts_ev_convergence_and_wang_edge_decay_exits(db):
-    """EV-CONVERGENCE/WANG-EDGE-DECAY exits aren't P&L-threshold-triggered
-    like TAKE-PROFIT/STOP-LOSS, but they're still real closed trades and
-    must count toward total_trades/win_rate/avg_win/avg_loss — win/loss for
-    these two levels is derived from the realized price move (price vs
-    initial_price) since the level itself doesn't imply either, unlike
-    TAKE-PROFIT/STOP-LOSS."""
-    bridge = DataBridge()
-    dm.log_event(bridge, "EV-CONVERGENCE", "Crypto::BTC", "tok1",
-                 {"side": "NO", "price": 0.38, "initial_price": 0.43, "shares": 58.14, "sold": True,
-                  "estimated_ev": -0.1163}, db_path=db)
-    dm.log_event(bridge, "WANG-EDGE-DECAY", "Crypto::ETH", "tok2",
-                 {"side": "YES", "price": 0.55, "initial_price": 0.50, "shares": 10, "sold": True,
-                  "pnl_ratio": 0.10}, db_path=db)
+def test_get_trade_stats_reads_the_ledger(db):
+    _ledger_with_round_trip(db)
 
     stats = dm.get_trade_stats(db_path=db)
 
     assert stats["total_trades"] == 2
-    # EV-CONVERGENCE: price(0.38) < initial_price(0.43) -> a loss.
-    # WANG-EDGE-DECAY: price(0.55) > initial_price(0.50) -> a win.
-    assert stats["win_rate"] == pytest.approx(50.0)
-    assert stats["avg_win"] == pytest.approx(round(0.55 * 10, 2))
-    assert stats["avg_loss"] == pytest.approx(round(0.38 * 58.14, 2))
-
-
-def test_get_trade_stats_excludes_failed_sell_attempts_from_win_loss(db):
-    """sell_position() now honestly reports failure (see
-    trading/executor.py) rather than the old hardcoded True, so a position
-    that can't actually be sold gets retried on every loop tick
-    indefinitely, logging a fresh sold: false TAKE-PROFIT/STOP-LOSS row
-    each time. price/shares are still present on a failed attempt (they
-    describe the position being evaluated, not the sale's outcome), so
-    those rows must not be counted toward win_rate/avg_win/avg_loss."""
-    bridge = DataBridge()
-    for _ in range(5):  # simulates repeated retries against one stuck position
-        dm.log_event(bridge, "STOP-LOSS", "Crypto::BTC", "stuck_tok",
-                      {"price": 0.0005, "initial_price": 0.001, "shares": 1000.0, "sold": False},
-                      db_path=db)
-    dm.log_event(bridge, "TAKE-PROFIT", "Crypto::ETH", "tok2",
-                 {"price": 0.60, "initial_price": 0.50, "shares": 5, "sold": True}, db_path=db)
-
-    stats = dm.get_trade_stats(db_path=db)
-
     assert stats["win_rate"] == 100.0
-    assert stats["avg_win"] == pytest.approx(3.0)  # 0.60 * 5
-    assert stats["avg_loss"] == 0.0
 
 
-def test_get_trade_stats_counts_expired_market_resolutions(db):
-    """EXPIRED (market resolution — see PaperAdapter.resolve_closed_markets()
-    and PortfolioManager._exit_position()'s gave-up branch) is a real closed
-    trade like any other exit reason, win/loss derived from price vs
-    initial_price the same way EV-CONVERGENCE/WANG-EDGE-DECAY are."""
+def test_trade_log_rows_in_hunt_history_are_not_counted_as_trades(db):
+    """hunt_history is diagnostics only: AUTO-TRADE / DRY-RUN / TRACK rows
+    logged for one fill must not count — the Ledger's one entry does."""
     bridge = DataBridge()
-    dm.log_event(bridge, "EXPIRED", "Crypto::BTC", "tok1",
-                 {"side": "YES", "price": 1.0, "initial_price": 0.40, "shares": 10.0,
-                  "sold": True, "payout": 10.0}, db_path=db)
-
-    stats = dm.get_trade_stats(db_path=db)
-
-    assert stats["total_trades"] == 1
-    assert stats["win_rate"] == pytest.approx(100.0)
-    assert stats["avg_win"] == pytest.approx(10.0)  # price(1.0) * shares(10.0)
-
-
-def test_get_trade_stats_excludes_unconfirmed_expired_rows(db):
-    """Live mode's gave-up EXPIRED flag logs sold=False (no confirmed
-    on-chain payout) — must not be counted, same as any other failed exit."""
-    bridge = DataBridge()
-    dm.log_event(bridge, "EXPIRED", "Crypto::BTC", "tok1",
-                 {"side": "YES", "price": 0.001, "initial_price": 0.40, "shares": 10.0,
-                  "sold": False}, db_path=db)
-
-    stats = dm.get_trade_stats(db_path=db)
-
-    assert stats["total_trades"] == 0
-
-
-# ── get_closed_trade_deltas ───────────────────────────────────────────────────
-
-def test_get_closed_trade_deltas_empty_db(db):
-    assert dm.get_closed_trade_deltas(db_path=db) == []
-
-
-def test_get_closed_trade_deltas_computes_price_minus_initial_price(db):
-    bridge = DataBridge()
-    dm.log_event(bridge, "TAKE-PROFIT", "Crypto::BTC", "tok1",
-                 {"price": 0.65, "initial_price": 0.50, "shares": 10, "sold": True}, db_path=db)
-    dm.log_event(bridge, "STOP-LOSS", "Crypto::ETH", "tok2",
-                 {"price": 0.30, "initial_price": 0.45, "shares": 5, "sold": True}, db_path=db)
-
-    deltas = sorted(dm.get_closed_trade_deltas(db_path=db))
-
-    assert deltas == pytest.approx([-0.15, 0.15])
-
-
-def test_get_closed_trade_deltas_includes_all_exit_reasons(db):
-    bridge = DataBridge()
-    for level in ("TAKE-PROFIT", "STOP-LOSS", "WANG-EDGE-DECAY", "EV-CONVERGENCE"):
+    for level in ("AUTO-TRADE", "DRY-RUN", "TRACK", "PAPER-TRADE"):
         dm.log_event(bridge, level, "Crypto::BTC", "tok1",
-                     {"price": 0.55, "initial_price": 0.50, "sold": True}, db_path=db)
+                     {"side": "YES", "price": 0.5, "shares": 2}, db_path=db)
+    Ledger(db).record_entry(
+        token_id="tok1", condition_id="c1", side="YES", shares=2.0, price=0.5,
+        venue="paper", strategy="crypto",
+    )
 
-    deltas = dm.get_closed_trade_deltas(db_path=db)
-
-    assert len(deltas) == 4
-    assert all(d == pytest.approx(0.05) for d in deltas)
-
-
-def test_get_closed_trade_deltas_ignores_non_exit_levels(db):
-    bridge = DataBridge()
-    dm.log_event(bridge, "DRY-RUN", "Crypto::BTC", "tok1",
-                 {"price": 0.55, "initial_price": 0.50, "sold": True}, db_path=db)
-    dm.log_event(bridge, "TRACK", "Crypto::BTC", "tok1",
-                 {"price": 0.55, "initial_price": 0.50, "sold": True}, db_path=db)
-
-    assert dm.get_closed_trade_deltas(db_path=db) == []
+    assert dm.get_trade_stats(db_path=db)["total_trades"] == 1
 
 
-def test_get_closed_trade_deltas_skips_rows_missing_initial_price(db):
-    """Rows logged before initial_price was added to the exit payload."""
-    bridge = DataBridge()
-    dm.log_event(bridge, "TAKE-PROFIT", "Crypto::BTC", "tok1",
-                 {"price": 0.65, "shares": 10, "sold": True}, db_path=db)  # no initial_price
+def test_get_closed_trade_deltas_reads_the_ledger(db):
+    _ledger_with_round_trip(db)
 
-    assert dm.get_closed_trade_deltas(db_path=db) == []
+    assert dm.get_closed_trade_deltas(db_path=db) == pytest.approx([0.25])
 
-
-def test_get_closed_trade_deltas_excludes_failed_sell_attempts(db):
-    """sell_position() now honestly reports failure (see
-    trading/executor.py) rather than the old hardcoded True, so a position
-    that can't actually be sold (e.g. a missing paper-adapter token
-    mapping) gets retried on every loop tick indefinitely, logging a fresh
-    sold: false row each time. Those must not be counted as real closed
-    trades — a stuck position retried for months would otherwise swamp
-    this average with duplicates of one delta from a position that never
-    actually closed."""
-    bridge = DataBridge()
-    dm.log_event(bridge, "STOP-LOSS", "Crypto::BTC", "stuck_tok",
-                 {"price": 0.0005, "initial_price": 0.001, "shares": 1000.0, "sold": False}, db_path=db)
-    dm.log_event(bridge, "TAKE-PROFIT", "Crypto::ETH", "tok2",
-                 {"price": 0.60, "initial_price": 0.50, "shares": 5, "sold": True}, db_path=db)
-
-    deltas = dm.get_closed_trade_deltas(db_path=db)
-
-    assert deltas == pytest.approx([0.10])
-
-
-def test_get_closed_trade_deltas_includes_expired(db):
-    bridge = DataBridge()
-    dm.log_event(bridge, "EXPIRED", "Crypto::BTC", "tok1",
-                 {"price": 1.0, "initial_price": 0.40, "sold": True}, db_path=db)
-
-    deltas = dm.get_closed_trade_deltas(db_path=db)
-
-    assert deltas == pytest.approx([0.60])
-
-
-# ── fetch_transactions ────────────────────────────────────────────────────────
 
 def test_fetch_transactions_empty_db(db):
     df = dm.fetch_transactions(db_path=db)
@@ -353,36 +209,31 @@ def test_fetch_transactions_empty_db(db):
 
 
 def test_fetch_transactions_includes_buys_and_sells(db):
-    bridge = DataBridge()
-    dm.log_event(bridge, "PAPER-TRADE", "Crypto::BTC", "tok1",
-                 {"price": 0.40, "shares": 10.0, "bet_amount_usd": 4.0, "side": "YES"}, db_path=db)
-    dm.log_event(bridge, "TAKE-PROFIT", "Crypto::BTC", "tok1",
-                 {"price": 0.65, "initial_price": 0.40, "shares": 10.0, "sold": True,
-                  "side": "YES", "market_name": "Will BTC hit 100k?"}, db_path=db)
+    _ledger_with_round_trip(db)
 
     df = dm.fetch_transactions(db_path=db)
 
     assert len(df) == 2
-    types = set(df["Type"])
-    assert types == {"BUY", "SELL (Take-Profit)"}
+    assert set(df["Type"]) == {"BUY", "SELL (Take-Profit)"}
     sell_row = df[df["Type"] == "SELL (Take-Profit)"].iloc[0]
     assert sell_row["P&L ($/share)"] == pytest.approx(0.25)
     assert sell_row["Market Name"] == "Will BTC hit 100k?"
+    assert sell_row["Status"] == "Sold"
+    assert df[df["Type"] == "BUY"].iloc[0]["Amount ($)"] == pytest.approx(4.0)
 
 
-def test_fetch_transactions_excludes_failed_retries_but_keeps_expired(db):
-    bridge = DataBridge()
-    dm.log_event(bridge, "STOP-LOSS", "Crypto::BTC", "stuck_tok",
-                 {"price": 0.001, "initial_price": 0.10, "shares": 100.0, "sold": False}, db_path=db)
-    dm.log_event(bridge, "EXPIRED", "Crypto::BTC", "dead_tok",
-                 {"price": 0.02, "initial_price": 0.30, "shares": 5.0, "sold": False,
-                  "reason": "gave up"}, db_path=db)
+def test_fetch_transactions_shows_unconfirmed_expiry(db):
+    ledger = Ledger(db)
+    ledger.record_entry(token_id="dead", condition_id="c1", side="NO", shares=5.0, price=0.30,
+                        venue="live", strategy="crypto")
+    ledger.record_resolution(token_id="dead", shares=5.0, payout_price=None, venue="live")
 
     df = dm.fetch_transactions(db_path=db)
 
-    assert len(df) == 1
-    assert df.iloc[0]["Type"] == "EXPIRED"
-    assert df.iloc[0]["Status"] == "Unconfirmed"
+    expiry = df.iloc[0]
+    assert expiry["Type"] == "EXPIRED"
+    assert expiry["Status"] == "Unconfirmed"
+    assert expiry["Side"] == "NO"
 
 
 # ── process_logs_for_display: Phase 7 analytics columns ──────────────────────

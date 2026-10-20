@@ -410,6 +410,27 @@ class TestResolveClosedMarketsLogging:
         _, _, token_id, _ = log_func.call_args[0]
         assert token_id == "__unmapped__:mystery-slug:no"
 
+    def test_on_resolved_receives_each_resolved_position(self, tmp_path):
+        adapter = PaperAdapter(data_dir=str(tmp_path), initial_balance=100.0)
+        adapter._token_map = {"tok1": ("crypto-slug", "yes")}
+        mock_engine = MagicMock()
+        mock_engine.resolve_all.return_value = [
+            self._fake_resolve_result("crypto-slug", "yes", payout=10.0, shares=10.0, avg_entry_price=0.4)
+        ]
+        adapter.engine = mock_engine
+
+        resolved = []
+        adapter.resolve_closed_markets(resolve_arbitrage=True, on_resolved=resolved.append)
+
+        assert len(resolved) == 1
+        r = resolved[0]
+        assert r["token_id"] == "tok1"
+        assert r["shares"] == 10.0
+        assert r["payout_price"] == pytest.approx(1.0)
+        assert r["entry_price"] == pytest.approx(0.4)
+        assert r["side"] == "YES"
+        assert r["market_name"] == "Will it happen?"
+
     def test_no_log_func_still_works(self, tmp_path):
         """log_func is optional — omitting it must not break the existing
         count-returning behavior other callers rely on."""

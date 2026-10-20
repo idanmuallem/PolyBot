@@ -28,11 +28,14 @@ def _parse_payload(payload_value) -> dict:
 
 
 class PortfolioManager:
-    def __init__(self, bridge, executor, config, hunter=None, db_path: Optional[str] = None):
+    def __init__(self, bridge, executor, config, hunter=None, db_path: Optional[str] = None, ledger=None):
         self.bridge = bridge
         self.executor = executor
         self.hunter = hunter
         self.db_path = db_path  # this wallet's trades.db — no guessing, the caller (WalletContext) owns it
+        # Ledger (trading/ledger.py): every confirmed sale and expiry made
+        # here is recorded in it exactly once. None = not recording.
+        self.ledger = ledger
         self.take_profit_pct = float(config.take_profit_pct)
         self.stop_loss_pct = float(config.stop_loss_pct)
         self.min_hold_ev = float(config.min_hold_ev)
@@ -321,6 +324,24 @@ class PortfolioManager:
         """Average correlation between a candidate asset_type and the current book."""
         return self.correlation_tracker.exposure_for_new_position(asset_type, self.get_book_asset_types())
 
+    def _venue(self) -> str:
+        return "paper" if getattr(self.executor, "dry_run", True) else "live"
+
+    def _record_sale(self, position, reason: str) -> None:
+        """Record one confirmed sale of this position in the Ledger."""
+        if self.ledger is None:
+            return
+        self.ledger.record_exit(
+            token_id=str(self._position_field(position, "token_id", "") or ""),
+            shares=float(self._position_field(position, "shares", 0.0) or 0.0),
+            price=float(self._position_field(position, "current_price", 0.0) or 0.0),
+            reason=reason,
+            venue=self._venue(),
+            strategy="arbitrage" if self._is_arbitrage_position(position) else "crypto",
+            entry_price=float(self._position_field(position, "initial_price", 0.0) or 0.0),
+            side=str(self._position_field(position, "side", "") or "") or None,
+        )
+
     def _liquidate_position_value(self, position, log_func) -> float:
         token_id = str(self._position_field(position, "token_id", "") or "")
         shares = float(self._position_field(position, "shares", 0.0) or 0.0)
@@ -336,7 +357,10 @@ class PortfolioManager:
             print(f"[PORTFOLIO-CULL] Liquidation failed for {token_id}: {exc}")
             return 0.0
 
-        return max(0.0, float(position_value)) if sold else 0.0
+        if not sold:
+            return 0.0
+        self._record_sale(position, "PORTFOLIO-CULL")
+        return max(0.0, float(position_value))
 
     def _position_live_ev(self, position) -> float:
         live_ev = getattr(position, "live_ev", None)
@@ -400,6 +424,7 @@ class PortfolioManager:
 
         if sold:
             self._apply_sale_to_bridge(position_value)
+            self._record_sale(position, level)
             # See __init__ for why TAKE-PROFIT is excluded: a profitable exit
             # means the model was right about this market, so re-entering it
             # is a legitimate trade, not the churn pattern this guards against.
@@ -433,6 +458,13 @@ class PortfolioManager:
         # sold=True EXPIRED row with a real payout, so this branch would
         # only ever double up on that — hence live-mode only.
         if gave_up and not getattr(self.executor, "dry_run", True):
+            if self.ledger is not None:
+                self.ledger.record_resolution(
+                    token_id=token_id, shares=shares, payout_price=None, venue="live",
+                    strategy="arbitrage" if self._is_arbitrage_position(position) else "crypto",
+                    entry_price=initial_price,
+                    side=str(self._position_field(position, "side", "") or "") or None,
+                )
             log_func("EXPIRED", "Portfolio", token_id, {
                 "shares": shares,
                 "price": current_price,
@@ -543,6 +575,7 @@ class PortfolioManager:
                 continue
 
             self._apply_sale_to_bridge(position_value)
+            self._record_sale(position, "OPPORTUNITY-SWAP")
             log_func("OPPORTUNITY-SWAP", "Portfolio", token_id, {
                 "message": f"Liquidated {token_id} to free capital for high-EV trade.",
                 "freed_value": round(position_value, 4),

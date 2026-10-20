@@ -431,7 +431,7 @@ class PaperAdapter:
             logger.warning(f"[PAPER] Failed to fetch total value: {exc}")
             return 0.0
 
-    def resolve_closed_markets(self, resolve_arbitrage: bool = True, log_func=None) -> int:
+    def resolve_closed_markets(self, resolve_arbitrage: bool = True, log_func=None, on_resolved=None) -> int:
         """Resolve any paper positions in markets that have closed. Returns count resolved.
 
         resolve_arbitrage=False is the ENABLE_ARBITRAGE kill switch: while
@@ -452,6 +452,10 @@ class PaperAdapter:
         get_trade_stats()/get_closed_trade_deltas() aggregation — "price"
         here is the effective per-share payout (1.0 for a winning share,
         0.0 for a losing one), not a market quote.
+
+        on_resolved, when given, is called once per resolved position with
+        a dict (token_id, shares, payout_price, entry_price, side,
+        market_name) — the engine records it in the Ledger.
         """
         if not self.is_ready:
             return 0
@@ -469,12 +473,17 @@ class PaperAdapter:
                     )
                     if log_func is not None:
                         self._log_resolved_position(r, log_func)
+                    if on_resolved is not None:
+                        try:
+                            on_resolved(self._resolved_record(r))
+                        except Exception as exc:
+                            logger.warning(f"[PAPER] on_resolved failed: {exc}")
             return len(results)
         except Exception as exc:
             logger.warning(f"[PAPER] resolve_all failed: {exc}")
             return 0
 
-    def _log_resolved_position(self, resolve_result, log_func) -> None:
+    def _resolved_record(self, resolve_result) -> dict:
         position = resolve_result.position
         shares = float(position.shares or 0.0)
         payout_price = (float(resolve_result.payout) / shares) if shares else 0.0
@@ -485,19 +494,31 @@ class PaperAdapter:
             # dropping it" fallback get_positions() uses above.
             token_id = f"__unmapped__:{position.market_slug}:{position.outcome}"
 
+        return {
+            "token_id": token_id,
+            "shares": shares,
+            "payout_price": payout_price,
+            "entry_price": float(position.avg_entry_price or 0.0),
+            "side": str(position.outcome or "").upper(),
+            "market_name": position.market_question or position.market_slug,
+        }
+
+    def _log_resolved_position(self, resolve_result, log_func) -> None:
+        record = self._resolved_record(resolve_result)
+        position = resolve_result.position
         try:
-            log_func("EXPIRED", "Portfolio", token_id, {
-                "shares": shares,
-                "price": round(payout_price, 4),
-                "initial_price": round(float(position.avg_entry_price or 0.0), 4),
-                "side": str(position.outcome or "").upper(),
-                "market_name": position.market_question or position.market_slug,
+            log_func("EXPIRED", "Portfolio", record["token_id"], {
+                "shares": record["shares"],
+                "price": round(record["payout_price"], 4),
+                "initial_price": round(record["entry_price"], 4),
+                "side": record["side"],
+                "market_name": record["market_name"],
                 "payout": round(float(resolve_result.payout), 2),
                 "realized_pnl": round(float(position.realized_pnl or 0.0), 4),
                 "sold": True,
             })
         except Exception as exc:
-            logger.warning(f"[PAPER] Failed to log resolved position {token_id}: {exc}")
+            logger.warning(f"[PAPER] Failed to log resolved position {record['token_id']}: {exc}")
 
     def _resolve_non_arbitrage_closed_markets(self) -> list:
         """Mirrors Engine.resolve_all()'s own closed-market loop, but skips
