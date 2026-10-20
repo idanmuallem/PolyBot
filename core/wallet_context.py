@@ -20,8 +20,8 @@ were built from) wherever all four are assembled together.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, Optional
 
 from core.bridge import DataBridge
 from core.trading_config import TradingConfig
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from trading.risk_manager import PortfolioManager
     from trading.budget_manager import BudgetManager
     from trading.ledger import Ledger
+    from trading.venue import Venue
 
 
 @dataclass
@@ -51,3 +52,7 @@ class WalletContext:
     portfolio_manager: Optional["PortfolioManager"] = None
     budget_manager: Optional["BudgetManager"] = None
     ledger: Optional["Ledger"] = None  # typed trades/positions record (trading/ledger.py)
+    # Every Venue this wallet can trade on, by name ("paper" / "live"). The
+    # executor trades on one of them; the pipeline swaps it at a tick
+    # boundary when the dashboard's live-trading request changes.
+    venues: Dict[str, "Venue"] = field(default_factory=dict)

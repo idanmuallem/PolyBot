@@ -123,6 +123,18 @@ class SequentialTradingPipeline:
 
         self.executor = ctx.executor
         self.hunter = ctx.scanner
+
+        # The pipeline owns the active Venue: every Venue this wallet can
+        # trade on, by name, and the one the executor trades on now. A mode
+        # change from the dashboard swaps it at a tick boundary (see
+        # _apply_mode_request()), so no tick runs half-paper, half-live.
+        self.venue = getattr(self.executor, "venue", None)
+        self.venues = dict(getattr(ctx, "venues", None) or {})
+        if self.venue is not None:
+            self.venues.setdefault(self.venue.name, self.venue)
+        self._refused_mode: str | None = None
+        self._last_resolve_check_at = 0.0
+        self._last_drift = None  # last logged Venue/Ledger drift (see _reconcile())
         # Typed trade record (trading/ledger.py). The engine is its only
         # writer; None (e.g. a bare test context) means not recording.
         self.ledger = getattr(ctx, "ledger", None)
@@ -1012,8 +1024,36 @@ class SequentialTradingPipeline:
 
     def _ledger_venue(self) -> str:
         """Ledger venue tag for a fill: the name ("paper" / "live") of the
-        Venue the executor trades on. #19 moves the Venue onto the pipeline."""
-        return getattr(getattr(self.executor, "venue", None), "name", "paper")
+        active Venue."""
+        return getattr(self.venue, "name", "paper")
+
+    def _apply_mode_request(self) -> None:
+        """Tick boundary: trade on the Venue the dashboard asked for.
+
+        Polled from engine_control (DB) rather than read off self.bridge:
+        the dashboard runs as a separate OS process (see run_engine.py).
+        Defaults to paper when no control row exists yet (see
+        data_manager.read_live_trading_requested()). A mode with no Venue
+        (live without a usable CLOB client) is refused, logged once per
+        request.
+        """
+        wanted = "live" if data_manager.read_live_trading_requested(self.db_path) else "paper"
+        current = getattr(self.venue, "name", None)
+        if wanted == current:
+            self._refused_mode = None
+            return
+        venue = self.venues.get(wanted)
+        if venue is None:
+            if self._refused_mode != wanted:
+                self._refused_mode = wanted
+                self.log_func("MODE-SWITCH-REFUSED", "Engine", wanted, {
+                    "requested": wanted, "active": current, "reason": f"no_{wanted}_venue",
+                })
+            return
+        self._refused_mode = None
+        self.venue = venue
+        self.executor.venue = venue
+        self.log_func("MODE-SWITCH", "Engine", wanted, {"from": current, "to": wanted})
 
     def _record_arbitrage_entry(self, signal, group_id: str, filled_shares: float) -> None:
         """Record one arbitrage leg fill in the Ledger, tagged with its
@@ -1043,16 +1083,89 @@ class SequentialTradingPipeline:
             market_name=signal.market.market_name,
         )
 
-    def _record_paper_resolution(self, resolved: dict) -> None:
-        """Record one paper market resolution (see
-        PaperVenue.resolve_closed_markets(on_resolved=...)) in the Ledger."""
+    def _resolve_closed_markets(self) -> None:
+        """Every 15 minutes, settle closed markets on every Venue this wallet
+        holds (paper positions keep resolving while trading live), recording
+        each settlement in the Ledger under that Venue's name.
+
+        NOT asyncio.to_thread: PaperVenue's pm_trader sqlite3 connection is
+        bound to the thread that first used it -- this loop's thread (see
+        trading/paper_venue.py). to_thread hands the call to a worker thread,
+        which sqlite3 refuses, failing every resolution (28c7637). The
+        blocking network calls this makes are accepted the same way other
+        blocking calls are in this sequential loop.
+
+        resolve_arbitrage=config.enable_arbitrage: the ENABLE_ARBITRAGE kill
+        switch also covers this cleanup path, not just new-trade entry.
+        """
+        now = time.time()
+        if now - self._last_resolve_check_at < 900.0:
+            return
+        self._last_resolve_check_at = now
+        for venue in self.venues.values():
+            try:
+                venue.resolve_closed_markets(
+                    resolve_arbitrage=self.config.enable_arbitrage,
+                    log_func=self.log_func,
+                    on_resolved=lambda resolved, name=venue.name: self._record_resolution(resolved, name),
+                )
+            except Exception as e:
+                self.log_func("PAPER-ERROR", "Engine", "resolve_all", {"venue": venue.name, "error": str(e)})
+
+    # Share counts within this of each other agree: venues floor or round
+    # fills to cents, the Ledger records the requested size.
+    _RECONCILE_SHARE_TOLERANCE = 0.02
+
+    def _reconcile(self) -> None:
+        """Compare the active Venue's holdings (authoritative for share
+        quantities) with the Ledger's open positions on that venue, and log
+        drift: tokens only one side holds, and share-count mismatches.
+
+        Detection only; nothing is corrected. A drift is logged
+        (RECONCILE-DRIFT) when it first appears or changes, and its
+        clearing is logged (RECONCILE-OK), so an unchanged drift doesn't
+        flood the event log every tick.
+        """
+        if self.ledger is None or self.venue is None:
+            return
+        try:
+            venue_shares: dict = {}
+            for p in self.venue.open_positions():
+                token = str(getattr(p, "token_id", "") or "")
+                venue_shares[token] = venue_shares.get(token, 0.0) + float(getattr(p, "shares", 0.0) or 0.0)
+            ledger_shares = {h.token_id: float(h.shares) for h in self.ledger.open_positions(venue=self.venue.name)}
+        except Exception as exc:
+            self.log_func("SYNC-WARN", "Pipeline", "reconcile", {"reason": "reconcile_failed", "error": str(exc)})
+            return
+
+        venue_only = {t: n for t, n in venue_shares.items() if t not in ledger_shares and n > 0}
+        ledger_only = {t: n for t, n in ledger_shares.items() if t not in venue_shares}
+        mismatch = {
+            t: {"venue": venue_shares[t], "ledger": n}
+            for t, n in ledger_shares.items()
+            if t in venue_shares and abs(venue_shares[t] - n) > self._RECONCILE_SHARE_TOLERANCE
+        }
+        drift = {"venue_only": venue_only, "ledger_only": ledger_only, "share_mismatch": mismatch}
+        signature = (self.venue.name, repr(sorted((k, repr(sorted(v.items()))) for k, v in drift.items())))
+        previous = self._last_drift
+        if any(drift.values()):
+            if signature != previous:
+                self.log_func("RECONCILE-DRIFT", "Pipeline", self.venue.name, {"venue": self.venue.name, **drift})
+            self._last_drift = signature
+        elif previous is not None:
+            self.log_func("RECONCILE-OK", "Pipeline", self.venue.name, {"venue": self.venue.name})
+            self._last_drift = None
+
+    def _record_resolution(self, resolved: dict, venue: str) -> None:
+        """Record one market resolution reported by *venue* (see
+        Venue.resolve_closed_markets(on_resolved=...)) in the Ledger."""
         if self.ledger is None:
             return
         self.ledger.record_resolution(
             token_id=resolved["token_id"],
             shares=float(resolved["shares"]),
             payout_price=float(resolved["payout_price"]),
-            venue="paper",
+            venue=venue,
             entry_price=resolved.get("entry_price"),
             side=resolved.get("side"),
             market_name=resolved.get("market_name"),
@@ -1118,90 +1231,62 @@ class SequentialTradingPipeline:
     async def run_forever(self):
         while True:
             await asyncio.sleep(self.loop_delay)
-            self._reset_daily_if_needed()
+            await self.tick()
 
-            # Periodic Market Resolution Check (Phase 3)
-            if getattr(self.executor, "dry_run", True):
-                now = time.time()
-                if now - getattr(self, "_last_resolve_check_at", 0.0) >= 900.0:  # 15 minutes
-                    self._last_resolve_check_at = now
-                    venue = getattr(self.executor, "venue", None)
-                    if venue is not None:
-                        try:
-                            # NOT asyncio.to_thread: PaperVenue's pm_trader
-                            # sqlite3 connection is bound to the thread that
-                            # first used it -- this loop's thread (see
-                            # trading/paper_venue.py). to_thread hands the
-                            # call to a worker thread, which sqlite3 refuses,
-                            # failing every resolution (28c7637). The blocking
-                            # network calls this makes are accepted the same
-                            # way other blocking calls are in this sequential
-                            # loop -- it only runs once per 15 minutes.
-                            #
-                            # resolve_arbitrage=config.enable_arbitrage: the
-                            # ENABLE_ARBITRAGE kill switch also covers this
-                            # cleanup path, not just new-trade entry.
-                            venue.resolve_closed_markets(
-                                resolve_arbitrage=self.config.enable_arbitrage,
-                                log_func=self.log_func,
-                                on_resolved=self._record_paper_resolution,
-                            )
-                        except Exception as e:
-                            self.log_func("PAPER-ERROR", "Engine", "resolve_all", {"error": str(e)})
+    async def tick(self):
+        """One engine loop iteration: mode switch, resolution, sync, exits,
+        Venue/Ledger reconcile, status flush, then new entries (unless
+        paused)."""
+        self._reset_daily_if_needed()
 
-            # Polled from engine_control (DB) rather than read off self.bridge
-            # directly: the dashboard that sets this now runs as a separate
-            # OS process (see run_engine.py) and can no longer write straight
-            # into this process's in-memory bridge. Defaults to False
-            # (dry-run) when no control row exists yet — see
-            # data_manager.read_live_trading_requested()'s docstring.
-            requested_live = data_manager.read_live_trading_requested(self.db_path)
-            self.executor.dry_run = not requested_live
+        self._apply_mode_request()
+        self._resolve_closed_markets()
 
-            sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
-            self.portfolio_manager.manage_portfolio(self.log_func)  # exits always run, even while paused
-            sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
-            self._update_drawdown_guard()
+        sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
+        self.portfolio_manager.manage_portfolio(self.log_func)  # exits always run, even while paused
+        sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
+        self._update_drawdown_guard()
+        self._reconcile()
 
-            # Flush this tick's live state to the DB for the dashboard
-            # process to read — every iteration, unconditionally, before any
-            # of the early `continue`s below, so it doesn't skip ticks where
-            # hunting finds nothing or a candidate gets rejected (the common
-            # case). See ui/data_manager.py's engine_status/open_positions
-            # tables and run_engine.py.
-            data_manager.write_engine_status(
-                db_path=self.db_path,
-                balance=float(self.bridge.current_balance),
-                starting_balance=float(self.bridge.starting_balance),
-                position_value=float(self.bridge.open_position_value),
-                unrealized_pnl=float(getattr(self.bridge, "unrealized_pnl", 0.0) or 0.0),
-                watch_only=bool(getattr(self.bridge, "watch_only", False)),
-            )
-            data_manager.write_open_positions(
-                db_path=self.db_path,
-                positions=list(getattr(self.bridge, "current_portfolio", None) or []),
-                position_analytics=dict(getattr(self.bridge, "position_analytics", None) or {}),
-            )
+        # Flush this tick's live state to the DB for the dashboard
+        # process to read — every iteration, unconditionally, before any
+        # of the early returns below, so it doesn't skip ticks where
+        # hunting finds nothing or a candidate gets rejected (the common
+        # case). See ui/data_manager.py's engine_status/open_positions
+        # tables and run_engine.py.
+        data_manager.write_engine_status(
+            db_path=self.db_path,
+            balance=float(self.bridge.current_balance),
+            starting_balance=float(self.bridge.starting_balance),
+            position_value=float(self.bridge.open_position_value),
+            unrealized_pnl=float(getattr(self.bridge, "unrealized_pnl", 0.0) or 0.0),
+            watch_only=bool(getattr(self.bridge, "watch_only", False)),
+        )
+        data_manager.write_open_positions(
+            db_path=self.db_path,
+            positions=list(getattr(self.bridge, "current_portfolio", None) or []),
+            position_analytics=dict(getattr(self.bridge, "position_analytics", None) or {}),
+        )
 
-            if self.ctx.drawdown_paused:
-                continue  # circuit breaker: skip new-entry scanning/execution below
+        if self.ctx.drawdown_paused:
+            return  # circuit breaker: skip new-entry scanning/execution below
 
-            await self._stage_strategy_scan()
+        await self._stage_strategy_scan()
 
-            stage1 = await self._stage_hunt()
-            if not stage1:
-                continue
+        stage1 = await self._stage_hunt()
+        if not stage1:
+            return
 
-            market, hunter = stage1
-            candidate = self._stage_evaluate_ev(market, hunter)
-            if candidate is None:
-                continue
+        market, hunter = stage1
+        candidate = self._stage_evaluate_ev(market, hunter)
+        if candidate is None:
+            return
 
-            approved_bet, risk_context = self._stage_risk_and_budget(candidate)
-            if approved_bet <= 0.0 or risk_context is None:
-                continue
+        approved_bet, risk_context = self._stage_risk_and_budget(candidate)
+        if approved_bet <= 0.0 or risk_context is None:
+            return
 
-            self._stage_execute(candidate, approved_bet, risk_context)
+        self._stage_execute(candidate, approved_bet, risk_context)
 
 
 def _default_log_func(ctx: WalletContext):

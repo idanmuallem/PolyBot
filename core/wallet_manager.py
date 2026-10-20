@@ -25,8 +25,9 @@ def _build_venues(ctx: WalletContext) -> Tuple[Venue, Optional[Venue]]:
     The configured mode's Venue must build: live_run without a usable CLOB
     client raises ClobUnavailable, and dry_run without a paper engine raises
     (there is no log-only mode). The other mode's Venue is built if it can
-    be, so the dashboard can switch modes at runtime; if it can't, switching
-    to that mode is refused.
+    be, so the dashboard can switch modes at runtime (the pipeline swaps the
+    executor's Venue at a tick boundary); if it can't, switching to that mode
+    is refused.
     """
     paper: Optional[Venue] = None
     paper_error: Optional[Exception] = None
@@ -64,7 +65,8 @@ def build_wallet_runtime(ctx: WalletContext) -> None:
     """
     ctx.ledger = Ledger(ctx.db_path)
     venue, standby_venue = _build_venues(ctx)
-    ctx.executor = TradeExecutor(config=ctx.config, venue=venue, standby_venue=standby_venue)
+    ctx.venues = {v.name: v for v in (venue, standby_venue) if v is not None}
+    ctx.executor = TradeExecutor(config=ctx.config, venue=venue)
     ctx.scanner = PolymarketScannerHunter(
         bridge=ctx.bridge,
         executor=ctx.executor,

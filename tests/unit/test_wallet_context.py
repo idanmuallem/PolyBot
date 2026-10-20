@@ -184,25 +184,24 @@ def test_live_run_trades_on_the_clob_with_paper_on_standby(tmp_path, monkeypatch
 
     build_wallet_runtime(ctx)
 
-    assert ctx.executor.dry_run is False
+    assert ctx.executor.venue is live
     assert ctx.executor.get_balance() == 55.0
-    ctx.executor.dry_run = True
-    assert ctx.executor.get_balance() == 300.0
+    assert ctx.venues == {"live": live, "paper": paper}
 
 
 def test_dry_run_trades_on_paper_and_can_switch_live_when_a_client_is_available(tmp_path, monkeypatch):
     from core.wallet_manager import build_wallet_runtime
     from trading.fake_venue import FakeVenue
 
-    _stub_venues(monkeypatch, paper=FakeVenue(cash=300.0), live=_live_stub())
+    paper, live = FakeVenue(cash=300.0), _live_stub()
+    _stub_venues(monkeypatch, paper=paper, live=live)
     ctx = _make_ctx("w", str(tmp_path / "trades.db"), trading_mode="dry_run")
 
     build_wallet_runtime(ctx)
 
-    assert ctx.executor.dry_run is True
+    assert ctx.executor.venue is paper
     assert ctx.bridge.current_balance == 300.0
-    ctx.executor.dry_run = False
-    assert ctx.executor.get_balance() == 55.0
+    assert ctx.venues == {"paper": paper, "live": live}
 
 
 def test_dry_run_without_a_clob_client_still_starts_but_cannot_go_live(tmp_path, monkeypatch):
@@ -210,14 +209,14 @@ def test_dry_run_without_a_clob_client_still_starts_but_cannot_go_live(tmp_path,
     from trading.clob_venue import ClobUnavailable
     from trading.fake_venue import FakeVenue
 
-    _stub_venues(monkeypatch, paper=FakeVenue(cash=300.0), live=ClobUnavailable("missing keys"))
+    paper = FakeVenue(cash=300.0)
+    _stub_venues(monkeypatch, paper=paper, live=ClobUnavailable("missing keys"))
     ctx = _make_ctx("w", str(tmp_path / "trades.db"), trading_mode="dry_run")
 
     build_wallet_runtime(ctx)
-    ctx.executor.dry_run = False
 
-    assert ctx.executor.dry_run is True
-    assert ctx.executor.get_balance() == 300.0
+    assert ctx.executor.venue is paper
+    assert ctx.venues == {"paper": paper}
 
 
 def test_dry_run_without_a_paper_engine_fails_at_startup(tmp_path, monkeypatch):
