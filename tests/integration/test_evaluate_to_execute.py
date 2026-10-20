@@ -51,7 +51,7 @@ def _make_pipeline(config=None, balance=100.0, ledger=None):
         ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
         ctx.portfolio_manager = PortfolioManager(
             bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
-            hunter=ctx.scanner, db_path=ctx.db_path,
+            hunter=ctx.scanner, db_path=ctx.db_path, ledger=ledger,
         )
         ctx.budget_manager = BudgetManager(
             bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),

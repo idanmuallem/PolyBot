@@ -20,7 +20,7 @@ from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
 from core.polymarket_client import PolymarketClient
 from trading.account import Account
-from trading.gate import Gate, Skip
+from trading.gate import Skip
 from trading.strategies import EventSumStrategy, Strategy
 from trading.venue import MarketRef, normalize_side
 from ui import data_manager
@@ -124,14 +124,12 @@ class SequentialTradingPipeline:
 
         self.portfolio_manager = ctx.portfolio_manager
 
-        # Entry eligibility (already held on either side, post-exit
-        # cooldown) for model entries and arbitrage baskets alike. Holdings
-        # come from the Ledger, so the answer survives restarts.
-        self.gate = Gate(
-            self.ledger,
-            exit_cooldown_until=self.portfolio_manager.exit_cooldown_until,
-            venue=self._ledger_venue,
-        )
+        # Entry and exit eligibility (already held on either side, post-exit
+        # cooldown, exit attempt cap) for model entries, arbitrage baskets
+        # and every exit path. One Gate, shared with the PortfolioManager
+        # that makes the exits, so an exit's cooldown blocks re-entry here.
+        # Holdings come from the Ledger, so the answer survives restarts.
+        self.gate = self.portfolio_manager.gate
 
         # The single writer of cash, equity and the drawdown breaker. Built
         # by build_wallet_runtime; a hand-assembled context gets one here.

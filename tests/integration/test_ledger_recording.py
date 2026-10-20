@@ -282,7 +282,7 @@ def test_live_position_given_up_after_max_attempts_is_recorded_as_one_expiry(tmp
                         price=0.40, venue="live", strategy="crypto")
     executor.sell_position.return_value = False
 
-    for _ in range(pm.MAX_EXIT_ATTEMPTS + 2):
+    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS + 2):
         pm.manage_portfolio(lambda *a: None)
 
     expiries = [t for t in ledger.transactions() if t["kind"] == "EXPIRED"]

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from freezegun import freeze_time
 
 from core.models import MarketData
 from trading.gate import Gate, Ok, Skip
@@ -107,35 +108,66 @@ def test_no_ledger_holds_nothing():
 
 # ── Post-exit cooldown ───────────────────────────────────────────────────────
 
-def _cooldowns(**until_by_token):
-    return lambda token: until_by_token.get(token)
+def _sold(gate, token_id, reason="EV-CONVERGENCE"):
+    gate.record_exit_attempt(SimpleNamespace(token_id=token_id), sold=True, reason=reason)
 
 
+@freeze_time("2026-06-02T00:00:00+00:00")
 def test_refuses_inside_the_post_exit_cooldown_on_either_token(ledger):
-    until = datetime(2026, 6, 3, tzinfo=timezone.utc)
     for token in ("tok1", "tok1_no"):
-        decision = Gate(ledger, exit_cooldown_until=_cooldowns(**{token: until})).can_enter(_market())
+        gate = Gate(ledger)
+        _sold(gate, token)
+        decision = gate.can_enter(_market())
         assert isinstance(decision, Skip)
         assert decision.reason == "exit_cooldown"
-        assert decision.detail == {"until": str(until)}
+        assert decision.detail == {"until": str(datetime(2026, 6, 3, tzinfo=timezone.utc))}
+
+
+@pytest.mark.parametrize("reason", [
+    "STOP-LOSS", "WANG-EDGE-DECAY", "EV-CONVERGENCE", "PORTFOLIO-CULL", "OPPORTUNITY-SWAP",
+])
+def test_every_loss_type_exit_starts_a_24h_cooldown(ledger, reason):
+    gate = Gate(ledger)
+    with freeze_time("2026-06-02T00:00:00+00:00"):
+        _sold(gate, "tok1", reason)
+        assert gate.exit_cooldown_until("tok1") == datetime(2026, 6, 3, tzinfo=timezone.utc)
+    with freeze_time("2026-06-02T23:59:00+00:00"):
+        assert gate.can_enter(_market()).reason == "exit_cooldown"
+    with freeze_time("2026-06-03T01:00:00+00:00"):
+        assert gate.exit_cooldown_until("tok1") is None
+        assert isinstance(gate.can_enter(_market()), Ok)
+
+
+def test_take_profit_exit_starts_no_cooldown(ledger):
+    """A profitable exit means the model was right about the market, so
+    re-entering it is a legitimate trade, not churn."""
+    gate = Gate(ledger)
+    _sold(gate, "tok1", "TAKE-PROFIT")
+    assert gate.exit_cooldown_until("tok1") is None
+
+
+def test_failed_exit_starts_no_cooldown(ledger):
+    gate = Gate(ledger)
+    gate.record_exit_attempt(SimpleNamespace(token_id="tok1"), sold=False, reason="STOP-LOSS")
+    assert gate.exit_cooldown_until("tok1") is None
 
 
 def test_buy_exit_rebuy_churn_is_refused_until_the_cooldown_ends(ledger):
     """Regression (8e9b2d5): after a loss-type exit, an oscillating EV
     estimate re-bought the market it had just sold. The position is closed,
     so only the cooldown stands between exit and re-buy."""
-    cooldowns = {}
-    gate = Gate(ledger, exit_cooldown_until=cooldowns.get)
+    gate = Gate(ledger)
 
-    _buy(ledger, "tok1", "YES")
-    assert gate.can_enter(_market()).reason == "already_owned_in_portfolio"
+    with freeze_time("2026-06-02T00:00:00+00:00"):
+        _buy(ledger, "tok1", "YES")
+        assert gate.can_enter(_market()).reason == "already_owned_in_portfolio"
 
-    ledger.record_exit(token_id="tok1", shares=10.0, price=0.30, reason="EV-CONVERGENCE", venue="paper")
-    cooldowns["tok1"] = datetime(2026, 6, 3, tzinfo=timezone.utc)
-    assert gate.can_enter(_market()).reason == "exit_cooldown"
+        ledger.record_exit(token_id="tok1", shares=10.0, price=0.30, reason="EV-CONVERGENCE", venue="paper")
+        _sold(gate, "tok1")
+        assert gate.can_enter(_market()).reason == "exit_cooldown"
 
-    del cooldowns["tok1"]  # window over
-    assert isinstance(gate.can_enter(_market()), Ok)
+    with freeze_time("2026-06-03T00:00:01+00:00"):  # window over
+        assert isinstance(gate.can_enter(_market()), Ok)
 
 
 # ── Arbitrage baskets ────────────────────────────────────────────────────────
@@ -190,8 +222,34 @@ def test_basket_with_a_leg_held_on_the_opposite_side_is_refused(ledger):
 
 
 def test_basket_with_a_missing_leg_in_cooldown_is_refused(ledger):
-    until = datetime(2026, 6, 3, tzinfo=timezone.utc)
+    gate = Gate(ledger)
+    _sold(gate, "leg1")
 
-    decision = Gate(ledger, exit_cooldown_until=_cooldowns(leg1=until)).can_enter([_leg(0), _leg(1)])
+    decision = gate.can_enter([_leg(0), _leg(1)])
 
     assert decision.reason == "exit_cooldown"
+
+
+# ── can_exit: exit attempt cap ───────────────────────────────────────────────
+
+def _position(token_id="tok1"):
+    return SimpleNamespace(token_id=token_id, shares=10.0, current_price=0.30, side="YES")
+
+
+def test_dead_position_is_refused_after_five_failed_exits(ledger):
+    """Regression (98748ae): a position whose market vanished can never
+    sell, and was retried every tick (~2,000 times in one incident). After
+    five failed attempts, whichever exit path made them, the Gate refuses."""
+    gate = Gate(ledger)
+    pos = _position("dead_tok")
+
+    gave_up = [gate.record_exit_attempt(pos, sold=False, reason=reason)
+               for reason in ("STOP-LOSS", "PORTFOLIO-CULL", "OPPORTUNITY-SWAP", "STOP-LOSS")]
+    assert gave_up == [False] * 4
+    assert isinstance(gate.can_exit(pos), Ok)
+
+    assert gate.record_exit_attempt(pos, sold=False, reason="PORTFOLIO-CULL") is True
+    decision = gate.can_exit(pos)
+    assert isinstance(decision, Skip)
+    assert decision.reason == "exit_attempts_exhausted"
+    assert isinstance(gate.can_exit(_position("other_tok")), Ok)
