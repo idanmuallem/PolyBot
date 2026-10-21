@@ -275,3 +275,72 @@ def test_model_entry_has_no_group_id(ledger):
 
     assert ledger.holding("tok_yes").group_id is None
     assert ledger.transactions()[0]["group_id"] is None
+
+
+# ── Live entries rest on the book: the order id and what filled ──────────────
+
+def test_an_entrys_resting_order_id_survives_a_restart(tmp_path):
+    db = str(tmp_path / "trades.db")
+    _enter(Ledger(db), venue="live", order_id="o-1")
+
+    assert Ledger(db).holding("tok_yes").order_id == "o-1"
+
+
+def test_an_entry_that_filled_at_once_has_no_order_id(ledger):
+    _enter(ledger)
+
+    assert ledger.holding("tok_yes").order_id is None
+
+
+def test_an_order_that_filled_nothing_closes_the_entry_as_unfilled(ledger):
+    _enter(ledger, venue="live", order_id="o-1")
+
+    assert ledger.settle_entry_order(token_id="tok_yes", venue="live", filled_shares=0.0) == "unfilled"
+
+    assert ledger.holding("tok_yes") is None
+    [closed, _buy] = ledger.transactions()
+    assert closed["kind"] == "UNFILLED"
+    assert ledger.realized_pnl() == 0.0
+
+
+def test_a_partly_filled_order_keeps_the_entry_at_the_filled_shares(ledger):
+    _enter(ledger, venue="live", shares=10.0, price=0.40, order_id="o-1")
+
+    assert ledger.settle_entry_order(token_id="tok_yes", venue="live", filled_shares=4.0) == "partial"
+
+    holding = ledger.holding("tok_yes")
+    assert holding.shares == pytest.approx(4.0)
+    assert holding.order_id is None                     # nothing left to follow
+    [buy] = ledger.transactions()
+    assert buy["shares"] == pytest.approx(4.0)          # the entry fill is what filled
+    assert ledger.entries_on(holding.opened_at[:10])["crypto"][0] == pytest.approx(1.60)
+
+
+def test_a_fully_filled_order_keeps_the_entry_as_it_is(ledger):
+    _enter(ledger, venue="live", shares=10.0, order_id="o-1")
+
+    assert ledger.settle_entry_order(token_id="tok_yes", venue="live", filled_shares=10.0) == "filled"
+
+    holding = ledger.holding("tok_yes")
+    assert holding.shares == pytest.approx(10.0)
+    assert holding.order_id is None
+
+
+def test_settling_a_live_order_never_touches_a_paper_holding_of_the_same_token(ledger):
+    _enter(ledger, venue="live", order_id="o-1")
+    _enter(ledger, venue="paper")                       # same token, opened later, Dry run
+
+    ledger.settle_entry_order(token_id="tok_yes", venue="live", filled_shares=0.0)
+
+    [paper] = ledger.open_positions()
+    assert paper.venue == "paper"
+    assert paper.shares == pytest.approx(10.0)
+
+
+def test_unfilled_close_only_closes_the_holding_on_its_venue(ledger):
+    _enter(ledger, venue="live")
+    _enter(ledger, venue="paper")
+
+    ledger.record_unfilled(token_id="tok_yes", venue="live")
+
+    assert [h.venue for h in ledger.open_positions()] == ["paper"]

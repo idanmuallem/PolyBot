@@ -192,9 +192,10 @@ class ClobVenue:
     def buy(
         self, market: MarketRef, side: str, usd: float,
         price: Optional[float] = None, log_func: Optional[Callable] = None,
-    ) -> bool:
+    ) -> "LimitOrder | bool":
         """Post a limit BUY for *usd* worth of *side* at *price* (the side's
-        per-share price). LIVE-TRADE / LIVE-TRADE-ERROR rows go to log_func."""
+        per-share price): the resting order, or False if it was refused.
+        LIVE-TRADE / LIVE-TRADE-ERROR rows go to log_func."""
         log = log_func or _no_log
         execution_side = normalize_side(side)
         token_id = market.token_for(execution_side)
@@ -218,7 +219,7 @@ class ClobVenue:
             "success": True, "response": order_resp,
             "side": execution_side, "price": float(price),
         })
-        return True
+        return LimitOrder(id=_order_id(order_resp), token_id=token_id)
 
     def sell(
         self, token_id: str, shares: float,
@@ -265,25 +266,28 @@ class ClobVenue:
         return LimitOrder(id=order_id, token_id=token_id)
 
     def poll_limit_orders(self, orders: Sequence[LimitOrder]) -> Dict[Any, float]:
-        """Shares matched so far per order. ClobClient.get_order is a
-        synchronous REST call; it blocks the (sequential) engine loop for
-        one round-trip per order per poll."""
+        """Shares matched so far per order (the CLOB's size_matched). An
+        order whose status can't be read is left out. ClobClient.get_order
+        is a synchronous REST call; it blocks the (sequential) engine loop
+        for one round-trip per order per poll."""
         filled: Dict[Any, float] = {}
         for order in orders:
             try:
                 status = self.client.get_order(order.id)
             except Exception as exc:
                 logger.warning(f"get_order failed for {order.id}: {exc}")
-                status = None
-            filled[order.id] = (
-                _pick_float(status, "size_matched", "matched_size", "sizeMatched", "filled_size", "filledSize")
-                if isinstance(status, dict) else 0.0
-            )
+                continue
+            if isinstance(status, dict):
+                filled[order.id] = _pick_float(
+                    status, "size_matched", "matched_size", "sizeMatched", "filled_size", "filledSize",
+                )
         return filled
 
     def cancel_limit_order(self, order: LimitOrder, log_func: Optional[Callable] = None) -> bool:
-        """Cancel a resting order; CANCEL (with the CLOB's response) or
-        CANCEL-ERROR rows go to log_func, keyed by order id."""
+        """Cancel a resting order. False when the call failed or the CLOB
+        answered that it did not cancel it (not_canceled: already matched,
+        unknown, ...). CANCEL (with the CLOB's response) or CANCEL-ERROR
+        rows go to log_func, keyed by order id."""
         log = log_func or _no_log
         try:
             resp = self.client.cancel(order.id)
@@ -292,7 +296,8 @@ class ClobVenue:
             log("CANCEL-ERROR", "Portfolio", str(order.id), {"reason": "cancel_failed", "error": str(exc)})
             return False
         log("CANCEL", "Portfolio", str(order.id), {"response": resp})
-        return True
+        not_canceled = resp.get("not_canceled") if isinstance(resp, dict) else None
+        return not (not_canceled and str(order.id) in {str(k) for k in not_canceled})
 
     def resolve_closed_markets(
         self,

@@ -187,16 +187,18 @@ async def test_unchanged_drift_is_logged_once_and_its_clearing_is_logged(tmp_pat
     assert "RECONCILE-OK" in levels(rows)
 
 
-# ── Live run: entries the venue never shows are closed as unfilled ───────────
-# A live entry is a resting limit order: posting it is not a fill. A model
-# entry the CLOB never shows as a position is closed in the Ledger once a
-# grace period has passed, as unfilled (no P&L), so it isn't a phantom
-# holding.
+# ── Live run: a resting entry order is cancelled, then kept for what filled ──
+# A live entry is a GTC limit order: accepted is not filled. Once a grace
+# period has passed the engine cancels the entry's resting order and asks
+# the venue what filled: nothing -> closed as unfilled (no P&L); part ->
+# kept at the filled shares; all -> kept. A cancel that fails is retried
+# next tick. The order id is in the Ledger, so this survives a restart.
 
 def _clocked_live_pipeline(tmp_path):
     from datetime import datetime, timezone
     now = {"t": datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)}
     live = live_fake(cash=100.0)
+    live.rest_buys()
     pipeline, ctx, rows = make_tick_pipeline(tmp_path, live=live, active="live", clock=lambda: now["t"])
     dm.write_live_trading_requested(ctx.db_path, True)
     return pipeline, ctx, rows, live, now
@@ -207,21 +209,35 @@ def _minutes(now, n):
     now["t"] = now["t"] + timedelta(minutes=n)
 
 
+def _resting_entry(live, ledger, at="2026-10-21 12:00:00"):
+    """A live BTC YES entry of 10 shares at 0.40, resting on the book."""
+    live.list_market(BTC, yes_price=0.40)
+    order = live.buy(BTC, "YES", 4.0, price=0.40)
+    ledger.record_entry(token_id="btc-yes", condition_id="0xbtc", side="YES", shares=10.0, price=0.40,
+                        venue="live", strategy="crypto", order_id=order.id, at=at)
+    return order
+
+
+def _closes(ledger):
+    return [t for t in ledger.transactions() if t["kind"] != "BUY"]
+
+
 @pytest.mark.asyncio
-async def test_a_live_entry_the_venue_never_shows_is_closed_as_unfilled(tmp_path):
+async def test_a_live_entry_that_never_fills_is_cancelled_then_closed_as_unfilled(tmp_path):
     pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
-    ctx.ledger.record_entry(token_id="eth-yes", condition_id="0xeth", side="YES", shares=5.0, price=0.5,
-                            venue="live", strategy="crypto", at="2026-10-21 12:00:00")
+    order = _resting_entry(live, ctx.ledger)
 
     _minutes(now, 1)
     await pipeline.tick()
-    assert ctx.ledger.holding("eth-yes") is not None   # still inside the grace period
+    assert ctx.ledger.holding("btc-yes") is not None   # still inside the grace period
+    assert live.cancelled == []
 
     _minutes(now, 10)
     await pipeline.tick()
 
-    assert ctx.ledger.holding("eth-yes") is None
-    [closed] = [t for t in ctx.ledger.transactions() if t["kind"] != "BUY"]
+    assert live.cancelled == [order.id]
+    assert ctx.ledger.holding("btc-yes") is None
+    [closed] = _closes(ctx.ledger)
     assert closed["kind"] == "UNFILLED"
     assert closed["confirmed"] is False
     assert closed["pnl_per_share"] is None
@@ -230,32 +246,125 @@ async def test_a_live_entry_the_venue_never_shows_is_closed_as_unfilled(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_a_live_entry_the_venue_has_shown_is_not_closed_as_unfilled(tmp_path):
+async def test_a_partly_filled_live_entry_is_kept_with_the_filled_shares(tmp_path):
     pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
-    live.list_market(BTC, yes_price=0.40)
-    live.buy(BTC, "YES", 4.0)
-    ctx.ledger.record_entry(token_id="btc-yes", condition_id="0xbtc", side="YES", shares=10.0, price=0.4,
-                            venue="live", strategy="crypto", at="2026-10-21 12:00:00")
-    await pipeline.tick()                       # the venue shows it: it filled
+    order = _resting_entry(live, ctx.ledger)
+    live.fill_resting(order, 4.0)
 
-    live.sell("btc-yes", 10.0)                  # gone from the venue later (sold elsewhere)
-    _minutes(now, 30)
+    _minutes(now, 10)
     await pipeline.tick()
 
-    assert ctx.ledger.holding("btc-yes") is not None
-    assert "RECONCILE-UNFILLED" not in levels(rows)
+    assert live.cancelled == [order.id]                 # the rest can't fill later
+    assert ctx.ledger.holding("btc-yes").shares == pytest.approx(4.0)
+    assert _closes(ctx.ledger) == []
+
+    live.fill_resting(order, 6.0)                       # too late: it was cancelled
+    _minutes(now, 10)
+    await pipeline.tick()
+    assert ctx.ledger.holding("btc-yes").shares == pytest.approx(4.0)
+    assert [p.shares for p in live.open_positions()] == [pytest.approx(4.0)]
 
 
 @pytest.mark.asyncio
-async def test_holdings_from_before_this_run_are_not_closed_as_unfilled(tmp_path):
+async def test_a_fully_filled_live_entry_is_kept(tmp_path):
+    pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
+    order = _resting_entry(live, ctx.ledger)
+    live.fill_resting(order, 10.0)
+
+    _minutes(now, 10)
+    await pipeline.tick()
+
+    holding = ctx.ledger.holding("btc-yes")
+    assert holding.shares == pytest.approx(10.0)
+    assert holding.order_id is None
+    assert _closes(ctx.ledger) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_cancel_keeps_the_entry_and_is_retried_next_tick(tmp_path):
+    pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
+    order = _resting_entry(live, ctx.ledger)
+    live.fail_cancels()
+
+    _minutes(now, 10)
+    await pipeline.tick()
+
+    assert ctx.ledger.holding("btc-yes").order_id == order.id
+    assert _closes(ctx.ledger) == []
+
+    live.restore_cancels()
+    _minutes(now, 1)
+    await pipeline.tick()
+
+    assert live.cancelled == [order.id]
+    assert ctx.ledger.holding("btc-yes") is None
+    assert [c["kind"] for c in _closes(ctx.ledger)] == ["UNFILLED"]
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_holding_of_the_same_token_is_never_closed_as_unfilled(tmp_path):
+    pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
+    _resting_entry(live, ctx.ledger)
+    ctx.ledger.record_entry(token_id="btc-yes", condition_id="0xbtc", side="YES", shares=7.0, price=0.40,
+                            venue="paper", strategy="crypto", at="2026-10-21 12:01:00")
+
+    _minutes(now, 10)
+    await pipeline.tick()
+
+    [paper] = ctx.ledger.open_positions()
+    assert paper.venue == "paper"
+    assert paper.shares == pytest.approx(7.0)
+    assert [c["venue"] for c in _closes(ctx.ledger)] == ["live"]
+
+
+@pytest.mark.asyncio
+async def test_a_live_entry_opened_before_a_restart_is_still_cancelled_and_closed(tmp_path):
+    pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
+    order = _resting_entry(live, ctx.ledger, at="2026-10-20 08:00:00")   # yesterday, before this start
+
+    await pipeline.tick()
+
+    assert live.cancelled == [order.id]
+    assert ctx.ledger.holding("btc-yes") is None
+
+
+@pytest.mark.asyncio
+async def test_a_live_entry_with_no_order_to_follow_is_never_closed_as_unfilled(tmp_path):
+    """Entries recorded before order ids were kept: nothing to cancel or
+    check, so nothing is assumed about them."""
     pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
     ctx.ledger.record_entry(token_id="eth-yes", condition_id="0xeth", side="YES", shares=5.0, price=0.5,
-                            venue="live", strategy="crypto", at="2026-10-20 08:00:00")
+                            venue="live", strategy="crypto", at="2026-10-21 12:00:00")
 
     _minutes(now, 30)
     await pipeline.tick()
 
     assert ctx.ledger.holding("eth-yes") is not None
+    assert "RECONCILE-UNFILLED" not in levels(rows)
+
+
+@pytest.mark.asyncio
+async def test_a_live_model_entry_records_its_resting_order_id(tmp_path):
+    from unittest.mock import patch
+    from tests.integration.test_account_budget_tick import _btc_market, _config
+    from tests.tick_harness import FixedMarketScanner
+
+    market = _btc_market()
+    live = live_fake(cash=1000.0)
+    live.rest_buys()
+    live.list_market(MarketRef.from_market(market), market.initial_price)
+    pipeline, ctx, rows = make_tick_pipeline(
+        tmp_path, live=live, active="live", config=_config(trading_mode="live_run"),
+        scanner=FixedMarketScanner(market, live_truth=97_000.0),
+    )
+    dm.write_live_trading_requested(ctx.db_path, True)
+
+    with patch("brains.crypto.HybridCryptoBrain._calculate_probability", return_value=0.70):
+        await pipeline.tick()
+
+    [entry] = ctx.ledger.open_positions(venue="live")
+    assert entry.order_id is not None
+    assert live.resting_order_ids() == [entry.order_id]
 
 
 # ── positions unavailable (a Data API outage) ────────────────────────────────
@@ -263,15 +372,15 @@ async def test_holdings_from_before_this_run_are_not_closed_as_unfilled(tmp_path
 @pytest.mark.asyncio
 async def test_an_outage_longer_than_the_grace_period_closes_nothing(tmp_path):
     pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
-    ctx.ledger.record_entry(token_id="eth-yes", condition_id="0xeth", side="YES", shares=5.0, price=0.5,
-                            venue="live", strategy="crypto", at="2026-10-21 12:00:00")
+    _resting_entry(live, ctx.ledger)
     live.fail_position_reads()
 
     for _ in range(3):
         _minutes(now, 10)
         await pipeline.tick()
 
-    assert ctx.ledger.holding("eth-yes") is not None
+    assert ctx.ledger.holding("btc-yes") is not None
+    assert live.cancelled == []
     assert "RECONCILE-UNFILLED" not in levels(rows)
     assert _drift(rows) == []                          # an outage is not absence
     assert levels(rows).count("RECONCILE-UNAVAILABLE") == 1   # logged once, not every tick

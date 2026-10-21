@@ -22,7 +22,7 @@ from trading.account import Account, Refused
 from trading.gate import Skip
 from trading.kelly import kelly_bet_size
 from trading.strategies import EventSumStrategy, Strategy
-from trading.venue import MarketRef, PositionsUnavailable, whole_cent_shares
+from trading.venue import LimitOrder, MarketRef, PositionsUnavailable, whole_cent_shares
 from ui import data_manager
 
 
@@ -120,11 +120,6 @@ class SequentialTradingPipeline:
         self._last_resolve_check_at = 0.0
         self._last_drift = None  # last logged Venue/Ledger drift (see _reconcile())
         self._positions_unavailable = False  # outage logged (see _reconcile())
-        # Live entries are resting limit orders: a holding the CLOB has never
-        # shown is closed as unfilled after a grace period (see
-        # _close_unfilled_entries()). Only holdings opened since this start.
-        self._started_at = self.clock()
-        self._seen_on_venue: set[str] = set()
         # Typed trade record (trading/ledger.py). The engine is its only
         # writer; None (e.g. a bare test context) means not recording.
         self.ledger = getattr(ctx, "ledger", None)
@@ -916,6 +911,7 @@ class SequentialTradingPipeline:
             pre_prob=float(candidate.pre_prob),
             post_prob=float(candidate.post_prob),
             wang_edge=candidate.wang_edge,
+            order_id=getattr(entry, "order_id", None),
         )
 
     def _apply_mode_request(self) -> None:
@@ -1041,8 +1037,7 @@ class SequentialTradingPipeline:
             return
         self._positions_unavailable = False
 
-        self._seen_on_venue.update(t for t, n in venue_shares.items() if n > 0)
-        if self.venue.name == "live" and self._close_unfilled_entries(venue_shares):
+        if self._settle_resting_entries():
             ledger_shares = {h.token_id: float(h.shares) for h in self.ledger.open_positions(venue=self.venue.name)}
 
         venue_only = {t: n for t, n in venue_shares.items() if t not in ledger_shares and n > 0}
@@ -1063,36 +1058,73 @@ class SequentialTradingPipeline:
             self.log_func("RECONCILE-OK", "Pipeline", self.venue.name, {"venue": self.venue.name})
             self._last_drift = None
 
-    # How long a live entry may go unseen on the CLOB before it counts as
-    # never filled (the Data API lags fills by up to a minute or so).
+    # How long a resting entry order may rest before the engine cancels it
+    # and keeps whatever filled.
     _UNFILLED_GRACE = timedelta(minutes=5)
 
-    def _close_unfilled_entries(self, venue_shares: dict) -> bool:
-        """Close, as unfilled, the live model entries opened since this
-        engine started that the venue has never shown once the grace period
-        is over. ClobVenue.buy() posts a GTC limit order, and the CLOB's
-        response only says it was accepted, not that it filled; an order
-        that rests unfilled would otherwise stay a Ledger holding for ever.
-        Arbitrage legs are recorded from polled fills, so they are left
-        alone. True if anything was closed."""
+    def _settle_resting_entries(self) -> bool:
+        """Settle the active Venue's entries whose order rests on the book
+        (Ledger holdings with an order id: a live buy is a GTC limit order,
+        accepted but not known to be filled) once the grace period is over.
+
+        The order is cancelled first, then polled for what filled:
+          nothing -> closed as unfilled (RECONCILE-UNFILLED, no P&L)
+          part    -> kept at the filled shares (RECONCILE-PARTIAL)
+          all     -> kept as recorded
+        A cancel that fails, or a fill that can't be read, keeps the entry
+        as it is; it is tried again next tick. The order id is in the
+        Ledger, so entries opened before a restart are settled too. Only
+        holdings on the active Venue are looked at, so a holding of the same
+        token on another Venue is never touched. True if any holding changed.
+        """
         now = self.clock()
-        closed = False
-        for h in self.ledger.open_positions(venue=self.venue.name):
-            if h.strategy != "crypto" or h.token_id in venue_shares or h.token_id in self._seen_on_venue:
+        venue = self.venue
+        changed = False
+        for h in self.ledger.open_positions(venue=venue.name):
+            if not h.order_id:
                 continue
             opened = _parse_utc(h.opened_at)
-            if opened is None or opened < self._started_at - timedelta(seconds=1):
+            if opened is None or now - opened < self._UNFILLED_GRACE:
                 continue
-            if now - opened < self._UNFILLED_GRACE:
+            try:
+                outcome = self._settle_resting_entry(venue, h)
+            except Exception as exc:
+                self.log_func("SYNC-WARN", "Pipeline", h.token_id, {
+                    "reason": "resting_entry_settle_failed", "order_id": h.order_id, "error": str(exc),
+                })
                 continue
-            self.ledger.record_unfilled(token_id=h.token_id, venue=self.venue.name)
+            changed = changed or outcome in ("unfilled", "partial")
+        return changed
+
+    def _settle_resting_entry(self, venue, h) -> Optional[str]:
+        order = LimitOrder(id=h.order_id, token_id=h.token_id)
+        cancel_rows = lambda level, asset_type, token_id, payload: self.log_func(  # noqa: E731
+            level, asset_type, token_id, {"reason": "resting_entry_timeout", **payload},
+        )
+        cancelled = venue.cancel_limit_order(order, log_func=cancel_rows)
+        filled = venue.poll_limit_orders([order]).get(order.id)
+        if filled is None:
+            return None  # fill unknown: keep, try again next tick
+        filled = float(filled)
+        fully = filled >= h.shares - self._RECONCILE_SHARE_TOLERANCE
+        if not fully and not cancelled:
+            return None  # still resting, may fill more: keep, try again next tick
+        outcome = self.ledger.settle_entry_order(
+            token_id=h.token_id, venue=venue.name, filled_shares=h.shares if fully else filled,
+        )
+        if outcome == "unfilled":
             self.log_func("RECONCILE-UNFILLED", "Pipeline", h.token_id, {
-                "venue": self.venue.name, "shares": h.shares, "entry_price": h.entry_price,
-                "opened_at": h.opened_at,
-                "reason": "live entry order never showed up as a position on the venue",
+                "venue": venue.name, "order_id": h.order_id, "shares": h.shares,
+                "entry_price": h.entry_price, "opened_at": h.opened_at,
+                "reason": "entry order cancelled with nothing filled",
             })
-            closed = True
-        return closed
+        elif outcome == "partial":
+            self.log_func("RECONCILE-PARTIAL", "Pipeline", h.token_id, {
+                "venue": venue.name, "order_id": h.order_id, "ordered_shares": h.shares,
+                "filled_shares": filled, "entry_price": h.entry_price,
+                "reason": "entry order cancelled part filled",
+            })
+        return outcome
 
     def _record_resolution(self, resolved: dict, venue: str) -> None:
         """Record one market resolution reported by *venue* (see

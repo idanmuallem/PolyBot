@@ -6,6 +6,12 @@ or slippage, refuses what it can't fill, and settles closed markets.
 
 Exchange controls for tests: list_market(), set_price(), close_market(),
 fail_position_reads() / restore_position_reads().
+
+Resting buys (the live CLOB's behaviour, for tests of the engine around
+it): after rest_buys(), buy() places a resting order and returns it
+instead of filling. fill_resting() fills part or all of one;
+fail_cancels() / restore_cancels() make cancels fail. `cancelled` lists
+the order ids cancelled.
 """
 
 from __future__ import annotations
@@ -21,6 +27,17 @@ from trading.venue import (
 )
 
 MIN_ORDER_USD = 1.0  # same floor pm_trader enforces
+
+
+@dataclass
+class _Resting:
+    """A buy resting on the book (rest_buys())."""
+    market: MarketRef
+    side: str
+    shares: float
+    price: float
+    filled: float = 0.0
+    open: bool = True
 
 
 @dataclass
@@ -45,6 +62,10 @@ class FakeVenue:
         self._pending: Dict[int, dict] = {}           # order id -> order
         self._order_ids = itertools.count(1)
         self._positions_readable = True
+        self._rest_buys = False
+        self._resting: Dict[str, _Resting] = {}       # order id -> resting buy
+        self._cancels_fail = False
+        self.cancelled: List[Any] = []                # order ids cancelled
 
         # Every buy/sell that landed, in order: (op, token_id, shares, usd).
         self.fills: List[tuple] = []
@@ -69,6 +90,31 @@ class FakeVenue:
 
     def restore_position_reads(self) -> None:
         self._positions_readable = True
+
+    def rest_buys(self) -> None:
+        """From now on buy() rests on the book, as a live GTC order does."""
+        self._rest_buys = True
+
+    def fill_resting(self, order: LimitOrder, shares: float) -> None:
+        """*shares* of a resting buy match (nothing, once it's cancelled)."""
+        resting = self._resting[order.id]
+        if not resting.open:
+            return
+        shares = min(float(shares), resting.shares - resting.filled)
+        self._add_holding(resting.market, resting.side, shares, shares * resting.price, arbitrage=False)
+        self._cash -= shares * resting.price
+        resting.filled += shares
+        if resting.filled >= resting.shares - 1e-9:
+            resting.open = False
+
+    def resting_order_ids(self) -> List[Any]:
+        return [order_id for order_id, r in self._resting.items() if r.open]
+
+    def fail_cancels(self) -> None:
+        self._cancels_fail = True
+
+    def restore_cancels(self) -> None:
+        self._cancels_fail = False
 
     # -- Venue port ---------------------------------------------------------
 
@@ -96,8 +142,10 @@ class FakeVenue:
             ))
         return positions
 
-    def buy(self, market: MarketRef, side: str, usd: float, price=None, log_func=None) -> bool:
+    def buy(self, market: MarketRef, side: str, usd: float, price=None, log_func=None):
         log_paper_buy(log_func, market.token_for(side), normalize_side(side), usd, price)
+        if self._rest_buys:
+            return self._rest_buy(market, side, float(usd), price)
         return self._fill_buy(market, side, float(usd), max_price=None, arbitrage=False) > 0
 
     def sell(self, token_id: str, shares: float, price=None, log_func=None) -> bool:
@@ -136,6 +184,8 @@ class FakeVenue:
         return LimitOrder(id=order_id, token_id=token)
 
     def poll_limit_orders(self, orders: Sequence[LimitOrder]) -> Dict[Any, float]:
+        if any(order.id in self._resting for order in orders):
+            return {order.id: self._resting[order.id].filled for order in orders if order.id in self._resting}
         for order_id, pending in list(self._pending.items()):
             filled = self._fill_buy(
                 pending["market"], pending["side"], pending["usd"],
@@ -149,6 +199,15 @@ class FakeVenue:
         }
 
     def cancel_limit_order(self, order: LimitOrder, log_func: Optional[Callable] = None) -> bool:
+        if self._cancels_fail:
+            return False
+        resting = self._resting.get(order.id)
+        if resting is not None:
+            if not resting.open:
+                return False
+            resting.open = False
+            self.cancelled.append(order.id)
+            return True
         return self._pending.pop(order.id, None) is not None
 
     def resolve_closed_markets(
@@ -183,6 +242,29 @@ class FakeVenue:
     def _market_closed(self, market: MarketRef) -> bool:
         return market in self._winners
 
+    def _rest_buy(self, market: MarketRef, side: str, usd: float, price) -> Optional[LimitOrder]:
+        token = market.token_for(side)
+        price = float(price) if price else self._prices.get(token)
+        if not price or price <= 0 or usd < MIN_ORDER_USD or usd > self._cash + 1e-9:
+            return None
+        order_id = f"rest-{next(self._order_ids)}"
+        self._resting[order_id] = _Resting(
+            market=market, side=normalize_side(side), shares=usd / price, price=price,
+        )
+        return LimitOrder(id=order_id, token_id=token)
+
+    def _add_holding(self, market: MarketRef, side: str, shares: float, usd: float, arbitrage: bool) -> None:
+        token = market.token_for(side)
+        holding = self._holdings.get(token)
+        if holding is None:
+            self._holdings[token] = _Holding(
+                market=market, side=normalize_side(side), shares=shares, cost=usd, arbitrage=arbitrage,
+            )
+        else:
+            holding.shares += shares
+            holding.cost += usd
+            holding.arbitrage = holding.arbitrage or arbitrage
+
     def _fill_buy(
         self, market: MarketRef, side: str, usd: float, max_price: Optional[float], arbitrage: bool,
     ) -> float:
@@ -196,14 +278,6 @@ class FakeVenue:
             return 0.0
         shares = usd / price
         self._cash -= usd
-        holding = self._holdings.get(token)
-        if holding is None:
-            self._holdings[token] = _Holding(
-                market=market, side=normalize_side(side), shares=shares, cost=usd, arbitrage=arbitrage,
-            )
-        else:
-            holding.shares += shares
-            holding.cost += usd
-            holding.arbitrage = holding.arbitrage or arbitrage
+        self._add_holding(market, side, shares, usd, arbitrage)
         self.fills.append(("buy", token, shares, usd))
         return shares

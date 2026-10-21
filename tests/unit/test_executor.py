@@ -641,6 +641,27 @@ def test_an_entry_reports_the_token_side_price_and_shares_ordered():
     assert entry == PlacedEntry(token_id="tok1_no", side="NO", price=pytest.approx(0.60), shares=5.0)
 
 
+def test_a_live_entry_reports_its_resting_order_id():
+    """A live entry rests on the book; its order id is what lets the engine
+    cancel it and check its fill later."""
+    from trading.executor import TradeExecutor
+    from tests.unit.test_clob_venue import StubClobClient
+    from trading.clob_venue import ClobVenue
+    client = StubClobClient(order_response={"orderID": "o-77"})
+    executor = TradeExecutor(_dry_config(trading_mode="live_run"),
+                             venue=ClobVenue(client=client, proxy_address="0xabc", http_get=None))
+
+    entry = _evaluate(executor, side="YES", price=0.40, bet=2.0)
+
+    assert entry.order_id == "o-77"
+
+
+def test_an_entry_that_filled_at_once_has_no_order_to_follow():
+    executor = _make_executor(venue=_listed_venue(yes_price=0.40))
+
+    assert _evaluate(executor, price=0.40).order_id is None
+
+
 def test_a_refused_entry_reports_nothing():
     from trading.fake_venue import FakeVenue
     executor = _make_executor(venue=FakeVenue(cash=1000.0))  # tok1 not listed

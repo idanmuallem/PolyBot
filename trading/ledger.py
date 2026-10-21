@@ -45,6 +45,7 @@ _SCHEMA = (
         post_prob     REAL,
         wang_edge     REAL,
         group_id      TEXT,
+        order_id      TEXT,
         opened_at     TEXT NOT NULL,
         closed_at     TEXT,
         status        TEXT NOT NULL DEFAULT 'open',
@@ -82,6 +83,7 @@ _SCHEMA = (
 _ADDED_COLUMNS = (
     ("positions", "group_id", "TEXT"),
     ("trades", "group_id", "TEXT"),
+    ("positions", "order_id", "TEXT"),
 )
 
 
@@ -102,6 +104,9 @@ class Holding:
     wang_edge: Optional[float]
     opened_at: str
     group_id: Optional[str] = None  # arbitrage basket the leg belongs to
+    # The entry's resting order while what it filled is still unknown (a
+    # live buy is a GTC limit order); None once settled, or for a fill.
+    order_id: Optional[str] = None
 
 
 def _now() -> str:
@@ -161,21 +166,25 @@ class Ledger:
         price: float, venue: str, strategy: str, asset_type: Optional[str] = None,
         market_name: Optional[str] = None, pre_prob: Optional[float] = None,
         post_prob: Optional[float] = None, wang_edge: Optional[float] = None,
-        group_id: Optional[str] = None, at: Optional[str] = None,
+        group_id: Optional[str] = None, order_id: Optional[str] = None,
+        at: Optional[str] = None,
     ) -> int:
         """Record an entry fill. Returns the position id. group_id ties an
         arbitrage leg to its basket; the position's later sales and its
-        resolution inherit it. `at` overrides the recorded time
+        resolution inherit it. order_id is the entry's resting order, when
+        the venue's buy rests on the book instead of filling at once; see
+        settle_entry_order(). `at` overrides the recorded time
         ("YYYY-MM-DD HH:MM:SS"; default now)."""
         ts = at or _now()
         side = str(side or "").upper() or None
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO positions (venue, strategy, token_id, condition_id, side, asset_type, "
-                "market_name, shares, entry_price, pre_prob, post_prob, wang_edge, group_id, opened_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "market_name, shares, entry_price, pre_prob, post_prob, wang_edge, group_id, order_id, "
+                "opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (venue, strategy, str(token_id), condition_id, side, asset_type, market_name,
-                 float(shares), float(price), pre_prob, post_prob, wang_edge, group_id, ts),
+                 float(shares), float(price), pre_prob, post_prob, wang_edge, group_id,
+                 (str(order_id) if order_id is not None else None), ts),
             )
             position_id = int(cur.lastrowid)
             conn.execute(
@@ -227,32 +236,71 @@ class Ledger:
         )
 
     def record_unfilled(self, *, token_id: str, venue: str, at: Optional[str] = None) -> Optional[int]:
-        """Close the open holding for token_id as an entry order that never
-        filled: its whole size, no exit price and no realized P&L. Returns
-        the trade id, or None if nothing was open."""
-        holding = self.holding(token_id)
+        """Close the open holding for token_id on *venue* as an entry order
+        that never filled: its whole size, no exit price and no realized
+        P&L. A holding of the same token on another venue is never touched.
+        Returns the trade id, or None if nothing was open."""
+        holding = self._open_holding(token_id, venue)
         if holding is None:
             return None
         return self._close(
             kind="UNFILLED", token_id=token_id, shares=holding.shares, price=None,
             reason="UNFILLED", venue=venue, strategy=None, entry_price=None, side=None,
             market_name=None, confirmed=False, at=at, closed_status="unfilled",
+            same_venue=True,
         )
+
+    def settle_entry_order(self, *, token_id: str, venue: str, filled_shares: float) -> Optional[str]:
+        """The open holding for token_id on *venue* had a resting entry
+        order that is now done (cancelled or matched), with *filled_shares*
+        filled. Returns what that made of the entry:
+
+          "unfilled" -- nothing filled: closed as unfilled (record_unfilled)
+          "partial"  -- kept at the filled shares; its BUY row says so too
+          "filled"   -- kept as recorded
+          None       -- nothing open on that venue
+
+        Either way the order is no longer followed (order_id cleared)."""
+        holding = self._open_holding(token_id, venue)
+        if holding is None:
+            return None
+        filled = max(0.0, float(filled_shares))
+        if filled <= 1e-9:
+            self.record_unfilled(token_id=token_id, venue=venue)
+            return "unfilled"
+        partial = filled < holding.shares - 1e-9
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, entry_price FROM positions WHERE token_id = ? AND venue = ? "
+                "AND status = 'open' ORDER BY id DESC LIMIT 1",
+                (str(token_id), venue),
+            ).fetchone()
+            if partial:
+                conn.execute("UPDATE positions SET shares = ?, order_id = NULL WHERE id = ?", (filled, row["id"]))
+                conn.execute(
+                    "UPDATE trades SET shares = ?, amount_usd = ? WHERE position_id = ? AND kind = 'BUY'",
+                    (filled, filled * float(row["entry_price"]), row["id"]),
+                )
+            else:
+                conn.execute("UPDATE positions SET order_id = NULL WHERE id = ?", (row["id"],))
+        return "partial" if partial else "filled"
 
     def _close(
         self, *, kind: str, token_id: str, shares: float, price: Optional[float],
         reason: Optional[str], venue: str, strategy: Optional[str],
         entry_price: Optional[float], side: Optional[str], market_name: Optional[str],
         confirmed: bool, at: Optional[str] = None, closed_status: Optional[str] = None,
+        same_venue: bool = False,
     ) -> int:
         ts = at or _now()
         shares = float(shares)
+        sql = "SELECT * FROM positions WHERE token_id = ? AND status = 'open' "
+        params: tuple = (str(token_id),)
+        if same_venue:  # only the holding on this venue
+            sql += "AND venue = ? "
+            params += (venue,)
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM positions WHERE token_id = ? AND status = 'open' "
-                "ORDER BY id DESC LIMIT 1",
-                (str(token_id),),
-            ).fetchone()
+            row = conn.execute(sql + "ORDER BY id DESC LIMIT 1", params).fetchone()
 
             position_id = None
             condition_id = None
@@ -309,6 +357,15 @@ class Ledger:
                 "SELECT * FROM positions WHERE token_id = ? AND status = 'open' "
                 "ORDER BY id DESC LIMIT 1",
                 (str(token_id),),
+            ).fetchone()
+        return _holding(row) if row else None
+
+    def _open_holding(self, token_id: str, venue: str) -> Optional[Holding]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM positions WHERE token_id = ? AND venue = ? AND status = 'open' "
+                "ORDER BY id DESC LIMIT 1",
+                (str(token_id), venue),
             ).fetchone()
         return _holding(row) if row else None
 
@@ -487,4 +544,5 @@ def _holding(row) -> Holding:
         venue=row["venue"], strategy=row["strategy"], asset_type=row["asset_type"],
         market_name=row["market_name"], pre_prob=row["pre_prob"], post_prob=row["post_prob"],
         wang_edge=row["wang_edge"], opened_at=row["opened_at"], group_id=row["group_id"],
+        order_id=row["order_id"],
     )

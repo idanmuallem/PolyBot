@@ -84,7 +84,7 @@ def test_buy_no_posts_a_limit_buy_on_the_no_token_at_the_side_price():
     client = StubClobClient()
     venue = _venue(client)
 
-    assert venue.buy(BTC, "NO", 3.0, price=0.6) is True
+    assert venue.buy(BTC, "NO", 3.0, price=0.6)
 
     # floor(3.0 / 0.6 * 100) / 100 = 5.0 shares at the NO price
     assert client.orders == [("btc-no", 0.6, "BUY", 5.0)]
@@ -94,11 +94,20 @@ def test_buy_logs_live_trade_with_the_order_response():
     client = StubClobClient(order_response={"orderID": "abc"})
     rows, log = _logger()
 
-    assert _venue(client).buy(BTC, "YES", 2.0, price=0.4, log_func=log) is True
+    assert _venue(client).buy(BTC, "YES", 2.0, price=0.4, log_func=log)
 
     assert rows == [("LIVE-TRADE", "Portfolio", "btc-yes", {
         "success": True, "response": {"orderID": "abc"}, "side": "YES", "price": 0.4,
     })]
+
+
+def test_buy_hands_back_the_resting_order_so_it_can_be_polled_and_cancelled():
+    """A live buy is a GTC limit order: accepted is not filled."""
+    client = StubClobClient(order_response={"orderID": "abc"})
+
+    order = _venue(client).buy(BTC, "NO", 3.0, price=0.6)
+
+    assert order == LimitOrder(id="abc", token_id="btc-no")
 
 
 @pytest.mark.parametrize("response", [None, {}, {"error": "insufficient_funds"}, {"errorMsg": "x", "orderID": "1"}])
@@ -273,7 +282,7 @@ def test_place_limit_buy_without_an_order_id_returns_none():
 
 
 def test_poll_limit_orders_reports_matched_size_per_order():
-    client = StubClobClient(filled={"L1": 3.0, "L2": RuntimeError("down")})
+    client = StubClobClient(filled={"L1": 3.0, "L2": 0.0})
     venue = _venue(client)
 
     filled = venue.poll_limit_orders([LimitOrder(id="L1", token_id="A"), LimitOrder(id="L2", token_id="B")])
@@ -281,10 +290,42 @@ def test_poll_limit_orders_reports_matched_size_per_order():
     assert filled == {"L1": 3.0, "L2": 0.0}
 
 
+def test_poll_leaves_out_an_order_whose_status_cant_be_read():
+    """Unknown is not "nothing filled": the engine would close a filled entry."""
+    client = StubClobClient(filled={"L1": 3.0, "L2": RuntimeError("down")})
+    client.get_order = (lambda real: lambda order_id: None if order_id == "L3" else real(order_id))(client.get_order)
+    venue = _venue(client)
+
+    filled = venue.poll_limit_orders([LimitOrder(id=i, token_id="A") for i in ("L1", "L2", "L3")])
+
+    assert filled == {"L1": 3.0}
+
+
 def test_cancel_limit_order_cancels_on_the_clob():
     client = StubClobClient()
     assert _venue(client).cancel_limit_order(LimitOrder(id="L1", token_id="A")) is True
     assert client.cancelled == ["L1"]
+
+
+def test_cancel_the_clob_did_not_cancel_reports_false():
+    """The CLOB answers a cancel it refused (already matched, unknown order)
+    with not_canceled rather than an error: that order wasn't pending."""
+    client = StubClobClient()
+    client.cancel = lambda order_id: {"canceled": [], "not_canceled": {order_id: "order already matched"}}
+
+    assert _venue(client).cancel_limit_order(LimitOrder(id="L1", token_id="A")) is False
+
+
+def test_cancel_raising_reports_false_and_logs_cancel_error():
+    rows, log = _logger()
+    client = StubClobClient()
+
+    def down(order_id):
+        raise RuntimeError("timeout")
+    client.cancel = down
+
+    assert _venue(client).cancel_limit_order(LimitOrder(id="L1", token_id="A"), log_func=log) is False
+    assert [r[0] for r in rows] == ["CANCEL-ERROR"]
 
 
 def test_resolve_closed_markets_is_a_no_op_live():

@@ -241,8 +241,12 @@ class Venue(Protocol):
     def buy(
         self, market: MarketRef, side: str, usd: float,
         price: Optional[float] = None, log_func: Optional[Callable] = None,
-    ) -> bool:
-        """Buy *usd* worth of *side*. True only if the order landed."""
+    ) -> "bool | LimitOrder":
+        """Buy *usd* worth of *side*. Falsy unless the order landed: True
+        when it filled there and then, or the resting LimitOrder where the
+        venue's buys rest on the book (live: a GTC order, accepted but not
+        yet known to be filled). That order is followed with
+        poll_limit_orders() / cancel_limit_order() like any other."""
 
     def sell(
         self, token_id: str, shares: float,
@@ -260,7 +264,8 @@ class Venue(Protocol):
 
     def poll_limit_orders(self, orders: Sequence[LimitOrder]) -> Dict[Any, float]:
         """Advance pending limit orders against the book; return shares held
-        per order id for the token each order buys."""
+        per order id for the token each order buys. An order whose status
+        can't be read is left out (unknown is not zero)."""
 
     def cancel_limit_order(self, order: LimitOrder, log_func: Optional[Callable] = None) -> bool:
         """Cancel a still-pending order. False if it wasn't pending."""

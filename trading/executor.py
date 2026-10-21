@@ -20,11 +20,14 @@ from trading.venue import LimitOrder, MarketRef, Venue, normalize_side, side_pri
 @dataclass(frozen=True)
 class PlacedEntry:
     """A model entry the Venue accepted: the token bought (the NO token for
-    a NO entry), at the side's price, for whole-cent shares of the bet."""
+    a NO entry), at the side's price, for whole-cent shares of the bet.
+    order_id is set when the buy rests on the book instead of filling at
+    once: the engine follows that order until it knows what filled."""
     token_id: str
     side: str
     price: float
     shares: float
+    order_id: Optional[str] = None  # the resting order, where the venue's buys rest (live)
 
 
 def _with_asset_type(log_func: Callable, asset_type: str) -> Callable:
@@ -89,25 +92,26 @@ class TradeExecutor:
         log_func: Callable,
         condition_id: Optional[str] = None,
         slug: Optional[str] = None,
-    ) -> bool:
+    ) -> "bool | LimitOrder":
         """Buy *bet_amount* of *side* on the active venue.
 
         token_id/current_poly_price are the market's YES token and price;
-        side picks which outcome is bought. True only if the order landed:
+        side picks which outcome is bought. Falsy unless the order landed:
         callers spend budget and trade count, and assume a position exists,
-        on True.
-        """
+        when it is truthy. A venue whose buys rest on the book returns the
+        resting LimitOrder (see Venue.buy())."""
         market = MarketRef(
             yes_token_id=str(token_id), no_token_id=no_token_id or None,
             condition_id=condition_id or None, slug=slug or None,
         )
         execution_side = normalize_side(side)
         try:
-            return bool(self.venue.buy(
+            placed = self.venue.buy(
                 market, execution_side, bet_amount,
                 price=side_price(current_poly_price, execution_side),
                 log_func=_with_asset_type(log_func, asset_type),
-            ))
+            )
+            return placed if isinstance(placed, LimitOrder) else bool(placed)
         except Exception as exc:
             logging.warning(f"[VENUE] Buy failed (non-fatal to pipeline): {exc}")
             return False
@@ -328,7 +332,8 @@ class TradeExecutor:
         if not executed:
             return None
         return PlacedEntry(token_id=execution_token_id, side=execution_side,
-                           price=execution_price, shares=shares)
+                           price=execution_price, shares=shares,
+                           order_id=str(executed.id) if isinstance(executed, LimitOrder) else None)
 
     def _validate_market(self, market: MarketData, log_func: Callable) -> bool:
         for field_name, field_value in [
