@@ -1191,6 +1191,7 @@ class SequentialTradingPipeline:
             position_value=account.open_position_value,
             unrealized_pnl=account.unrealized_pnl,
             watch_only=account.watch_only,
+            venue=self.venue.name,
         )
         data_manager.write_open_positions(
             db_path=self.db_path,

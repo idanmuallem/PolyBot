@@ -68,10 +68,14 @@ def init_db(db_path: str):
                 starting_balance    REAL,
                 open_position_value REAL,
                 unrealized_pnl      REAL,
-                watch_only          INTEGER
+                watch_only          INTEGER,
+                venue               TEXT
             )
             """
         )
+        # Added after engine_status first shipped.
+        if "venue" not in {row[1] for row in conn.execute("PRAGMA table_info(engine_status)")}:
+            conn.execute("ALTER TABLE engine_status ADD COLUMN venue TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS engine_control (
@@ -142,16 +146,19 @@ def insert_paper_snapshot(db_path: str, cash: float, positions_value: float):
 def write_engine_status(
     db_path: str, balance: float, starting_balance: float,
     position_value: float, unrealized_pnl: float, watch_only: bool,
+    venue: str | None = None,
 ) -> None:
+    """*venue* is the name of the Venue the engine trades on ("paper" for
+    Dry run, "live" for Live run)."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         with _open_db(db_path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO engine_status "
                 "(id, updated_at, current_balance, starting_balance, open_position_value, "
-                " unrealized_pnl, watch_only) VALUES (1, ?, ?, ?, ?, ?, ?)",
+                " unrealized_pnl, watch_only, venue) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
                 (ts, float(balance), float(starting_balance), float(position_value),
-                 float(unrealized_pnl), int(bool(watch_only))),
+                 float(unrealized_pnl), int(bool(watch_only)), venue),
             )
     except Exception as e:
         print(f"[ENGINE-STATUS] DB error writing status: {e}")
@@ -172,6 +179,21 @@ def read_engine_status(db_path: str) -> dict | None:
     d = dict(row)
     d["watch_only"] = bool(d["watch_only"])
     return d
+
+
+def trading_venue(db_path: str) -> str:
+    """The venue of the engine's current trading mode ("paper" for Dry run,
+    "live" for Live run): the one the engine last published, or the
+    requested mode before the engine has published one. The dashboard's
+    trade history is filtered to it, so Dry run and Live run never mix."""
+    try:
+        with _open_db(db_path) as conn:
+            row = conn.execute("SELECT venue FROM engine_status WHERE id = 1").fetchone()
+        if row is not None and row[0]:
+            return str(row[0])
+    except Exception:
+        pass
+    return "live" if read_live_trading_requested(db_path) else "paper"
 
 
 def write_live_trading_requested(db_path: str, value: bool) -> None:

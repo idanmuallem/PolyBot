@@ -264,7 +264,9 @@ def _render_portfolio_view() -> None:
     st.markdown("#### EV by Market")
     render_ev_chart(data_manager.get_latest_ev_by_token(wallet_ctx.db_path, limit=15))
     st.markdown("#### Transactions")
-    render_transactions_table(data_manager.fetch_transactions(wallet_ctx.db_path, limit=100))
+    render_transactions_table(data_manager.fetch_transactions(
+        wallet_ctx.db_path, limit=100, venue=data_manager.trading_venue(wallet_ctx.db_path),
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -324,8 +326,11 @@ def _render_balance_stats_row() -> None:
     # just duplicate that number under a second label.
     cash, holdings, _, total_deposits = _compute_balance_snapshot()
 
-    stats = data_manager.get_trade_stats(wallet_ctx.db_path)
-    closed_deltas = data_manager.get_closed_trade_deltas(wallet_ctx.db_path)
+    # Trade history of the engine's current trading mode only: Dry run and
+    # Live run results never mix.
+    venue = data_manager.trading_venue(wallet_ctx.db_path)
+    stats = data_manager.get_trade_stats(wallet_ctx.db_path, venue=venue)
+    closed_deltas = data_manager.get_closed_trade_deltas(wallet_ctx.db_path, venue=venue)
     open_deltas = [
         float(p.get("current_price", 0.0) or 0.0) - float(p.get("initial_price", 0.0) or 0.0)
         for p in data_manager.read_open_positions(wallet_ctx.db_path)

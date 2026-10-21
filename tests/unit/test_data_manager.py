@@ -488,3 +488,33 @@ def test_get_terminal_feed_formats_most_recent_first(db):
     assert lines[0].startswith("[DRY-RUN] Crypto::ETH - ETH market")
     assert "ev=0.6" in lines[0]
     assert lines[1].startswith("[REJECTED] Crypto::BTC - EV below threshold")
+
+
+# ── Dashboard history follows the engine's trading mode ──────────────────────
+
+def test_trading_venue_is_the_venue_the_engine_last_published(db):
+    dm.write_engine_status(db, balance=50.0, starting_balance=50.0, position_value=0.0,
+                           unrealized_pnl=0.0, watch_only=False, venue="live")
+    dm.write_live_trading_requested(db, False)   # requested, not yet applied
+
+    assert dm.trading_venue(db) == "live"
+
+
+def test_trading_venue_falls_back_to_the_requested_mode(db):
+    assert dm.trading_venue(db) == "paper"
+    dm.write_live_trading_requested(db, True)
+    assert dm.trading_venue(db) == "live"
+
+
+def test_trading_venue_survives_an_engine_status_table_without_a_venue_column(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE engine_status (id INTEGER PRIMARY KEY CHECK (id = 1), updated_at TEXT, "
+                     "current_balance REAL, starting_balance REAL, open_position_value REAL, "
+                     "unrealized_pnl REAL, watch_only INTEGER)")
+    dm.init_db(path)
+    dm.write_engine_status(path, balance=1.0, starting_balance=1.0, position_value=0.0,
+                           unrealized_pnl=0.0, watch_only=False, venue="live")
+
+    assert dm.trading_venue(path) == "live"

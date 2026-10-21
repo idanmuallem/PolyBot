@@ -256,3 +256,16 @@ async def test_holdings_from_before_this_run_are_not_closed_as_unfilled(tmp_path
     await pipeline.tick()
 
     assert ctx.ledger.holding("eth-yes") is not None
+
+
+@pytest.mark.asyncio
+async def test_engine_status_names_the_active_venue(tmp_path):
+    paper, live = FakeVenue(cash=300.0), live_fake(cash=55.0)
+    pipeline, ctx, _ = make_tick_pipeline(tmp_path, paper=paper, live=live)
+
+    await pipeline.tick()
+    assert dm.trading_venue(ctx.db_path) == "paper"
+
+    dm.write_live_trading_requested(ctx.db_path, True)
+    await pipeline.tick()
+    assert dm.trading_venue(ctx.db_path) == "live"
