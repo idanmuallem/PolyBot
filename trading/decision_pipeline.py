@@ -1008,7 +1008,7 @@ class SequentialTradingPipeline:
                     on_resolved=lambda resolved, name=venue.name: self._record_resolution(resolved, name),
                 )
             except Exception as e:
-                self.log_func("PAPER-ERROR", "Engine", "resolve_all", {"venue": venue.name, "error": str(e)})
+                self.log_func("RESOLVE-ERROR", "Engine", venue.name, {"venue": venue.name, "error": str(e)})
 
     # Share counts within this of each other agree: venues floor or round
     # fills to cents, the Ledger records the requested size.

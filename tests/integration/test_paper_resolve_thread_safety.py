@@ -41,7 +41,7 @@ async def test_paper_resolution_settles_closed_market_on_the_loop_thread(tmp_pat
     )
     assert venue.open_positions() == []
     assert venue.cash() == pytest.approx(1000.0 - 20.0 + 50.0)
-    assert "PAPER-ERROR" not in levels(rows)
+    assert "RESOLVE-ERROR" not in levels(rows)
 
 
 @pytest.mark.asyncio
@@ -56,4 +56,7 @@ async def test_paper_resolution_failure_is_caught_and_logged(tmp_path):
 
     await pipeline.tick()
 
-    assert "PAPER-ERROR" in levels(rows)
+    [(token, payload)] = [(t, p) for level, t, p in rows if level == "RESOLVE-ERROR"]
+    assert token == "paper"
+    assert payload["venue"] == "paper" and "boom" in payload["error"]
+    assert "PAPER-ERROR" not in levels(rows)
