@@ -157,3 +157,20 @@ async def test_the_first_tick_of_a_new_utc_day_resets_the_budget(tmp_path):
 
     assert {h.token_id for h in ctx.ledger.open_positions()} == {"tok1", "tok2"}
     assert ctx.bridge.spent_today == pytest.approx(3.0)
+
+
+@pytest.mark.asyncio
+async def test_a_restarted_engine_keeps_todays_spend(tmp_path):
+    """Spend the whole $3 daily budget, restart (a new pipeline and Account
+    over the same database), and the budget is still spent."""
+    config = _config(daily_limit_usd=3.0, crypto_daily_limit_usd=3.0)
+    pipeline, ctx, rows, venue = _pipeline(tmp_path, config, markets=[_btc_market("tok1")])
+    await _tick(pipeline)
+    assert ctx.bridge.spent_today == pytest.approx(3.0)
+
+    restarted, ctx2, rows2, venue2 = _pipeline(tmp_path, config, markets=[_btc_market("tok2")])
+    assert ctx2.bridge.spent_today == pytest.approx(3.0)
+    await _tick(restarted)
+
+    assert "daily_limit_reached" in _rejections(rows2)
+    assert "TRACK" not in [level for level, _, _ in rows2]

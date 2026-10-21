@@ -8,11 +8,21 @@ the bridge. Nothing else in the engine writes cash.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from core.trading_config import TradingConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _utc(now: datetime) -> datetime:
+    """*now* in UTC; a naive datetime is taken to be UTC already."""
+    if now.tzinfo is None:
+        return now.replace(tzinfo=timezone.utc)
+    return now.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -136,20 +146,30 @@ class Account:
         self._publish()
 
     def daily_reset(self, now: datetime) -> bool:
-        """Start a new budget day when *now* is on a later UTC date than
-        the current one: spend and trade counts go back to zero. True if
-        it reset."""
-        day = now.astimezone(timezone.utc).date()
-        if self._day is None:
-            self._day = day
-            return False
+        """Start the budget day *now* falls on (UTC): today's spend and
+        trade counts are whatever the Ledger recorded for that day, so a
+        restart resumes them and a new day starts from zero. True if it
+        moved to a later day; the first call only sets the day."""
+        day = _utc(now).date()
         if day == self._day:
             return False
+        first = self._day is None
         self._day = day
-        self._spent, self._trades = {}, {}
-        self._snapshot = replace(self._snapshot, spent_today=0.0)
+        self._spent, self._trades = self._recorded_entries(day.isoformat())
+        self._snapshot = replace(self._snapshot, spent_today=sum(self._spent.values()))
         self._publish()
-        return True
+        return not first
+
+    def _recorded_entries(self, day: str) -> tuple[dict, dict]:
+        if self._ledger is None:
+            return {}, {}
+        try:
+            entries = self._ledger.entries_on(day)
+        except Exception as exc:
+            logger.warning(f"[ACCOUNT] Today's spend unavailable from the Ledger: {exc}")
+            return {}, {}
+        return ({s: usd for s, (usd, _n) in entries.items()},
+                {s: n for s, (_usd, n) in entries.items()})
 
     def _strategy_limit(self, strategy: str) -> float:
         cfg = self._config
@@ -257,7 +277,7 @@ class Account:
         try:
             return float(self._ledger.unrealized_pnl(marks, venue=venue_name))
         except Exception as exc:
-            print(f"[ACCOUNT] Unrealized P&L unavailable: {exc}")
+            logger.warning(f"[ACCOUNT] Unrealized P&L unavailable: {exc}")
             return 0.0
 
     def _publish(self) -> None:

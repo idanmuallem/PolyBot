@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 _SCHEMA = (
@@ -104,7 +104,8 @@ class Holding:
 
 
 def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """Recorded times are UTC, the same clock as the Account's budget day."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class _Borrowed:
@@ -328,6 +329,17 @@ class Ledger:
                 (str(day),),
             ).fetchone()
         return float(row[0] or 0.0)
+
+    def entries_on(self, day: str) -> dict[str, tuple[float, int]]:
+        """Entry fills recorded on `day` ("YYYY-MM-DD", UTC), per strategy:
+        {strategy: ($ spent, number of fills)}, across venues."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT strategy, COALESCE(SUM(amount_usd), 0.0), COUNT(*) FROM trades "
+                "WHERE kind = 'BUY' AND substr(timestamp, 1, 10) = ? GROUP BY strategy",
+                (str(day),),
+            ).fetchall()
+        return {str(r[0]): (float(r[1] or 0.0), int(r[2])) for r in rows}
 
     def _closing_trades(self, venue: Optional[str] = None) -> list:
         """Confirmed closes (sales and paid-out resolutions) with a known

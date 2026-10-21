@@ -196,3 +196,67 @@ def test_realistic_kelly_fraction_sizes_vary_with_edge_below_the_ceiling():
 
     assert trade_a == pytest.approx(50.83, abs=0.01)
     assert trade_b == pytest.approx(40.40, abs=0.01)
+
+
+# ── Restart: today's spend and trade counts come back from the Ledger ────────
+
+def _restarted_account(ledger, bridge=None, **config):
+    """A fresh Account over a Ledger that already holds today's entries,
+    as after an engine restart."""
+    return Account(
+        venue=lambda: FakeVenue(cash=100.0),
+        bridge=bridge if bridge is not None else DataBridge(),
+        ledger=ledger,
+        config=_config(**config),
+    )
+
+
+def _spend(ledger, strategy, usd, at):
+    ledger.record_entry(token_id=f"{strategy}-{at}", condition_id=None, side="YES",
+                        shares=usd / 0.5, price=0.5, venue="paper", strategy=strategy, at=at)
+
+
+def test_a_restarted_account_resumes_todays_spend_from_the_ledger(tmp_path):
+    from trading.ledger import Ledger
+    ledger = Ledger(str(tmp_path / "trades.db"))
+    now = datetime(2026, 10, 21, 15, 0, tzinfo=timezone.utc)
+    _spend(ledger, "crypto", 12.0, "2026-10-21 09:00:00")
+    _spend(ledger, "arbitrage", 1.0, "2026-10-21 10:00:00")
+    _spend(ledger, "crypto", 9.0, "2026-10-20 23:59:59")         # yesterday (UTC)
+
+    bridge = DataBridge()
+    account = _restarted_account(ledger, bridge=bridge)
+    account.daily_reset(now)
+
+    assert account.snapshot().spent_today == pytest.approx(13.0)
+    assert bridge.spent_today == pytest.approx(13.0)
+    # $15 global limit, $13 spent: $2 left, whatever the strategy asks for.
+    assert account.reserve("crypto", 3.0).usd == pytest.approx(2.0)
+    account.record_fill("crypto", 2.0)
+    assert isinstance(account.reserve("crypto", 1.0), Refused)
+
+
+def test_a_restarted_account_resumes_todays_trade_counts_from_the_ledger(tmp_path):
+    from trading.ledger import Ledger
+    ledger = Ledger(str(tmp_path / "trades.db"))
+    _spend(ledger, "crypto", 1.0, "2026-10-21 09:00:00")
+    _spend(ledger, "arbitrage", 1.0, "2026-10-21 09:30:00")
+
+    account = _restarted_account(ledger, crypto_max_daily_trades=1, max_daily_trades=3)
+    account.daily_reset(datetime(2026, 10, 21, 15, 0, tzinfo=timezone.utc))
+
+    assert account.reserve("crypto", 1.0).reason == "daily_trade_limit_would_be_exceeded"
+    assert account.reserve("arbitrage", 2.0, trades=2).reason == "global_daily_trade_limit_would_be_exceeded"
+
+
+def test_the_first_refresh_keeps_the_restored_spend(tmp_path):
+    from trading.ledger import Ledger
+    ledger = Ledger(str(tmp_path / "trades.db"))
+    _spend(ledger, "crypto", 6.0, "2026-10-21 09:00:00")
+    bridge = DataBridge()
+    account = _restarted_account(ledger, bridge=bridge)
+    account.daily_reset(datetime(2026, 10, 21, 15, 0, tzinfo=timezone.utc))
+
+    account.refresh()
+
+    assert bridge.spent_today == pytest.approx(6.0)

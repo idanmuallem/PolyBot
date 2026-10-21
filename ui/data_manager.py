@@ -1,7 +1,7 @@
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -629,7 +629,9 @@ def get_equity_curve(db_path: str) -> pd.DataFrame:
 def restore_runtime_state(db_path: str, fallback_starting_balance: float, now: datetime | None = None) -> dict:
     """Engine state to resume from after a restart or redeploy.
 
-    spent_today comes from the Ledger (today's entry fills). Balances resume
+    spent_today comes from the Ledger (today's entry fills, UTC day, as the
+    Account counts them; a diagnostic here, the Account seeds its own budget
+    from the Ledger). Balances resume
     from the last engine_status the engine published before it stopped;
     they are refreshed from the Venue on the first sync after startup.
     hunt_history is not consulted: it is a diagnostics log, not state.
@@ -642,7 +644,10 @@ def restore_runtime_state(db_path: str, fallback_starting_balance: float, now: d
         "source": "default",
     }
 
-    today = (now or datetime.now()).strftime("%Y-%m-%d")
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
     try:
         state["spent_today"] = Ledger(db_path).spent_on(today)
     except Exception as e:

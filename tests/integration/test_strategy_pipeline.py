@@ -178,6 +178,8 @@ async def test_fully_held_group_is_skipped_not_rebought(tmp_path):
     ledger = Ledger(str(tmp_path / "trades.db"))
     _hold_legs(ledger, [(f"evt1_tok{i}", 3.0, 0.30) for i in range(3)])
     pipeline, bridge, log_calls = _make_pipeline(balance=100.0, ledger=ledger)
+    # The held legs were bought today, so the restarted Account counts them.
+    spent_before = pipeline.account.snapshot().spent_today
 
     with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[_underpriced_event(n=3)]):
         await pipeline._stage_strategy_scan()
@@ -187,7 +189,7 @@ async def test_fully_held_group_is_skipped_not_rebought(tmp_path):
         c["level"] == "SCAN-SKIP" and c["payload"].get("reason") == "already_owned_in_portfolio"
         for c in log_calls
     )
-    assert pipeline.account.snapshot().spent_today == 0.0
+    assert pipeline.account.snapshot().spent_today == spent_before
 
 
 @pytest.mark.asyncio

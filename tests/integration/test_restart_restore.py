@@ -1,7 +1,7 @@
 """Restart restore reads the Ledger (spec #12, ticket #16): what the engine
 held and spent before a restart or redeploy is what it resumes with."""
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -19,7 +19,7 @@ def _ctx(db_path):
 
 def test_state_after_restart_matches_state_before(tmp_path):
     db = str(tmp_path / "trades.db")
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # The engine's session before the restart.
     restore_wallet_state(_ctx(db))
@@ -36,10 +36,11 @@ def test_state_after_restart_matches_state_before(tmp_path):
 
     # Restart: a fresh process restores from the database.
     ctx = _ctx(db)
-    restore_wallet_state(ctx)
+    restored = restore_wallet_state(ctx)
 
     assert ctx.bridge.starting_balance == pytest.approx(1000.0)
-    assert ctx.bridge.spent_today == pytest.approx(13.0)
+    assert restored["spent_today"] == pytest.approx(13.0)
+    assert ctx.bridge.spent_today == 0.0  # the Account seeds and publishes it
     assert Ledger(db).open_positions() == held_before
     assert Ledger(db).holding_for("c1", "NO").token_id == "no1"
 
@@ -48,7 +49,7 @@ def test_first_start_after_upgrade_restores_backfilled_history(tmp_path):
     """The first start on a pre-Ledger database backfills hunt_history, so
     restore already sees today's historical entries and open holdings."""
     db = str(tmp_path / "trades.db")
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with sqlite3.connect(db) as conn:
         conn.execute(
             "CREATE TABLE hunt_history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, "
@@ -66,7 +67,7 @@ def test_first_start_after_upgrade_restores_backfilled_history(tmp_path):
         )
 
     ctx = _ctx(db)
-    restore_wallet_state(ctx)
+    restored = restore_wallet_state(ctx)
 
-    assert ctx.bridge.spent_today == pytest.approx(10.0)
+    assert restored["spent_today"] == pytest.approx(10.0)
     assert Ledger(db).holding("yes1").shares == pytest.approx(25.0)
