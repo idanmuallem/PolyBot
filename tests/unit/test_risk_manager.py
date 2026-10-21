@@ -574,3 +574,47 @@ def test_cull_and_swap_sales_start_the_post_exit_cooldown(ledger, path):
         pm.free_up_capital(1_000.0, lambda *a: None)
 
     assert pm.gate.exit_cooldown_until("weak_tok") == datetime(2026, 6, 3, tzinfo=timezone.utc)
+
+
+# ── Live run: every exit path that gives up records the expiry ───────────────
+
+def _live_dead_position(ledger):
+    pm, bridge, executor = _make_pm(ledger=ledger)
+    executor.dry_run = False  # Live run
+    executor.sell_position.return_value = False
+    executor.get_balance.return_value = 0.0
+    ledger.record_entry(token_id="dead_tok", condition_id="c", side="YES", shares=10.0, price=0.40,
+                        venue="live", strategy="crypto")
+    pos = _pos(pnl_ratio=-1.0, token_id="dead_tok")
+    return pm, executor, pos
+
+
+def _expired(rows):
+    return [payload for level, payload in rows if level == "EXPIRED"]
+
+
+def test_cull_that_gives_up_in_live_run_records_the_expiry(ledger):
+    pm, executor, pos = _live_dead_position(ledger)
+    rows = []
+    log_func = lambda level, asset_type, token_id, payload: rows.append((level, payload))
+
+    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS):
+        pm._liquidate_position_value(pos, log_func)
+
+    [expired] = _expired(rows)
+    assert expired["sold"] is False
+    assert ledger.holding("dead_tok") is None
+    assert [t["kind"] for t in ledger.transactions()] == ["EXPIRED", "BUY"]
+
+
+def test_free_up_capital_that_gives_up_in_live_run_records_the_expiry(ledger):
+    pm, executor, pos = _live_dead_position(ledger)
+    executor.get_open_positions.return_value = [pos]
+    rows = []
+    log_func = lambda level, asset_type, token_id, payload: rows.append((level, payload))
+
+    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS):
+        pm.free_up_capital(100.0, log_func)
+
+    assert len(_expired(rows)) == 1
+    assert ledger.holding("dead_tok") is None

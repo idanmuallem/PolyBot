@@ -5,7 +5,7 @@ from ui import data_manager
 
 from brains.pricing_engine import PricingEngine
 from trading.correlation import CorrelationTracker
-from trading.gate import Gate, Ok
+from trading.gate import MAX_EXIT_ATTEMPTS, Gate, Ok
 
 
 class PortfolioManager:
@@ -205,11 +205,13 @@ class PortfolioManager:
             return 0.0
 
         try:
-            sold, _gave_up = self._sell(position, "PORTFOLIO-CULL", log_func)
+            sold, gave_up = self._sell(position, "PORTFOLIO-CULL", log_func)
         except Exception as exc:
             print(f"[PORTFOLIO-CULL] Liquidation failed for {token_id}: {exc}")
             return 0.0
 
+        if gave_up:
+            self._record_gave_up(position, log_func)
         if not sold:
             return 0.0
         self._record_sale(position, "PORTFOLIO-CULL")
@@ -275,43 +277,50 @@ class PortfolioManager:
             **extra,
         })
 
-        # Live-mode-only: giving up at the Gate's exit attempt cap is the existing
-        # signal for "this position's market has no live order book left" —
-        # per the MAX_EXIT_ATTEMPTS comment in trading/gate.py, that's what a resolved/closed
-        # Polymarket market looks like from here (it doesn't disappear from
-        # the positions API, it just stops being sellable). Fires exactly
-        # once per token (the attempt that pushes the counter to the cap;
-        # every attempt after that short-circuits before reaching this
-        # point), so this can't spam the ledger. sold stays False — there's
-        # no confirmed on-chain payout (this bot doesn't automate
-        # redemption), so it's excluded from get_trade_stats()/
-        # get_closed_trade_deltas()'s P&L aggregation, just surfaced as a
-        # visibility flag in the Transactions ledger. Paper mode's
-        # equivalent (PaperVenue.resolve_closed_markets) already logs a
-        # sold=True EXPIRED row with a real payout, so this branch would
-        # only ever double up on that — hence live-mode only.
-        if gave_up and not getattr(self.executor, "dry_run", True):
-            if self.ledger is not None:
-                self.ledger.record_resolution(
-                    token_id=token_id, shares=shares, payout_price=None, venue="live",
-                    entry_price=initial_price,
-                    side=str(self._position_field(position, "side", "") or "") or None,
-                )
-            log_func("EXPIRED", "Portfolio", token_id, {
-                "shares": shares,
-                "price": current_price,
-                "initial_price": initial_price,
-                "side": str(self._position_field(position, "side", "") or ""),
-                "market_name": str(self._position_field(position, "market_id", "") or ""),
-                "sold": False,
-                "reason": (
-                    f"Gave up selling after {self.gate.MAX_EXIT_ATTEMPTS} failed attempts — "
-                    "market most likely resolved/closed on Polymarket. On-chain "
-                    "redemption is not automated by this bot."
-                ),
-            })
+        if gave_up:
+            self._record_gave_up(position, log_func)
 
         return bool(sold)
+
+    def _record_gave_up(self, position, log_func) -> None:
+        """Every exit path calls this on the failed sell that reaches the
+        Gate's attempt cap (it happens once per token).
+
+        Live run only: giving up is the signal for "this position's market
+        has no live order book left". Per the MAX_EXIT_ATTEMPTS comment in
+        trading/gate.py, that's what a resolved/closed Polymarket market
+        looks like from here (it doesn't disappear from the positions API,
+        it just stops being sellable). sold stays False: there's no
+        confirmed on-chain payout (this bot doesn't automate redemption),
+        so it's excluded from get_trade_stats()/get_closed_trade_deltas()'s
+        P&L aggregation, just surfaced in the Transactions ledger. Dry run's
+        equivalent (PaperVenue.resolve_closed_markets) already logs a
+        sold=True EXPIRED row with a real payout, so this would only double
+        up on that."""
+        if getattr(self.executor, "dry_run", True):
+            return
+        token_id = str(self._position_field(position, "token_id", "") or "")
+        shares = float(self._position_field(position, "shares", 0.0) or 0.0)
+        initial_price = float(self._position_field(position, "initial_price", 0.0) or 0.0)
+        side = str(self._position_field(position, "side", "") or "")
+        if self.ledger is not None:
+            self.ledger.record_resolution(
+                token_id=token_id, shares=shares, payout_price=None, venue=self._venue(),
+                entry_price=initial_price, side=side or None,
+            )
+        log_func("EXPIRED", "Portfolio", token_id, {
+            "shares": shares,
+            "price": float(self._position_field(position, "current_price", 0.0) or 0.0),
+            "initial_price": initial_price,
+            "side": side,
+            "market_name": str(self._position_field(position, "market_id", "") or ""),
+            "sold": False,
+            "reason": (
+                f"Gave up selling after {MAX_EXIT_ATTEMPTS} failed attempts — "
+                "market most likely resolved/closed on Polymarket. On-chain "
+                "redemption is not automated by this bot."
+            ),
+        })
 
     def optimize_for_candidate(self, new_candidate_ev: float, min_improvement: float = 0.10, log_func=None) -> float:
         """Liquidate positions materially weaker than the new candidate to pool capital."""
@@ -402,7 +411,9 @@ class PortfolioManager:
             current_price = float(position.current_price)
             position_value = float(getattr(position, "value", shares * current_price))
 
-            sold, _gave_up = self._sell(position, "OPPORTUNITY-SWAP", log_func)
+            sold, gave_up = self._sell(position, "OPPORTUNITY-SWAP", log_func)
+            if gave_up:
+                self._record_gave_up(position, log_func)
             if not sold:
                 continue
 
