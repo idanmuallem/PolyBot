@@ -98,6 +98,8 @@ class ClobVenue:
 
     name = "live"
     fill_reasons = FillReasons(not_filled="insufficient_liquidity", all_filled="all_legs_filled")
+    settles_resolutions = False
+    snapshots_equity = False
 
     def __init__(self, client: Any, proxy_address: Optional[str], http_get: Callable = requests.get):
         self.client = client

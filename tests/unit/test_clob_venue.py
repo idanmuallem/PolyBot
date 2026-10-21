@@ -332,6 +332,16 @@ def test_resolve_closed_markets_is_a_no_op_live():
     assert _venue().resolve_closed_markets(log_func=lambda *a: None) == 0
 
 
+def test_live_markets_settle_on_chain_not_on_the_venue():
+    """The engine records a gave-up live position as an unconfirmed expiry
+    because this venue never settles one."""
+    assert _venue().settles_resolutions is False
+
+
+def test_live_equity_is_not_snapshotted_by_the_engine():
+    assert _venue().snapshots_equity is False
+
+
 def test_is_named_live():
     assert _venue().name == "live"
 

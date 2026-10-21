@@ -162,6 +162,7 @@ def _portfolio(tmp_path, positions, dry_run=True):
     config = TradingConfig(trading_mode="dry_run", take_profit_pct=0.5, stop_loss_pct=-0.5)
     executor = MagicMock()
     executor.venue.name = "paper" if dry_run else "live"
+    executor.venue.settles_resolutions = executor.venue.snapshots_equity = dry_run
     executor.get_open_positions.return_value = positions
     executor.get_balance.return_value = 100.0
     bridge = DataBridge()

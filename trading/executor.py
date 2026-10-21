@@ -3,7 +3,7 @@ Trade execution engine: order sizing, gating and logging on top of a Venue.
 
 The executor trades on one Venue at a time (trading/venue.py): a PaperVenue
 in Dry run, a ClobVenue in Live run. It never branches on the trading mode
-itself; dry_run only reports which Venue is active.
+itself: where the modes differ, the Venue says how (trading/venue.py).
 """
 
 import asyncio
@@ -67,11 +67,6 @@ class TradeExecutor:
     @property
     def venue(self) -> Venue:
         return self._active_venue()
-
-    @property
-    def dry_run(self) -> bool:
-        """True while trading on a paper venue (Dry run)."""
-        return self.venue.name != "live"
 
     def get_balance(self) -> float:
         """Deployable cash on the active venue."""

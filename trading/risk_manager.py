@@ -52,7 +52,7 @@ class PortfolioManager:
         # the Gate (trading/gate.py). Every exit path here asks
         # gate.can_exit before selling and reports the outcome; the pipeline
         # asks the same Gate before entering.
-        self.gate = gate if gate is not None else Gate(ledger, venue_name_fn=self._venue)
+        self.gate = gate if gate is not None else Gate(ledger, venue_name_fn=self._venue_name)
 
     def refresh_positions(self):
         """Re-read the open positions risk works from (bridge.current_portfolio)
@@ -64,8 +64,8 @@ class PortfolioManager:
         except PositionsUnavailable:
             return
         self.bridge.current_portfolio = positions
-        # Dry run mark-to-market snapshot (Phase 3)
-        if self._venue() != "live":
+        # Mark-to-market snapshot where nothing else records the equity (Dry run)
+        if self.executor.venue.snapshots_equity:
             now = time.time()
             if now - self._last_snapshot_at >= 180.0:
                 cash = self.executor.get_balance()
@@ -182,7 +182,7 @@ class PortfolioManager:
         """Average correlation between a candidate asset_type and the current book."""
         return self.correlation_tracker.exposure_for_new_position(asset_type, self.get_book_asset_types())
 
-    def _venue(self) -> str:
+    def _venue_name(self) -> str:
         """The active Venue's name: the venue tag for this module's Ledger rows."""
         return self.executor.venue.name
 
@@ -197,7 +197,7 @@ class PortfolioManager:
             shares=float(self._position_field(position, "shares", 0.0) or 0.0),
             price=float(self._position_field(position, "current_price", 0.0) or 0.0),
             reason=reason,
-            venue=self._venue(),
+            venue=self._venue_name(),
             entry_price=float(self._position_field(position, "initial_price", 0.0) or 0.0),
             side=str(self._position_field(position, "side", "") or "") or None,
         )
@@ -293,7 +293,8 @@ class PortfolioManager:
         """Every exit path calls this on the failed sell that reaches the
         Gate's attempt cap (it happens once per token).
 
-        Live run only: giving up is the signal for "this position's market
+        Only on a venue that doesn't settle resolutions itself (Live run;
+        Venue.settles_resolutions): giving up is the signal for "this position's market
         has no live order book left". Per the MAX_EXIT_ATTEMPTS comment in
         trading/gate.py, that's what a resolved/closed Polymarket market
         looks like from here (it doesn't disappear from the positions API,
@@ -304,7 +305,7 @@ class PortfolioManager:
         equivalent (PaperVenue.resolve_closed_markets) already logs a
         sold=True EXPIRED row with a real payout, so this would only double
         up on that."""
-        if self._venue() != "live":
+        if self.executor.venue.settles_resolutions:
             return
         token_id = str(self._position_field(position, "token_id", "") or "")
         shares = float(self._position_field(position, "shares", 0.0) or 0.0)
@@ -312,7 +313,7 @@ class PortfolioManager:
         side = str(self._position_field(position, "side", "") or "")
         if self.ledger is not None:
             self.ledger.record_resolution(
-                token_id=token_id, shares=shares, payout_price=None, venue=self._venue(),
+                token_id=token_id, shares=shares, payout_price=None, venue=self._venue_name(),
                 entry_price=initial_price, side=side or None,
             )
         log_func("EXPIRED", "Portfolio", token_id, {

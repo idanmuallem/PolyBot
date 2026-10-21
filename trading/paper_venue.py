@@ -54,6 +54,8 @@ class PaperVenue:
 
     name = "paper"
     fill_reasons = FillReasons()
+    settles_resolutions = True
+    snapshots_equity = True
 
     def __init__(self, data_dir: Path, starting_balance: float, market_api: Any = None):
         """Open (or create) the paper account in *data_dir*.

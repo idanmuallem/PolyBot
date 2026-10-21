@@ -148,6 +148,8 @@ def test_gave_up_in_live_mode_logs_expired_flag():
     surface as a visible EXPIRED row, not just silently stop retrying."""
     pm, bridge, executor = _make_pm()
     executor.venue.name = "live"
+    executor.venue.settles_resolutions = False
+    executor.venue.snapshots_equity = False
     pos = _pos(pnl_ratio=-1.0, token_id="dead_tok")
     executor.sell_position.return_value = False
 
@@ -186,6 +188,8 @@ def test_gave_up_in_dry_run_mode_does_not_log_expired():
 def test_successful_live_exit_never_logs_expired():
     pm, bridge, executor = _make_pm()
     executor.venue.name = "live"
+    executor.venue.settles_resolutions = False
+    executor.venue.snapshots_equity = False
     pos = _pos(pnl_ratio=-0.60, token_id="stop_tok")
     executor.sell_position.return_value = True
 
@@ -582,6 +586,8 @@ def test_cull_and_swap_sales_start_the_post_exit_cooldown(ledger, path):
 def _live_dead_position(ledger):
     pm, bridge, executor = _make_pm(ledger=ledger)
     executor.venue.name = "live"
+    executor.venue.settles_resolutions = False
+    executor.venue.snapshots_equity = False
     executor.sell_position.return_value = False
     executor.get_balance.return_value = 0.0
     ledger.record_entry(token_id="dead_tok", condition_id="c", side="YES", shares=10.0, price=0.40,

@@ -12,7 +12,9 @@ PaperVenue and FakeVenue pass the shared contract suite in
 tests/unit/test_venue_contract.py; ClobVenue is tested against a stub client.
 
 Each adapter has a name, "paper" or "live": which one the engine trades on
-is the trading mode.
+is the trading mode. The name only tags and labels; where Dry run and Live
+run behave differently, the difference is a Venue property
+(settles_resolutions, snapshots_equity), so no caller branches on the name.
 """
 
 from __future__ import annotations
@@ -228,8 +230,16 @@ class Venue(Protocol):
     (EXECUTION-ERROR) and, if it has any, its cancel rows.
     """
 
-    name: str  # "paper" or "live"
+    name: str  # "paper" or "live": the Ledger's venue tag
     fill_reasons: FillReasons  # reasons for arbitrage basket rows
+    # True where resolve_closed_markets() pays out positions in resolved
+    # markets (paper). False where they settle on-chain without the venue
+    # (live: no automated redemption), so a position the engine gives up
+    # selling is recorded as an unconfirmed expiry instead.
+    settles_resolutions: bool
+    # True where nothing outside the engine records the account's equity
+    # curve (paper), so the engine snapshots it (paper_snapshots).
+    snapshots_equity: bool
 
     def cash(self) -> float:
         """Deployable cash."""

@@ -27,6 +27,8 @@ def live_fake(cash: float = 1000.0) -> FakeVenue:
     """A FakeVenue standing in for the live (CLOB) venue."""
     venue = FakeVenue(cash=cash)
     venue.name = "live"
+    venue.settles_resolutions = False  # settles on-chain
+    venue.snapshots_equity = False
     return venue
 
 

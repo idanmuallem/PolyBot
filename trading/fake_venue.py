@@ -52,6 +52,8 @@ class _Holding:
 class FakeVenue:
     name = "paper"
     fill_reasons = FillReasons()
+    settles_resolutions = True
+    snapshots_equity = True
 
     def __init__(self, cash: float = 1000.0) -> None:
         self._cash = float(cash)

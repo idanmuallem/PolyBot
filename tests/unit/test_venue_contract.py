@@ -200,6 +200,19 @@ def test_resolution_pays_winners_and_closes_positions(venue_and_exchange):
     assert expired["eth-yes"]["price"] == pytest.approx(0.0)
 
 
+def test_a_simulated_venue_settles_resolved_markets_itself(venue_and_exchange):
+    """Paper venues pay out a resolved market (the test above), so the
+    engine never records a gave-up position there as an expiry of its own."""
+    venue, _ = venue_and_exchange
+    assert venue.settles_resolutions is True
+
+
+def test_a_simulated_venue_has_its_equity_snapshotted_by_the_engine(venue_and_exchange):
+    """Nothing outside the engine records a paper account's equity curve."""
+    venue, _ = venue_and_exchange
+    assert venue.snapshots_equity is True
+
+
 def test_resolution_leaves_open_markets_alone(venue_and_exchange):
     venue, exchange = venue_and_exchange
     exchange.list_market(BTC, yes_price=0.40)

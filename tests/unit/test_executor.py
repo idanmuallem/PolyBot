@@ -12,10 +12,9 @@ def _dry_config(**overrides):
         min_ev=0.30,
         max_daily_trades=10,
         # Per-strategy trade caps default to 50 each (core/trading_config.py);
-        # pin the "crypto" tag's cap to max_daily_trades here so pre-existing
-        # tests below — which exercise the default strategy_tag="crypto" and
-        # were written before per-strategy tracking existed — see the same
-        # ceiling as before.
+        # pin the crypto strategy's cap to max_daily_trades here so the
+        # executor's (crypto) entries below, whose daily caps the Account
+        # enforces per strategy, see one ceiling.
         crypto_max_daily_trades=10,
         bankroll_usd=1000.0,
         daily_limit_usd=15.0,
@@ -446,20 +445,6 @@ def test_live_sell_posts_a_sell_at_the_given_price():
     assert executor.sell_position("tok1", 10.0, 0.55, log_func=lambda level, *a: rows.append(level)) is True
     assert client.orders == [("tok1", 0.55, "SELL", 10.0)]
     assert rows == ["SELL"]
-
-
-# ── Mode: the active Venue decides paper vs live ─────────────────────────────
-
-def _clob_venue():
-    from tests.unit.test_clob_venue import StubClobClient
-    from trading.clob_venue import ClobVenue
-    return ClobVenue(client=StubClobClient(balance="42"), proxy_address="0xabc", http_get=None)
-
-
-def test_dry_run_reflects_the_active_venue():
-    from trading.executor import TradeExecutor
-    assert _make_executor().dry_run is True
-    assert TradeExecutor(_dry_config(trading_mode="live_run"), venue=_clob_venue()).dry_run is False
 
 
 # ── Paper arbitrage: limit orders through the Venue ─────────────────────────
