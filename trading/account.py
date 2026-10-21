@@ -8,8 +8,11 @@ the bridge. Nothing else in the engine writes cash.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Callable, Optional
+
+from core.trading_config import TradingConfig
 
 
 @dataclass(frozen=True)
@@ -20,10 +23,31 @@ class AccountSnapshot:
     peak_equity: float = 0.0
     drawdown_pct: float = 0.0
     drawdown_paused: bool = False
+    spent_today: float = 0.0
+    watch_only: bool = False
 
     @property
     def equity(self) -> float:
         return self.cash + self.open_position_value
+
+
+@dataclass(frozen=True)
+class Approved:
+    """reserve() said yes: spend up to *usd*."""
+    usd: float
+
+    def __bool__(self) -> bool:
+        return True
+
+
+@dataclass(frozen=True)
+class Refused:
+    """reserve() said no, and why."""
+    reason: str
+    detail: dict
+
+    def __bool__(self) -> bool:
+        return False
 
 
 class Account:
@@ -34,13 +58,18 @@ class Account:
         ledger=None,
         max_drawdown_pct: float = 0.20,
         log_func: Optional[Callable] = None,
+        config: Optional[TradingConfig] = None,
     ):
+        self._config = config if config is not None else TradingConfig()
         self._venue = venue
         self._bridge = bridge
         self._ledger = ledger
         self._max_drawdown_pct = float(max_drawdown_pct)
         self._log = log_func or (lambda *a, **kw: None)
         self._snapshot = AccountSnapshot()
+        self._spent: dict[str, float] = {}
+        self._trades: dict[str, int] = {}
+        self._day = None  # UTC date today's spend and trade counts belong to
 
     # -- reads ----------------------------------------------------------------
 
@@ -59,6 +88,100 @@ class Account:
     def drawdown_paused(self) -> bool:
         """True pauses new entries; exits keep running."""
         return self._snapshot.drawdown_paused
+
+    # -- budget ---------------------------------------------------------------
+
+    def reserve(self, strategy: str, usd: float, trades: int = 1) -> "Approved | Refused":
+        """May *strategy* spend *usd* on *trades* trades now (an arbitrage
+        basket is one trade per leg)?
+
+        Refused if the trades don't all fit in today's per-strategy or
+        account-wide trade count, or nothing is left of today's budget.
+        Otherwise Approved with the amount allowed: *usd* capped at
+        max_bet_size_usd per trade and at what is left of the strategy's
+        and the account's daily budget. Reserving holds nothing:
+        record_fill() is what spends.
+        """
+        trades = int(trades)
+        strategy_trades = self._trades.get(strategy, 0)
+        if strategy_trades + trades > self._strategy_max_trades(strategy):
+            return Refused("daily_trade_limit_would_be_exceeded", {
+                "strategy": strategy, "trades": trades,
+                "strategy_trades_today": strategy_trades,
+                "strategy_max_daily_trades": self._strategy_max_trades(strategy),
+            })
+        # Same reasoning as the global spend ceiling: per-strategy trade
+        # caps may sum past max_daily_trades, which TradingConfig only warns
+        # about, so the account-wide count is a ceiling of its own.
+        trades_today = sum(self._trades.values())
+        global_max = int(self._config.max_daily_trades)
+        if trades_today + trades > global_max:
+            return Refused("global_daily_trade_limit_would_be_exceeded", {
+                "strategy": strategy, "trades": trades,
+                "trades_today": trades_today, "global_max_daily_trades": global_max,
+            })
+
+        remaining = self._remaining_budget(strategy)
+        approved = min(float(usd), float(self._config.max_bet_size_usd) * trades, remaining)
+        if approved <= 0:
+            return Refused("daily_limit_reached", self._budget_detail(strategy))
+        return Approved(usd=approved)
+
+    def record_fill(self, strategy: str, usd: float) -> None:
+        """One *strategy* entry filled for *usd*: it counts as one trade
+        and *usd* of spend against today's limits."""
+        self._spent[strategy] = self._spent.get(strategy, 0.0) + float(usd)
+        self._trades[strategy] = self._trades.get(strategy, 0) + 1
+        self._snapshot = replace(self._snapshot, spent_today=sum(self._spent.values()))
+        self._publish()
+
+    def daily_reset(self, now: datetime) -> bool:
+        """Start a new budget day when *now* is on a later UTC date than
+        the current one: spend and trade counts go back to zero. True if
+        it reset."""
+        day = now.astimezone(timezone.utc).date()
+        if self._day is None:
+            self._day = day
+            return False
+        if day == self._day:
+            return False
+        self._day = day
+        self._spent, self._trades = {}, {}
+        self._snapshot = replace(self._snapshot, spent_today=0.0)
+        self._publish()
+        return True
+
+    def _strategy_limit(self, strategy: str) -> float:
+        cfg = self._config
+        limits = {
+            "arbitrage": cfg.arbitrage_daily_limit_usd,
+            "crypto": cfg.crypto_daily_limit_usd,
+        }
+        return float(limits.get(strategy, cfg.daily_limit_usd))
+
+    def _strategy_max_trades(self, strategy: str) -> int:
+        cfg = self._config
+        caps = {
+            "arbitrage": cfg.arbitrage_max_daily_trades,
+            "crypto": cfg.crypto_max_daily_trades,
+        }
+        return int(caps.get(strategy, cfg.max_daily_trades))
+
+    def _remaining_budget(self, strategy: str) -> float:
+        # Per-strategy limits may sum past daily_limit_usd (TradingConfig
+        # only warns), so the global limit caps every strategy too.
+        strategy_left = self._strategy_limit(strategy) - self._spent.get(strategy, 0.0)
+        global_left = float(self._config.daily_limit_usd) - sum(self._spent.values())
+        return min(strategy_left, global_left)
+
+    def _budget_detail(self, strategy: str) -> dict:
+        return {
+            "strategy": strategy,
+            "strategy_daily_limit_usd": round(self._strategy_limit(strategy), 4),
+            "strategy_spent_today": round(self._spent.get(strategy, 0.0), 4),
+            "daily_limit_usd": round(float(self._config.daily_limit_usd), 4),
+            "spent_today": round(sum(self._spent.values()), 4),
+        }
 
     # -- refresh --------------------------------------------------------------
 
@@ -100,6 +223,8 @@ class Account:
             peak_equity=peak,
             drawdown_pct=drawdown_pct,
             drawdown_paused=paused,
+            spent_today=prev.spent_today,
+            watch_only=cash < float(self._config.min_trading_balance),
         )
         self._publish()
         self._log_breaker_transition(prev.drawdown_paused, self._snapshot)
@@ -143,3 +268,5 @@ class Account:
         bridge.peak_equity = snap.peak_equity
         bridge.current_drawdown_pct = snap.drawdown_pct
         bridge.drawdown_paused = snap.drawdown_paused
+        bridge.spent_today = snap.spent_today
+        bridge.watch_only = snap.watch_only

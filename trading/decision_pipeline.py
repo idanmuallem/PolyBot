@@ -19,8 +19,9 @@ from brains.base import calculate_tte
 from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
 from core.polymarket_client import PolymarketClient
-from trading.account import Account
+from trading.account import Account, Refused
 from trading.gate import Skip
+from trading.kelly import kelly_bet_size
 from trading.strategies import EventSumStrategy, Strategy
 from trading.venue import MarketRef, normalize_side
 from ui import data_manager
@@ -48,7 +49,7 @@ class CandidateTrade:
     post_prob: float
     pre_prob: float
     kelly_size: float       # raw Kelly criterion fraction (edge/odds), before confidence/kelly_fraction scaling
-    kelly_bet_usd: float    # final dollar bet size — confidence- and kelly_fraction-scaled, clamped to max_bet_size_usd
+    kelly_bet_usd: float    # Kelly dollar bet size — confidence- and kelly_fraction-scaled, before the Account's caps
     model_used: str
     price_yes: float
     side: str
@@ -74,13 +75,12 @@ class CandidateTrade:
 
 
 class SequentialTradingPipeline:
-    def __init__(self, ctx: WalletContext, log_func, delay: float | None = None):
-        if not all([ctx.executor, ctx.scanner, ctx.portfolio_manager, ctx.budget_manager]):
+    def __init__(self, ctx: WalletContext, log_func, delay: float | None = None, clock=None):
+        if not all([ctx.executor, ctx.scanner, ctx.portfolio_manager]):
             missing = [name for name, val in [
                 ("executor", ctx.executor),
                 ("scanner", ctx.scanner),
                 ("portfolio_manager", ctx.portfolio_manager),
-                ("budget_manager", ctx.budget_manager),
             ] if val is None]
             raise ValueError(f"WalletContext missing required components: {missing}")
 
@@ -90,6 +90,8 @@ class SequentialTradingPipeline:
         self.db_path = ctx.db_path
         self.log_func = log_func
         self.loop_delay = float(delay) if delay is not None else float(self.config.loop_delay_seconds)
+        # UTC "now" for the Account's daily budget reset.
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.min_ev_threshold = float(self.config.min_ev)
         self.max_bet_size_usd = float(self.config.max_bet_size_usd)
         self.safe_minimum = 1.0
@@ -130,8 +132,8 @@ class SequentialTradingPipeline:
         # tte_exceeds_max, or daily_trade_limit_would_be_exceeded — none of
         # these conditions change between scans (the per-strategy budget and
         # trade count only reset daily; a leg's expiry date is fixed), so
-        # re-evaluating the same groups every 30s was pure waste. Cleared in
-        # _reset_daily_if_needed().
+        # re-evaluating the same groups every 30s was pure waste. Cleared
+        # when the Account starts a new budget day (see tick()).
         self._exhausted_arb_groups: set[str] = set()
 
         self.portfolio_manager = ctx.portfolio_manager
@@ -143,36 +145,27 @@ class SequentialTradingPipeline:
         # Holdings come from the Ledger, so the answer survives restarts.
         self.gate = self.portfolio_manager.gate
 
-        # The single writer of cash, equity and the drawdown breaker. It
-        # reads whichever Venue the pipeline has active, so a mode swap at
-        # the tick boundary moves cash with it. Exits that need fresh cash
-        # (free_up_capital) read it through the same Account.
+        # The single writer of cash, equity, the drawdown breaker and the
+        # daily budget (spend limits, trade counts, max-bet ceiling) for
+        # model and arbitrage entries alike. It reads whichever Venue the
+        # pipeline has active, so a mode swap at the tick boundary moves
+        # cash with it. Exits that need fresh cash (free_up_capital) read it
+        # through the same Account.
         self.account = Account(
             venue=lambda: self.venue,
             bridge=self.bridge,
             ledger=self.ledger,
             max_drawdown_pct=float(getattr(self.config, "max_drawdown_pct", 0.20)),
             log_func=log_func,
+            config=self.config,
         )
+        self.account.daily_reset(self.clock())
         ctx.account = self.account
         self.portfolio_manager.account = self.account
 
         self._sync_account()
         if float(getattr(self.bridge, "starting_balance", 0.0) or 0.0) <= 0.0:
             self.bridge.starting_balance = self.account.cash
-
-        self.budget_manager = ctx.budget_manager
-
-        self.spent_today = float(getattr(self.bridge, "spent_today", 0.0) or 0.0)
-        self.spend_day = datetime.now(timezone.utc).date()
-        self.start_of_day_equity = float(getattr(self.bridge, "start_of_day_equity", 0.0) or 0.0)
-
-    # ------------------------------------------------------------------
-    # Bridge helpers — keep related fields in sync
-    # ------------------------------------------------------------------
-
-    def _set_spend(self, amount: float):
-        self.bridge.spent_today = float(amount)
 
     def _sync_account(self):
         """Refresh the positions list risk works from, then the Account
@@ -207,20 +200,6 @@ class SequentialTradingPipeline:
         }
 
     # ------------------------------------------------------------------
-
-    def _reset_daily_if_needed(self):
-        current_day = datetime.now(timezone.utc).date()
-        if current_day != self.spend_day:
-            self.spent_today = 0.0
-            self.spend_day = current_day
-            self.start_of_day_equity = 0.0
-            self._set_spend(0.0)
-            self.bridge.start_of_day_equity = 0.0
-            self.budget_manager.total_spent_today = 0.0
-            self.budget_manager.spent_by_strategy = {}
-            self.budget_manager.trades_by_strategy = {}
-            self.executor.reset_daily_count()
-            self._exhausted_arb_groups.clear()
 
     # ------------------------------------------------------------------
     # Strategy scan — constraint-based arbitrage, independent of the
@@ -390,7 +369,6 @@ class SequentialTradingPipeline:
 
         total_cost = sum(float(s.bet_amount_usd) for s in missing_signals)
         cash_balance = self.account.cash
-        remaining_budget = float(self.budget_manager.get_remaining_budget("arbitrage"))
 
         # Distinct reject reasons (Point 5): "can't afford it" (wallet cash)
         # vs "budget exhausted" (this strategy's own daily allocation) are
@@ -406,46 +384,22 @@ class SequentialTradingPipeline:
             })
             return
 
-        if total_cost > remaining_budget:
+        # Every leg is one trade: the basket is reserved whole against the
+        # same daily spend limits, trade counts and max-bet ceiling as a
+        # model entry (Account.reserve()). It is all-or-nothing, so a
+        # partial approval is a rejection too.
+        budget = self.account.reserve("arbitrage", total_cost, trades=len(missing_signals))
+        if isinstance(budget, Refused) or budget.usd < total_cost:
+            reason, detail = (
+                (budget.reason, budget.detail) if isinstance(budget, Refused)
+                else ("insufficient_budget", {"approved_usd": round(budget.usd, 4)})
+            )
             tagged_log("REJECTED", asset_type, group_id, {
-                "reason": "insufficient_budget",
+                "reason": reason,
                 "group_id": group_id,
                 "n_legs": len(missing_signals),
                 "total_cost": round(total_cost, 4),
-                "remaining_budget": round(remaining_budget, 4),
-            })
-            self._exhausted_arb_groups.add(group_id)
-            return
-
-        arbitrage_max_daily_trades = self.executor._strategy_max_daily_trades("arbitrage")
-        arbitrage_trades_today = self.executor.trades_by_strategy.get("arbitrage", 0)
-        if arbitrage_trades_today + len(missing_signals) > arbitrage_max_daily_trades:
-            tagged_log("REJECTED", asset_type, group_id, {
-                "reason": "daily_trade_limit_would_be_exceeded",
-                "group_id": group_id,
-                "n_legs": len(missing_signals),
-            })
-            self._exhausted_arb_groups.add(group_id)
-            return
-
-        # Belt-and-suspenders hard ceiling (Point: runaway-trade-rate fix):
-        # the check above only compares against this strategy's own
-        # allocation (arbitrage_max_daily_trades, e.g. 200) — it says
-        # nothing about the account-wide MAX_DAILY_TRADES ceiling a human
-        # actually configured. TradingConfig only *warns* if per-strategy
-        # caps are set to sum higher than the global one; it never clamps
-        # them. This check makes the global cap a real ceiling regardless
-        # of how per-strategy limits are configured, so no single strategy
-        # (or misconfiguration) can spend the whole account's daily
-        # allowance through its own generous per-strategy bucket.
-        global_max_daily_trades = int(self.executor.config.max_daily_trades)
-        if self.executor.trade_count_today + len(missing_signals) > global_max_daily_trades:
-            tagged_log("REJECTED", asset_type, group_id, {
-                "reason": "global_daily_trade_limit_would_be_exceeded",
-                "group_id": group_id,
-                "n_legs": len(missing_signals),
-                "trade_count_today": self.executor.trade_count_today,
-                "global_max_daily_trades": global_max_daily_trades,
+                **detail,
             })
             self._exhausted_arb_groups.add(group_id)
             return
@@ -481,8 +435,14 @@ class SequentialTradingPipeline:
         # Every share that filled is a real entry, whatever happens to the
         # basket below (kept, trimmed or unwound): record each leg's fill
         # in the Ledger now, and each sale back as it happens.
+        # Each filled leg is also one trade and its leg's dollars of spend
+        # in the Account, and cash is re-read from the Venue.
         for signal in missing_signals:
-            self._record_arbitrage_entry(signal, group_id, float(fills.get(self._leg_token_id(signal), 0.0)))
+            filled = float(fills.get(self._leg_token_id(signal), 0.0))
+            self._record_arbitrage_entry(signal, group_id, filled)
+            if filled > 0:
+                self.account.record_fill("arbitrage", float(signal.bet_amount_usd))
+        self.account.refresh()
 
         def _sell_back(signal, tid, shares, reason):
             if self.executor.sell_position(tid, shares, signal.price, tagged_log):
@@ -552,9 +512,6 @@ class SequentialTradingPipeline:
                     filled = fills.get(tid, 0.0)
                     if filled > 0:
                         _sell_back(signal, tid, filled, "ARBITRAGE-UNWIND")
-                        self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
-                self.spent_today = float(self.budget_manager.total_spent_today)
-                self._set_spend(self.spent_today)
 
                 tagged_log("REJECTED", asset_type, group_id, {
                     "reason": "not_profitable_after_real_fills",
@@ -594,12 +551,9 @@ class SequentialTradingPipeline:
                 _sell_back(signal, tid, excess, "ARBITRAGE-UNWIND" if arb_sets <= 0 else "ARBITRAGE-TRIM")
                 if arb_sets <= 0:
                     unwound_incomplete_group = True
-                    self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
                 fills[tid] = arb_sets
 
         if unwound_incomplete_group:
-            self.spent_today = float(self.budget_manager.total_spent_today)
-            self._set_spend(self.spent_today)
             tagged_log("REJECTED", asset_type, group_id, {
                 "reason": "group_incomplete_unwound_partial_fills",
                 "group_id": group_id,
@@ -629,9 +583,6 @@ class SequentialTradingPipeline:
 
             if executed:
                 executed_legs += 1
-                self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
-                self.spent_today = float(self.budget_manager.total_spent_today)
-                self._set_spend(self.spent_today)
 
         tagged_log("STRATEGY-GROUP", asset_type, group_id, {
             "group_id": group_id,
@@ -775,11 +726,11 @@ class SequentialTradingPipeline:
         final_ev = signal.expected_value
         entry_price = float(signal.entry_price)
 
-        # Kelly sizing (BudgetManager.compute_kelly_bet_size): kelly_optimal =
-        # edge/odds for whichever side was actually picked — YES odds are
-        # (1 - price), NO odds are the complementary YES price — scaled by
-        # model confidence and kelly_fraction (quarter-Kelly by default),
-        # then clamped to max_bet_size_usd as a hard ceiling.
+        # Kelly sizing (trading/kelly.py): kelly_optimal = edge/odds for
+        # whichever side was actually picked — YES odds are (1 - price), NO
+        # odds are the complementary YES price — scaled by model confidence
+        # and kelly_fraction (quarter-Kelly by default). The max-bet ceiling
+        # and daily budget are applied by Account.reserve() at the risk stage.
         if side == "YES":
             kelly_edge = float(post_prob) - price_yes
             kelly_odds = 1.0 - price_yes
@@ -788,7 +739,11 @@ class SequentialTradingPipeline:
             kelly_odds = price_yes  # == 1 - price_no
 
         kelly_raw_fraction = signal.kelly_size
-        kelly_bet_usd = self.budget_manager.compute_kelly_bet_size(kelly_edge, kelly_odds, confidence)
+        kelly_bet_usd = kelly_bet_size(
+            kelly_edge, kelly_odds, confidence,
+            kelly_fraction=float(self.config.kelly_fraction),
+            bankroll_usd=float(self.config.bankroll_usd),
+        )
 
         # Correlation exposure (see trading/correlation.py): how correlated
         # this candidate is with the currently open book, on average — logged
@@ -826,7 +781,7 @@ class SequentialTradingPipeline:
             wang_fair_value=wang_fair_value,
             wang_edge=wang_edge,
             strategy_type="model",
-            kelly_fraction_used=self.budget_manager.kelly_fraction,
+            kelly_fraction_used=float(self.config.kelly_fraction),
             correlation_exposure=float(correlation_exposure),
             spot=(
                 float(live_truth.get("spot_price") or 0.0)
@@ -872,25 +827,20 @@ class SequentialTradingPipeline:
                 "price_no": round(1.0 - candidate.price_yes, 4),
             })
 
-        # candidate.kelly_bet_usd is already confidence/kelly_fraction-scaled
-        # and clamped to max_bet_size_usd by BudgetManager.compute_kelly_bet_size();
-        # re-apply the ceiling explicitly here too, since it must hold as a
-        # hard cap regardless of how the bet size was derived upstream.
+        # The Account caps the Kelly size at the max-bet ceiling and what is
+        # left of today's budget, or refuses it (budget spent, daily trade
+        # count reached): the same rules arbitrage baskets go through.
         target_bet = candidate.kelly_bet_usd
-        desired_bet = min(target_bet, self.max_bet_size_usd)
-
-        budget_bet, budget_ok = self.budget_manager.cap_to_remaining_budget(desired_bet, strategy_tag="crypto")
-        if not budget_ok:
+        budget = self.account.reserve("crypto", target_bet)
+        if isinstance(budget, Refused):
             return self._reject("REJECTED", candidate, {
                 "market_name": candidate.question,
-                "reason": "daily_limit_reached",
+                "reason": budget.reason,
                 "kelly_size": round(candidate.kelly_size, 4),
                 "kelly_bet_usd": round(candidate.kelly_bet_usd, 4),
-                "strategy_daily_limit_usd": round(float(self.budget_manager._strategy_limit("crypto")), 4),
-                "strategy_spent_today": round(float(self.budget_manager.spent_by_strategy.get("crypto", 0.0)), 4),
-                "daily_limit_usd": round(float(self.budget_manager.daily_limit_usd), 4),
-                "spent_today": round(float(self.budget_manager.total_spent_today), 4),
+                **budget.detail,
             })
+        desired_bet = budget.usd
 
         available_cash = cash_balance
         freed_cash = 0.0
@@ -914,7 +864,7 @@ class SequentialTradingPipeline:
             # What the sales actually freed, as the Venue reports it.
             available_cash = self.account.refresh().cash
 
-        approved_bet = min(desired_bet, budget_bet, available_cash)
+        approved_bet = min(desired_bet, available_cash)
         if approved_bet < self.safe_minimum:
             return self._reject("REJECTED", candidate, {
                 "market_name": candidate.question,
@@ -932,7 +882,6 @@ class SequentialTradingPipeline:
                 "desired_bet": round(desired_bet, 4),
                 "actual_bet": round(approved_bet, 4),
                 "available_cash": round(available_cash, 4),
-                "budget_bet": round(budget_bet, 4),
             })
 
         return approved_bet, {
@@ -1129,10 +1078,9 @@ class SequentialTradingPipeline:
 
         if executed:
             self._record_model_entry(candidate, approved_bet)
-            self.budget_manager.record_trade(float(approved_bet), strategy_tag="crypto")
-            self.spent_today = float(self.budget_manager.total_spent_today)
-            self._set_spend(self.spent_today)
-            total_equity = self.account.refresh().equity
+            self.account.record_fill("crypto", float(approved_bet))
+            account = self.account.refresh()
+            total_equity = account.equity
 
             self.log_func("TRACK", candidate.asset_type, candidate.token_id, {
                 "market_name": candidate.question,
@@ -1151,7 +1099,7 @@ class SequentialTradingPipeline:
                 "target_bet_unclamped": round(float(risk_context.get("target_bet", 0.0)), 2),
                 "target_bet_usd": round(float(approved_bet), 2),
                 "available_cash": round(float(risk_context.get("available_cash", 0.0)), 2),
-                "spent_today": round(float(self.spent_today), 2),
+                "spent_today": round(float(account.spent_today), 2),
                 "strike_price": float(getattr(candidate.market, "strike_price", 0.0) or 0.0),
                 "expiry_date": str(getattr(candidate.market, "expiry_date", "") or ""),
                 # Entry-snapshot fields for forward calibration (joined to the
@@ -1178,7 +1126,8 @@ class SequentialTradingPipeline:
         """One engine loop iteration: mode switch, resolution, sync, exits,
         Venue/Ledger reconcile, status flush, then new entries (unless
         paused)."""
-        self._reset_daily_if_needed()
+        if self.account.daily_reset(self.clock()):
+            self._exhausted_arb_groups.clear()
 
         self._apply_mode_request()
         self._resolve_closed_markets()
@@ -1201,7 +1150,7 @@ class SequentialTradingPipeline:
             starting_balance=float(self.bridge.starting_balance),
             position_value=account.open_position_value,
             unrealized_pnl=account.unrealized_pnl,
-            watch_only=bool(getattr(self.bridge, "watch_only", False)),
+            watch_only=account.watch_only,
         )
         data_manager.write_open_positions(
             db_path=self.db_path,

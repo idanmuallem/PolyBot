@@ -148,17 +148,13 @@ def test_bridge_cash_is_the_venue_cash_after_every_refresh(ledger):
     venue sync) each wrote cash and the last one won, so the displayed
     balance bounced between values. Now only the Account writes it, always
     from the Venue."""
-    from core.trading_config import TradingConfig
-    from trading.budget_manager import BudgetManager
-
     venue, bridge = FakeVenue(cash=100.0), DataBridge()
     venue.list_market(BTC, yes_price=0.50)
     account = _account(venue, ledger, bridge)
     account.refresh()
-    budget = BudgetManager(bridge=bridge, config=TradingConfig(), initial_balance=500.0)
 
     venue.buy(BTC, "YES", 10.0)
-    budget.record_trade(10.0, strategy_tag="crypto")
+    account.record_fill("crypto", 10.0)
     assert bridge.current_balance == pytest.approx(100.0)   # budget bookkeeping never touches cash
 
     account.refresh()

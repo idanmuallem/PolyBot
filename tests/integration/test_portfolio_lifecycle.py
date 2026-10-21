@@ -1,11 +1,11 @@
 """Integration: PortfolioManager exits on a FakeVenue, with cash read back
-through the Account (the single cash writer) and BudgetManager alongside."""
+through the Account (the single cash writer, which also keeps the daily
+budget)."""
 import pytest
 
 from core.bridge import DataBridge
 from core.trading_config import TradingConfig
 from trading.account import Account
-from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
 from trading.fake_venue import FakeVenue
 from trading.risk_manager import PortfolioManager
@@ -28,10 +28,9 @@ def _make_components(cash=50.0, take_profit=0.20, stop_loss=-0.50):
         daily_limit_usd=15.0,
     )
     executor = TradeExecutor(config=config, venue=venue)
-    account = Account(venue=lambda: executor.venue, bridge=bridge)
+    account = Account(venue=lambda: executor.venue, bridge=bridge, config=config)
     pm = PortfolioManager(bridge=bridge, executor=executor, config=config, account=account)
-    budget = BudgetManager(bridge=bridge, config=config, initial_balance=cash)
-    return pm, budget, account, venue
+    return pm, account, venue
 
 
 def _hold(venue, name, usd=10.0, entry=0.50, now=None):
@@ -46,7 +45,7 @@ def _hold(venue, name, usd=10.0, entry=0.50, now=None):
 # ── Exits free cash, as the Venue reports it ─────────────────────────────────
 
 def test_stop_loss_frees_balance():
-    pm, budget, account, venue = _make_components(cash=50.0)
+    pm, account, venue = _make_components(cash=50.0)
     _hold(venue, "stop_tok", usd=10.0, entry=0.50, now=0.20)   # -60%: 20 shares worth $4
     before = account.refresh().cash
 
@@ -56,7 +55,7 @@ def test_stop_loss_frees_balance():
 
 
 def test_take_profit_exit_increases_balance():
-    pm, budget, account, venue = _make_components(cash=50.0)
+    pm, account, venue = _make_components(cash=50.0)
     _hold(venue, "tp_tok", usd=10.0, entry=0.40, now=0.50)     # +25%: 25 shares worth $12.50
     before = account.refresh().cash
 
@@ -73,7 +72,7 @@ def _spend_all(venue):
 
 
 def test_free_up_capital_sells_weakest_first():
-    pm, budget, account, venue = _make_components(cash=40.0)
+    pm, account, venue = _make_components(cash=40.0)
     _hold(venue, "strong", usd=10.0, entry=0.50, now=0.45)      # -10%
     _hold(venue, "weak", usd=10.0, entry=0.50, now=0.35)        # -30%
     _spend_all(venue)
@@ -88,7 +87,7 @@ def test_free_up_capital_sells_weakest_first():
 
 
 def test_free_up_capital_stops_when_enough():
-    pm, budget, account, venue = _make_components(cash=40.0)
+    pm, account, venue = _make_components(cash=40.0)
     _hold(venue, "pos_a", usd=10.0, entry=0.50, now=0.35)       # weakest: frees $7
     _hold(venue, "pos_b", usd=10.0, entry=0.50, now=0.40)
     _spend_all(venue)
@@ -104,15 +103,15 @@ def test_free_up_capital_stops_when_enough():
     assert account.cash == pytest.approx(7.0)
 
 
-# ── BudgetManager + PortfolioManager do not double-count ─────────────────────
+# ── Account spend + PortfolioManager do not double-count ─────────────────────
 
 def test_budget_spend_and_portfolio_manage_independent():
-    pm, budget, account, venue = _make_components(cash=100.0)
+    pm, account, venue = _make_components(cash=100.0)
 
-    budget.record_trade(5.0)
-    assert budget.total_spent_today == 5.0
+    account.record_fill("crypto", 5.0)
+    assert account.snapshot().spent_today == 5.0
     assert pm.bridge.spent_today == 5.0
 
     # manage_portfolio with no positions → no change to spent
     pm.manage_portfolio(lambda *a, **kw: None)
-    assert budget.total_spent_today == 5.0  # unchanged
+    assert account.snapshot().spent_today == 5.0  # unchanged

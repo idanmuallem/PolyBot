@@ -17,7 +17,6 @@ import ui.data_manager as dm
 from core.bridge import DataBridge
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
-from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
 from trading.fake_venue import FakeVenue
 from trading.ledger import Ledger
@@ -36,6 +35,24 @@ class QuietScanner:
 
     def get_active_markets(self, log_func):
         return None, None
+
+    def add_to_cooldown(self, token_id):
+        pass
+
+
+class FixedMarketScanner:
+    """Hunter that finds the same market on every scan, with a fixed live
+    truth (the underlying's spot) for the brain."""
+
+    def __init__(self, market, live_truth: float):
+        self.market = market
+        self.live_truth = live_truth
+
+    def get_active_markets(self, log_func):
+        return self.market, self
+
+    def get_live_truth(self, market):
+        return self.live_truth
 
     def add_to_cooldown(self, token_id):
         pass
@@ -67,10 +84,13 @@ def make_tick_pipeline(
     active: str = "paper",
     config: Optional[TradingConfig] = None,
     balance: float = 100.0,
+    scanner=None,
+    clock=None,
 ):
     """(pipeline, ctx, rows): rows collects every (level, token_id, payload)
     the engine logs. The venues present become ctx.venues; *active* is the
-    one the executor starts on."""
+    one the executor starts on. *scanner* replaces the QuietScanner (e.g. a
+    FixedMarketScanner); *clock* is the pipeline's UTC clock (callable)."""
     from trading.decision_pipeline import SequentialTradingPipeline
 
     db_path = str(tmp_path / "trades.db")
@@ -94,13 +114,12 @@ def make_tick_pipeline(
         rows.append((level, token_id, payload))
 
     ctx.executor = TradeExecutor(config=config, venue=ctx.venues[active])
-    ctx.scanner = QuietScanner()
+    ctx.scanner = scanner or QuietScanner()
     ctx.portfolio_manager = PortfolioManager(
         bridge=bridge, executor=ctx.executor, config=config,
         hunter=ctx.scanner, db_path=db_path, ledger=ctx.ledger,
     )
-    ctx.budget_manager = BudgetManager(bridge=bridge, config=config, initial_balance=balance)
-    pipeline = SequentialTradingPipeline(ctx=ctx, log_func=log_func, delay=0.01)
+    pipeline = SequentialTradingPipeline(ctx=ctx, log_func=log_func, delay=0.01, clock=clock)
     pipeline.polymarket_client = StaticEvents()
     return pipeline, ctx, rows
 

@@ -10,12 +10,11 @@ Each wallet's data directory lives at data/{wallet_id}/ containing:
     trades.db   — that wallet's trade history database
 
 WalletContext is a container, not a factory: it carries a wallet's runtime
-components (executor, scanner, portfolio_manager, budget_manager) but never
-constructs, initializes, or calls methods on them — the caller builds those
-and hands them in. Construction order is executor -> scanner ->
-portfolio_manager -> budget_manager (scanner needs executor; budget_manager
-and portfolio_manager both need the bridge/config the earlier components
-were built from) wherever all four are assembled together.
+components (executor, scanner, portfolio_manager) but never constructs,
+initializes, or calls methods on them — the caller builds those and hands
+them in. Construction order is executor -> scanner -> portfolio_manager
+(scanner needs executor; portfolio_manager needs the bridge/config the
+earlier components were built from) wherever they are assembled together.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ if TYPE_CHECKING:
     from trading.executor import TradeExecutor
     from polymarket import PolymarketScannerHunter
     from trading.risk_manager import PortfolioManager
-    from trading.budget_manager import BudgetManager
     from trading.ledger import Ledger
     from trading.account import Account
     from trading.venue import Venue
@@ -49,9 +47,8 @@ class WalletContext:
     executor: Optional["TradeExecutor"] = None
     scanner: Optional["PolymarketScannerHunter"] = None
     portfolio_manager: Optional["PortfolioManager"] = None
-    budget_manager: Optional["BudgetManager"] = None
     ledger: Optional["Ledger"] = None  # typed trades/positions record (trading/ledger.py)
-    account: Optional["Account"] = None  # cash, equity, drawdown breaker (built by the pipeline)
+    account: Optional["Account"] = None  # cash, equity, drawdown breaker, daily budget (built by the pipeline)
     # Every Venue this wallet can trade on, by name ("paper" / "live"). The
     # executor trades on one of them; the pipeline swaps it at a tick
     # boundary when the dashboard's live-trading request changes.

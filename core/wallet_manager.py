@@ -9,7 +9,6 @@ from typing import Optional, Tuple
 
 from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
-from trading.budget_manager import BudgetManager
 from trading.clob_venue import ClobUnavailable, ClobVenue
 from trading.executor import TradeExecutor
 from trading.ledger import Ledger
@@ -59,8 +58,9 @@ def _build_venues(ctx: WalletContext) -> Tuple[Venue, Optional[Venue]]:
 
 def build_wallet_runtime(ctx: WalletContext) -> None:
     """Build this wallet's runtime components in dependency order and attach
-    them to ctx: venues -> executor -> scanner -> portfolio_manager ->
-    budget_manager.
+    them to ctx: venues -> executor -> scanner -> portfolio_manager. The
+    Account (cash and the daily budget) is built by the pipeline, which owns
+    the active Venue.
     """
     ctx.ledger = Ledger(ctx.db_path)
     venue, standby_venue = _build_venues(ctx)
@@ -80,10 +80,3 @@ def build_wallet_runtime(ctx: WalletContext) -> None:
         ledger=ctx.ledger,
     )
 
-    # BudgetManager's watch-only check needs the account's real cash. The
-    # Account itself is built by the pipeline, which owns the active Venue.
-    ctx.budget_manager = BudgetManager(
-        bridge=ctx.bridge,
-        config=ctx.config,
-        initial_balance=float(venue.cash()),
-    )

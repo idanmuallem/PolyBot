@@ -12,7 +12,6 @@ from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
 from core.polymarket_client import PolymarketClient
 from polymarket import PolymarketScannerHunter
-from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
 from trading.ledger import Ledger
 from tests.venue_harness import open_book_venue
@@ -79,9 +78,6 @@ def _make_pipeline(balance=100.0, config=None, venue=None, ledger=None):
             bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
             hunter=ctx.scanner, db_path=ctx.db_path, ledger=ledger,
         )
-        ctx.budget_manager = BudgetManager(
-            bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
-        )
 
         pipeline = SequentialTradingPipeline(
             ctx=ctx,
@@ -125,14 +121,14 @@ async def test_all_strategy_logs_tagged_arbitrage():
 
 
 @pytest.mark.asyncio
-async def test_budget_manager_records_every_leg():
+async def test_account_records_every_leg_as_spend():
     pipeline, bridge, log_calls = _make_pipeline(balance=100.0)
 
     with patch.object(PolymarketClient, "get_multi_outcome_events", return_value=[_underpriced_event(n=3)]):
         await pipeline._stage_strategy_scan()
 
     # 3 legs at the strategy's default trade_size_usd (1.0) each.
-    assert pipeline.budget_manager.total_spent_today == pytest.approx(3.0, abs=0.01)
+    assert pipeline.account.snapshot().spent_today == pytest.approx(3.0, abs=0.01)
 
 
 # ── Fairly priced event: no signals, no trades ────────────────────────────────
@@ -146,7 +142,7 @@ async def test_fairly_priced_event_executes_nothing():
         await pipeline._stage_strategy_scan()
 
     assert not [c for c in log_calls if c["level"] in ("STRATEGY-LEG", "DRY-RUN")]
-    assert pipeline.budget_manager.total_spent_today == 0.0
+    assert pipeline.account.snapshot().spent_today == 0.0
 
 
 # ── Guardrails: cash/budget and daily-trade-limit gating ─────────────────────
@@ -164,7 +160,7 @@ async def test_insufficient_cash_rejects_whole_group():
         c["level"] == "REJECTED" and c["payload"].get("reason") == "insufficient_cash"
         for c in log_calls
     )
-    assert pipeline.budget_manager.total_spent_today == 0.0
+    assert pipeline.account.snapshot().spent_today == 0.0
 
 
 def _hold_legs(ledger, legs):
@@ -191,7 +187,7 @@ async def test_fully_held_group_is_skipped_not_rebought(tmp_path):
         c["level"] == "SCAN-SKIP" and c["payload"].get("reason") == "already_owned_in_portfolio"
         for c in log_calls
     )
-    assert pipeline.budget_manager.total_spent_today == 0.0
+    assert pipeline.account.snapshot().spent_today == 0.0
 
 
 @pytest.mark.asyncio
@@ -332,7 +328,7 @@ async def test_tte_filter_skips_group_with_long_dated_leg():
         c["level"] == "FILTERED" and c["payload"].get("reason") == "tte_exceeds_max"
         for c in log_calls
     )
-    assert pipeline.budget_manager.total_spent_today == 0.0
+    assert pipeline.account.snapshot().spent_today == 0.0
 
 
 @pytest.mark.asyncio

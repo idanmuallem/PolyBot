@@ -13,7 +13,6 @@ from core.bridge import DataBridge
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
-from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
 from trading.fake_venue import FakeVenue
 from trading.ledger import Ledger
@@ -48,7 +47,6 @@ def _make_pipeline(tmp_path, max_drawdown_pct=0.20):
         bridge=ctx.bridge, executor=ctx.executor, config=config,
         hunter=ctx.scanner, db_path=db_path, ledger=ctx.ledger,
     )
-    ctx.budget_manager = BudgetManager(bridge=ctx.bridge, config=config, initial_balance=100.0)
     pipeline = SequentialTradingPipeline(ctx=ctx, log_func=lambda *a, **kw: None, delay=0.01)
 
     pipeline._stage_hunt = AsyncMock(return_value=None)

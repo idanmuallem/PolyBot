@@ -168,7 +168,8 @@ PolyBot/
 ├── trading/                    # Execution pipeline and risk management
 │   ├── decision_pipeline.py    # SequentialTradingPipeline + run_market_monitor()
 │   ├── executor.py             # TradeExecutor: dry/paper/live order submission
-│   ├── budget_manager.py       # Daily spend limits, bankroll enforcement, Kelly sizing
+│   ├── account.py              # Account: cash, equity, drawdown breaker, daily spend/trade limits, max-bet cap
+│   ├── kelly.py                # Kelly bet-size formula
 │   ├── risk_manager.py         # PortfolioManager: take-profit, stop-loss, drawdown circuit breaker
 │   ├── correlation.py          # CorrelationTracker: category/symbol correlation between open positions
 │   └── strategies/             # Constraint-based ("arbitrage") strategies — no brain/probability needed

@@ -114,49 +114,6 @@ def test_ev_below_threshold_is_rejected():
     assert result is False
 
 
-# ── Daily trade limit ─────────────────────────────────────────────────────────
-
-def test_daily_limit_blocks_trade():
-    executor = _make_executor(max_daily_trades=10)
-    executor.trades_by_strategy["crypto"] = 10  # already at limit
-    market = _valid_market()
-
-    log_calls = []
-    result = executor.evaluate_and_execute(
-        market=market,
-        fair_value=0.75,
-        ev=0.50,
-        current_poly_price=0.50,
-        bet_amount_usd=2.0,
-        side="YES",
-        log_func=lambda level, *a, **kw: log_calls.append(level),
-    )
-    assert result is False
-    assert "RISK" in log_calls
-
-
-def test_global_daily_limit_blocks_trade_even_under_strategy_allowance():
-    """Belt-and-suspenders: a generous per-strategy crypto_max_daily_trades
-    must not let trades continue past the account-wide max_daily_trades
-    ceiling."""
-    executor = _make_executor(max_daily_trades=2, crypto_max_daily_trades=200)
-    executor.trade_count_today = 2  # at the global ceiling, strategy bucket untouched
-    market = _valid_market()
-
-    log_calls = []
-    result = executor.evaluate_and_execute(
-        market=market,
-        fair_value=0.75,
-        ev=0.50,
-        current_poly_price=0.50,
-        bet_amount_usd=2.0,
-        side="YES",
-        log_func=lambda level, *a, **kw: log_calls.append(level),
-    )
-    assert result is False
-    assert "RISK" in log_calls
-
-
 # ── Price bounds ──────────────────────────────────────────────────────────────
 
 def test_price_below_floor_rejected():
@@ -255,23 +212,6 @@ def test_dry_run_returns_true_and_logs():
     assert "DRY-RUN" in log_calls
 
 
-def test_trade_count_increments_on_success():
-    executor = _make_executor()
-    assert executor.trade_count_today == 0
-    market = _valid_market()
-
-    executor.evaluate_and_execute(
-        market=market,
-        fair_value=0.75,
-        ev=0.50,
-        current_poly_price=0.50,
-        bet_amount_usd=2.0,
-        side="YES",
-        log_func=lambda *a, **kw: None,
-    )
-    assert executor.trade_count_today == 1
-
-
 # ── Construction ──────────────────────────────────────────────────────────────
 
 def test_executor_constructs_without_pm_trader_or_filesystem(tmp_path, monkeypatch):
@@ -330,7 +270,6 @@ def test_dry_run_yes_buy_fills_on_the_venue():
     assert _evaluate(executor, side="YES", bet=2.0) is True
 
     assert venue.fills == [("buy", "tok1", pytest.approx(4.0), 2.0)]
-    assert executor.trade_count_today == 1
 
 
 def test_dry_run_no_buy_trades_the_no_token_through_the_venue():
@@ -361,7 +300,6 @@ def test_dry_run_buy_the_venue_refuses_is_not_reported_as_success():
     log_calls = []
 
     assert _evaluate(executor, log_calls=log_calls) is False
-    assert executor.trade_count_today == 0
     assert "DRY-RUN" in log_calls  # the attempt itself isn't hidden
 
 
@@ -492,7 +430,6 @@ def test_live_buy_posts_the_order_and_logs_live_trade_under_the_market_asset_typ
     assert result is True
     assert client.orders == [("tok1_no", 0.6, "BUY", 5.0)]
     assert ("LIVE-TRADE", "Crypto::BTCUSDT", "tok1_no") in rows
-    assert executor.trade_count_today == 1
 
 
 def test_live_rejected_buy_is_not_a_trade():
@@ -500,7 +437,6 @@ def test_live_rejected_buy_is_not_a_trade():
     client.order_response = {"error": "insufficient_funds"}
 
     assert _evaluate(executor) is False
-    assert executor.trade_count_today == 0
 
 
 def test_live_sell_posts_a_sell_at_the_given_price():
@@ -563,7 +499,6 @@ def test_paper_limit_arbitrage_group_all_legs_fill_returns_success():
     assert result["arb_sets"] == pytest.approx(5.0)
     assert result["unfilled"] == []
     assert result["fills"] == {"A": pytest.approx(10.0), "B": pytest.approx(5.0)}
-    assert executor.trades_by_strategy["arbitrage"] == 2
 
 
 def test_paper_limit_arbitrage_limit_price_is_the_raw_leg_price():

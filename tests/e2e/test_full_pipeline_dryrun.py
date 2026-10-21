@@ -17,14 +17,13 @@ from core.wallet_context import WalletContext
 from hunters.crypto import CryptoHunter
 from core.polymarket_client import PolymarketClient
 from polymarket import PolymarketScannerHunter
-from trading.budget_manager import BudgetManager
 from tests.venue_harness import open_book_venue
 from trading.executor import TradeExecutor
 from trading.risk_manager import PortfolioManager
 
 
 def _wire_ctx(ctx: WalletContext, log_func) -> None:
-    """Build and attach the four runtime components to ctx, in dependency
+    """Build and attach the runtime components to ctx, in dependency
     order, matching how ui/dashboard.py and core/wallet_manager.py wire a
     real WalletContext. Must run with any TradeExecutor patches already
     active, since it constructs a real TradeExecutor."""
@@ -33,9 +32,6 @@ def _wire_ctx(ctx: WalletContext, log_func) -> None:
     ctx.portfolio_manager = PortfolioManager(
         bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
         hunter=ctx.scanner, db_path=ctx.db_path,
-    )
-    ctx.budget_manager = BudgetManager(
-        bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
     )
 
 
@@ -136,7 +132,7 @@ async def test_single_pipeline_loop_dry_run(tmp_path):
     )
 
     # 3. Budget was spent
-    assert pipeline.budget_manager.total_spent_today > 0, "total_spent_today should be > 0"
+    assert pipeline.account.snapshot().spent_today > 0, "total_spent_today should be > 0"
 
     # 4. Market was cached as seen
     assert "tok_btc" in pipeline.hunter.seen_markets

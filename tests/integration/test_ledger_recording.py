@@ -17,7 +17,6 @@ from core.models import MarketData, Position
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
-from trading.budget_manager import BudgetManager
 from trading.executor import TradeExecutor
 from trading.fake_venue import FakeVenue
 from trading.venue import MarketRef
@@ -51,7 +50,6 @@ def _make_pipeline(db_path, balance=100.0, venue=None):
             bridge=bridge, executor=ctx.executor, config=config,
             hunter=ctx.scanner, db_path=db_path, ledger=ctx.ledger,
         )
-        ctx.budget_manager = BudgetManager(bridge=bridge, config=config, initial_balance=balance)
         pipeline = SequentialTradingPipeline(ctx=ctx, log_func=log_func, delay=0.01)
     return pipeline, ctx
 

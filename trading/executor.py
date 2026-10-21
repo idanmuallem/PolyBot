@@ -38,8 +38,6 @@ class TradeExecutor:
 
     def __init__(self, config: TradingConfig, venue: Venue):
         self.config = config
-        self.trade_count_today = 0
-        self.trades_by_strategy: Dict[str, int] = {}
         self.venue = venue
 
     @property
@@ -103,10 +101,6 @@ class TradeExecutor:
     # ------------------------------------------------------------------
     # Arbitrage group execution — limit orders + fill timeout (Phase 3)
     # ------------------------------------------------------------------
-
-    def _record_strategy_trade(self, strategy_tag: str):
-        self.trade_count_today += 1
-        self.trades_by_strategy[strategy_tag] = self.trades_by_strategy.get(strategy_tag, 0) + 1
 
     async def _execute_limit_arbitrage_group(
         self, legs: List[Dict[str, Any]], timeout_seconds: float, log_func: Callable,
@@ -187,20 +181,10 @@ class TradeExecutor:
                 "fills": fills,
             })
 
-            # Shares that did fill before the group was voided are real,
-            # unretractable trades (cancel only stops further fills) —
-            # they still count against this strategy's daily trade count.
-            for token_id, filled in fills.items():
-                if filled > 0:
-                    self._record_strategy_trade(strategy_tag)
-
             return {"success": False, "arb_sets": 0, "fills": fills, "unfilled": unfilled, "surplus": {}}
 
         arb_sets = min(fills.values())
         surplus = {tid: round(filled - arb_sets, 4) for tid, filled in fills.items() if filled > arb_sets}
-
-        for _token_id in fills:
-            self._record_strategy_trade(strategy_tag)
 
         log_func("ARBITRAGE-FILL", asset_type, group_id or "group", {
             "reason": "all_legs_filled_via_limit_order",
@@ -248,15 +232,6 @@ class TradeExecutor:
             legs, float(timeout_seconds), log_func, strategy_tag, asset_type, group_id,
         )
 
-    def _strategy_max_daily_trades(self, strategy_tag: str) -> int:
-        """Per-strategy daily trade cap (see core/trading_config.py).
-        Unrecognized strategy tags fall back to the global max_daily_trades."""
-        if strategy_tag == "arbitrage":
-            return int(getattr(self.config, "arbitrage_max_daily_trades", self.config.max_daily_trades))
-        if strategy_tag == "crypto":
-            return int(getattr(self.config, "crypto_max_daily_trades", self.config.max_daily_trades))
-        return int(self.config.max_daily_trades)
-
     def evaluate_and_execute(
         self,
         market: MarketData,
@@ -268,7 +243,9 @@ class TradeExecutor:
         log_func: Callable,
         strategy_tag: str = "crypto",
     ) -> bool:
-        """Gate on EV + daily limit + price bounds, then fire the order."""
+        """Gate on EV + price bounds, then fire the order. Daily spend and
+        trade-count limits are the Account's (Account.reserve()), checked by
+        the caller before sizing."""
         asset_type = market.asset_type
         token_id = market.market_id
         execution_side = normalize_side(side)
@@ -280,24 +257,6 @@ class TradeExecutor:
             execution_fair_value = 1.0 - float(fair_value)
 
         if ev < self.config.min_ev:
-            return False
-
-        strategy_max_daily_trades = self._strategy_max_daily_trades(strategy_tag)
-        if self.trades_by_strategy.get(strategy_tag, 0) >= strategy_max_daily_trades:
-            log_func("RISK", asset_type, token_id,
-                     f"Daily trade limit ({strategy_max_daily_trades}) reached for {strategy_tag}")
-            return False
-
-        # Belt-and-suspenders hard ceiling: the check above only compares
-        # against this strategy's own allocation. Per-strategy caps
-        # (crypto_max_daily_trades, arbitrage_max_daily_trades) can be
-        # configured to sum higher than the account-wide MAX_DAILY_TRADES —
-        # TradingConfig only warns about that, it never clamps it — so this
-        # makes the global cap an actual ceiling no strategy can bypass via
-        # its own generous per-strategy bucket.
-        if self.trade_count_today >= int(self.config.max_daily_trades):
-            log_func("RISK", asset_type, token_id,
-                     f"Global daily trade limit ({self.config.max_daily_trades}) reached")
             return False
 
         if not self._validate_market(market, log_func):
@@ -345,9 +304,6 @@ class TradeExecutor:
             condition_id=getattr(market, "condition_id", None),
             slug=getattr(market, "slug", None),
         )
-        if executed:
-            self.trade_count_today += 1
-            self.trades_by_strategy[strategy_tag] = self.trades_by_strategy.get(strategy_tag, 0) + 1
         return bool(executed)
 
     def _validate_market(self, market: MarketData, log_func: Callable) -> bool:
@@ -361,7 +317,3 @@ class TradeExecutor:
                 log_func("VALIDATE", "Market", "Unknown", f"Missing {field_name}")
                 return False
         return True
-
-    def reset_daily_count(self):
-        self.trade_count_today = 0
-        self.trades_by_strategy = {}

@@ -12,7 +12,6 @@ from core.models import MarketData, Position
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
 from polymarket import PolymarketScannerHunter
-from trading.budget_manager import BudgetManager
 from tests.venue_harness import open_book_venue
 from trading.executor import TradeExecutor
 from trading.ledger import Ledger
@@ -52,9 +51,6 @@ def _make_pipeline(config=None, balance=100.0, ledger=None):
         ctx.portfolio_manager = PortfolioManager(
             bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
             hunter=ctx.scanner, db_path=ctx.db_path, ledger=ledger,
-        )
-        ctx.budget_manager = BudgetManager(
-            bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
         )
 
         pipeline = SequentialTradingPipeline(
@@ -302,7 +298,7 @@ def test_stage_execute_records_budget_on_success():
     assert approved_bet > 0.0
 
     pipeline._stage_execute(candidate, approved_bet, risk_ctx)
-    assert pipeline.budget_manager.total_spent_today == pytest.approx(approved_bet, abs=0.01)
+    assert pipeline.account.snapshot().spent_today == pytest.approx(approved_bet, abs=0.01)
 
 
 # ── Wang pricing mode (PricingEngine wiring) ─────────────────────────────────
