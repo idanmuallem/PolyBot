@@ -225,7 +225,7 @@ class Account:
         try:
             positions = list(venue.open_positions())
             position_value = sum(float(getattr(p, "value", 0.0) or 0.0) for p in positions)
-            unrealized = self._unrealized_pnl(positions, getattr(venue, "name", None))
+            unrealized = self._unrealized_pnl(positions, venue.name)
             self._positions_unavailable = False
         except PositionsUnavailable as exc:
             # An outage: logged once, not on every refresh it lasts.
@@ -244,7 +244,7 @@ class Account:
         # baseline restarts from the new Venue's equity, so the difference
         # between two accounts never reads as a drawdown.
         equity = cash + position_value
-        venue_name = getattr(venue, "name", None)
+        venue_name = venue.name
         if venue_name != self._peak_venue:
             self._peak_venue = venue_name
             peak = equity

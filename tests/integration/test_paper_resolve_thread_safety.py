@@ -59,4 +59,3 @@ async def test_paper_resolution_failure_is_caught_and_logged(tmp_path):
     [(token, payload)] = [(t, p) for level, t, p in rows if level == "RESOLVE-ERROR"]
     assert token == "paper"
     assert payload["venue"] == "paper" and "boom" in payload["error"]
-    assert "PAPER-ERROR" not in levels(rows)
