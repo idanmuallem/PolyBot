@@ -20,7 +20,7 @@ import requests
 from eth_utils import to_checksum_address
 
 from core.models import Position
-from trading.venue import LimitOrder, MarketRef, normalize_side
+from trading.venue import FillReasons, LimitOrder, MarketRef, log_placement_failed, normalize_side
 
 try:
     from py_clob_client.client import ClobClient
@@ -101,6 +101,7 @@ class ClobVenue:
     """Venue adapter for real trading on the Polymarket CLOB."""
 
     name = "live"
+    fill_reasons = FillReasons(not_filled="insufficient_liquidity", all_filled="all_legs_filled")
 
     def __init__(self, client: Any, proxy_address: Optional[str], http_get: Callable = requests.get):
         self.client = client
@@ -253,13 +254,19 @@ class ClobVenue:
 
     def place_limit_buy(
         self, market: MarketRef, side: str, usd: float, limit_price: float,
+        shares: Optional[float] = None, log_func: Optional[Callable] = None,
     ) -> Optional[LimitOrder]:
+        """Post a limit BUY of *shares* (default: what *usd* buys) at
+        *limit_price*. A rejection is logged as EXECUTION-ERROR with the
+        CLOB's response."""
         token_id = market.token_for(side)
-        shares = _whole_cents_of_shares(usd, limit_price)
-        order_resp = self._submit_order(token_id, float(limit_price), BUY, shares)
+        if shares is None:
+            shares = _whole_cents_of_shares(usd, limit_price)
+        order_resp = self._submit_order(token_id, float(limit_price), BUY, float(shares))
         order_id = _order_id(order_resp) if is_valid_order_response(order_resp) else None
         if order_id is None:
             logger.warning(f"[LIVE] Limit buy for {token_id} not accepted: {order_resp}")
+            log_placement_failed(log_func, token_id, "order_placement_failed", response=order_resp)
             return None
         return LimitOrder(id=order_id, token_id=token_id)
 
@@ -280,13 +287,18 @@ class ClobVenue:
             )
         return filled
 
-    def cancel_limit_order(self, order: LimitOrder) -> bool:
+    def cancel_limit_order(self, order: LimitOrder, log_func: Optional[Callable] = None) -> bool:
+        """Cancel a resting order; CANCEL (with the CLOB's response) or
+        CANCEL-ERROR rows go to log_func, keyed by order id."""
+        log = log_func or _no_log
         try:
-            self.client.cancel(order.id)
-            return True
+            resp = self.client.cancel(order.id)
         except Exception as exc:
             logger.warning(f"[LIVE] Cancel failed for order {order.id}: {exc}")
+            log("CANCEL-ERROR", "Portfolio", str(order.id), {"reason": "cancel_failed", "error": str(exc)})
             return False
+        log("CANCEL", "Portfolio", str(order.id), {"response": resp})
+        return True
 
     def resolve_closed_markets(
         self,

@@ -24,6 +24,14 @@ def _with_asset_type(log_func: Callable, asset_type: str) -> Callable:
     return _log
 
 
+def _order_rows(log_func: Callable, asset_type: str, **defaults) -> Callable:
+    """log_func for a venue's arbitrage order rows: filed under *asset_type*,
+    with *defaults* (group_id, ...) in every payload unless the row sets them."""
+    def _log(level, _asset_type, token_id, payload):
+        log_func(level, asset_type, token_id, {**defaults, **payload})
+    return _log
+
+
 def _venue_name(venue: Any) -> str:
     return getattr(venue, "name", "paper")
 
@@ -125,23 +133,21 @@ class TradeExecutor:
         # just this group's -- harmless since arbitrage legs are the only
         # limit orders placed, and groups are processed one at a time.
         orders: Dict[str, Optional[LimitOrder]] = {}
+        reasons = self.venue.fill_reasons
+        placement_rows = _order_rows(log_func, asset_type, group_id=group_id)
 
         for leg in legs:
             token_id = str(leg["token_id"])
             price = float(leg["price"])
             shares = float(leg["shares"])
-            order = self.venue.place_limit_buy(
+            orders[token_id] = self.venue.place_limit_buy(
                 MarketRef.from_leg(leg),
                 str(leg.get("side", "YES")),
                 float(leg.get("bet_amount_usd", shares * price)),
                 limit_price=price,
+                shares=shares,
+                log_func=placement_rows,
             )
-            orders[token_id] = order
-            if order is None:
-                log_func("EXECUTION-ERROR", asset_type, token_id, {
-                    "reason": "limit_order_placement_failed",
-                    "group_id": group_id,
-                })
 
         fills: Dict[str, float] = {tid: 0.0 for tid in orders}
         poll_interval = max(0.01, min(1.0, timeout_seconds / 10.0)) if timeout_seconds > 0 else 0.0
@@ -164,12 +170,13 @@ class TradeExecutor:
         if unfilled:
             # Cancel every order -- cancelling one that already filled is a
             # harmless no-op (it doesn't retract the fill).
+            cancel_rows = _order_rows(log_func, asset_type, reason="partial_fill_no_arb", group_id=group_id)
             for order in placed:
-                self.venue.cancel_limit_order(order)
+                self.venue.cancel_limit_order(order, log_func=cancel_rows)
 
             for token_id in unfilled:
                 log_func("REJECTED", asset_type, token_id, {
-                    "reason": "limit_order_not_filled",
+                    "reason": reasons.not_filled,
                     "group_id": group_id,
                     "timeout_seconds": timeout_seconds,
                 })
@@ -187,7 +194,7 @@ class TradeExecutor:
         surplus = {tid: round(filled - arb_sets, 4) for tid, filled in fills.items() if filled > arb_sets}
 
         log_func("ARBITRAGE-FILL", asset_type, group_id or "group", {
-            "reason": "all_legs_filled_via_limit_order",
+            "reason": reasons.all_filled,
             "group_id": group_id,
             "fills": fills,
             "arb_sets": arb_sets,

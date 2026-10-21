@@ -15,7 +15,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from core.models import Position
 from trading.venue import (
-    LimitOrder, MarketRef, Resolution, log_paper_buy, log_paper_sell, normalize_side, report_resolution,
+    FillReasons, LimitOrder, MarketRef, Resolution, log_paper_buy, log_paper_sell,
+    log_placement_failed, normalize_side, report_resolution,
 )
 
 MIN_ORDER_USD = 1.0  # same floor pm_trader enforces
@@ -32,6 +33,7 @@ class _Holding:
 
 class FakeVenue:
     name = "paper"
+    fill_reasons = FillReasons()
 
     def __init__(self, cash: float = 1000.0) -> None:
         self._cash = float(cash)
@@ -109,8 +111,10 @@ class FakeVenue:
 
     def place_limit_buy(
         self, market: MarketRef, side: str, usd: float, limit_price: float,
+        shares: Optional[float] = None, log_func: Optional[Callable] = None,
     ) -> Optional[LimitOrder]:
         if float(usd) < MIN_ORDER_USD or not (0 < float(limit_price) < 1):
+            log_placement_failed(log_func, market.token_for(side), "limit_order_placement_failed")
             return None
         order_id = next(self._order_ids)
         token = market.token_for(side)
@@ -133,7 +137,7 @@ class FakeVenue:
             for order in orders
         }
 
-    def cancel_limit_order(self, order: LimitOrder) -> bool:
+    def cancel_limit_order(self, order: LimitOrder, log_func: Optional[Callable] = None) -> bool:
         return self._pending.pop(order.id, None) is not None
 
     def resolve_closed_markets(

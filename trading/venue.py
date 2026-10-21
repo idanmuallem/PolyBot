@@ -101,6 +101,16 @@ class LimitOrder:
 
 
 @dataclass(frozen=True)
+class FillReasons:
+    """The reasons an arbitrage basket's rows give, per venue. Live keeps the
+    CLOB path's historic names (the hunt_history backfill reads
+    `all_legs_filled` as a live fill); paper keeps its limit-order ones."""
+
+    not_filled: str = "limit_order_not_filled"
+    all_filled: str = "all_legs_filled_via_limit_order"
+
+
+@dataclass(frozen=True)
 class Resolution:
     """One position settled by its market closing."""
 
@@ -157,6 +167,14 @@ def report_resolution(
             logger.warning(f"on_resolved failed for {resolution.token_id}: {exc}")
 
 
+def log_placement_failed(
+    log_func: Optional[Callable], token_id: str, reason: str, **detail: Any,
+) -> None:
+    """The EXECUTION-ERROR row a venue writes when a limit order can't be placed."""
+    if log_func is not None:
+        log_func("EXECUTION-ERROR", "Portfolio", token_id, {"reason": reason, **detail})
+
+
 def paper_shares(usd: float, price: Optional[float]) -> Optional[float]:
     """Shares *usd* buys at *price*, floored to 2 decimals; None without a price."""
     if not price or float(price) <= 0:
@@ -194,9 +212,12 @@ class Venue(Protocol):
     orders are limit orders at that price; paper fills ignore it) and an
     optional *log_func* for the venue's own order rows (DRY-RUN for paper,
     LIVE-TRADE / SELL for live). Those rows use "Portfolio" as asset type.
+    The same goes for limit orders: a venue logs its own placement failure
+    (EXECUTION-ERROR) and, if it has any, its cancel rows.
     """
 
     name: str  # "paper" or "live"
+    fill_reasons: FillReasons  # reasons for arbitrage basket rows
 
     def cash(self) -> float:
         """Deployable cash."""
@@ -218,14 +239,17 @@ class Venue(Protocol):
 
     def place_limit_buy(
         self, market: MarketRef, side: str, usd: float, limit_price: float,
+        shares: Optional[float] = None, log_func: Optional[Callable] = None,
     ) -> Optional[LimitOrder]:
-        """Place a resting limit buy. None if it couldn't be placed."""
+        """Place a resting limit buy of *usd* (or *shares*, where the venue
+        orders by share count) at *limit_price*. None if it couldn't be
+        placed; the venue logs why (EXECUTION-ERROR) to log_func."""
 
     def poll_limit_orders(self, orders: Sequence[LimitOrder]) -> Dict[Any, float]:
         """Advance pending limit orders against the book; return shares held
         per order id for the token each order buys."""
 
-    def cancel_limit_order(self, order: LimitOrder) -> bool:
+    def cancel_limit_order(self, order: LimitOrder, log_func: Optional[Callable] = None) -> bool:
         """Cancel a still-pending order. False if it wasn't pending."""
 
     def resolve_closed_markets(

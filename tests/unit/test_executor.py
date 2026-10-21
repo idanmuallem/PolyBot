@@ -540,3 +540,91 @@ def test_paper_limit_arbitrage_group_uneven_fills_computes_surplus():
     assert result["success"] is True
     assert result["arb_sets"] == pytest.approx(5.0)
     assert result["surplus"] == {"B": pytest.approx(5.0), "C": pytest.approx(2.0)}
+
+
+# ── Live arbitrage rows match main's live path ───────────────────────────────
+
+def _run_arb_logged(executor, legs, timeout=0.05):
+    rows = []
+    asyncio.run(executor.execute_arbitrage_group(
+        legs=legs, timeout_seconds=timeout,
+        log_func=lambda level, asset, token, payload: rows.append((level, asset, token, payload)),
+    ))
+    return rows
+
+
+def _reasons(rows, level):
+    return [payload.get("reason") for lvl, _a, _t, payload in rows if lvl == level]
+
+
+def _live_legs(*specs):
+    return [{"token_id": t, "price": p, "shares": s, "side": "YES", "bet_amount_usd": round(p * s, 2),
+             "group_id": "g"} for t, p, s in specs]
+
+
+def test_live_arbitrage_all_legs_filled_reason():
+    executor, _ = _live_executor({"A": 3.0, "B": 2.0})
+
+    rows = _run_arb_logged(executor, _live_legs(("A", 0.30, 3.0), ("B", 0.40, 2.0)))
+
+    assert _reasons(rows, "ARBITRAGE-FILL") == ["all_legs_filled"]
+
+
+def test_live_arbitrage_unfilled_leg_is_insufficient_liquidity_and_cancels_are_logged():
+    executor, client = _live_executor({"A": 3.0, "B": 0.0})
+
+    rows = _run_arb_logged(executor, _live_legs(("A", 0.30, 3.0), ("B", 0.40, 2.0)))
+
+    assert "insufficient_liquidity" in _reasons(rows, "REJECTED")
+    cancels = [(token, payload) for lvl, _a, token, payload in rows if lvl == "CANCEL"]
+    assert sorted(token for token, _ in cancels) == ["order_A", "order_B"]
+    assert all(p["reason"] == "partial_fill_no_arb" and p["group_id"] == "g" and "response" in p
+               for _, p in cancels)
+
+
+def test_live_arbitrage_failed_cancel_is_logged_as_cancel_error():
+    executor, client = _live_executor({"A": 3.0, "B": 0.0})
+
+    def broken_cancel(order_id):
+        raise RuntimeError("clob down")
+    client.cancel = broken_cancel
+
+    rows = _run_arb_logged(executor, _live_legs(("A", 0.30, 3.0), ("B", 0.40, 2.0)))
+
+    errors = [payload for lvl, _a, _t, payload in rows if lvl == "CANCEL-ERROR"]
+    assert len(errors) == 2
+    assert all(p["reason"] == "cancel_failed" and "clob down" in p["error"] for p in errors)
+
+
+def test_live_arbitrage_placement_failure_logs_the_response():
+    executor, client = _live_executor({})
+    client.order_response = {"errorMsg": "not enough balance"}
+
+    rows = _run_arb_logged(executor, _live_legs(("A", 0.30, 3.0)))
+
+    errors = [payload for lvl, _a, _t, payload in rows if lvl == "EXECUTION-ERROR"]
+    assert errors == [{"reason": "order_placement_failed", "group_id": "g",
+                       "response": {"errorMsg": "not enough balance"}}]
+
+
+def test_live_arbitrage_orders_the_legs_share_count():
+    """The leg's own share count is ordered, not one re-derived from its dollars."""
+    executor, client = _live_executor({"A": 7.0})
+
+    _run_arb_logged(executor, [
+        {"token_id": "A", "price": 0.30, "shares": 7.0, "side": "YES", "bet_amount_usd": 3.0},
+    ])
+
+    assert client.orders == [("A", 0.3, "BUY", 7.0)]
+
+
+def test_paper_arbitrage_keeps_its_own_reasons():
+    venue = _arb_venue({"A": 0.30})
+    rows = _run_arb_logged(_make_executor(venue=venue), [_leg("A", 0.30, 3.0), _leg("B", 0.40, 2.0)])
+
+    assert "limit_order_not_filled" in _reasons(rows, "REJECTED")
+    assert not [r for r in rows if r[0] in ("CANCEL", "CANCEL-ERROR")]
+
+    venue = _arb_venue({"A": 0.30})
+    rows = _run_arb_logged(_make_executor(venue=venue), [_leg("A", 0.30, 3.0)])
+    assert _reasons(rows, "ARBITRAGE-FILL") == ["all_legs_filled_via_limit_order"]

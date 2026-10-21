@@ -25,7 +25,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from core.models import Position
 from trading.venue import (
-    LimitOrder, MarketRef, Resolution, log_paper_buy, log_paper_sell, normalize_side, report_resolution,
+    FillReasons, LimitOrder, MarketRef, Resolution, log_paper_buy, log_paper_sell,
+    log_placement_failed, normalize_side, report_resolution,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class PaperVenue:
     """
 
     name = "paper"
+    fill_reasons = FillReasons()
 
     def __init__(self, data_dir: Path, starting_balance: float, market_api: Any = None):
         """Open (or create) the paper account in *data_dir*.
@@ -210,9 +212,12 @@ class PaperVenue:
 
     def place_limit_buy(
         self, market: MarketRef, side: str, usd: float, limit_price: float,
+        shares: Optional[float] = None, log_func: Optional[Callable] = None,
     ) -> Optional[LimitOrder]:
+        """pm_trader orders by dollars: *shares* is not used."""
         slug_or_id = self._slug_or_id(market, "skipping limit order")
         if not slug_or_id:
+            log_placement_failed(log_func, market.token_for(side), "limit_order_placement_failed")
             return None
         outcome = normalize_side(side).lower()
 
@@ -222,6 +227,7 @@ class PaperVenue:
             )
         except Exception as exc:
             logger.warning(f"[PAPER] Limit buy placement failed for {slug_or_id} {outcome}: {exc}")
+            log_placement_failed(log_func, market.token_for(side), "limit_order_placement_failed")
             return None
 
         token = market.token_for(side)
@@ -258,7 +264,7 @@ class PaperVenue:
                 filled[order.id] = 0.0
         return filled
 
-    def cancel_limit_order(self, order: LimitOrder) -> bool:
+    def cancel_limit_order(self, order: LimitOrder, log_func: Optional[Callable] = None) -> bool:
         try:
             return self.engine.cancel_limit_order(order.id) is not None
         except Exception as exc:

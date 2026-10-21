@@ -131,8 +131,8 @@ def open_book_venue(cash: float = 1000.0):
                 self.set_price(market, side, price)
             return super().buy(market, side, usd, price=price, log_func=log_func)
 
-        def place_limit_buy(self, market, side, usd, limit_price):
+        def place_limit_buy(self, market, side, usd, limit_price, shares=None, log_func=None):
             self.set_price(market, side, limit_price)
-            return super().place_limit_buy(market, side, usd, limit_price)
+            return super().place_limit_buy(market, side, usd, limit_price, shares=shares, log_func=log_func)
 
     return OpenBookVenue(cash=cash)
