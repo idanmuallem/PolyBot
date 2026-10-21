@@ -197,3 +197,25 @@ def test_refresh_follows_the_active_venue():
     active["venue"] = live
 
     assert account.refresh().cash == pytest.approx(40.0)
+
+
+def test_switching_venue_starts_the_drawdown_baseline_from_the_new_venues_equity():
+    """$1000 on paper, $50 on live: the switch is not a 95% drawdown."""
+    paper, live = FakeVenue(cash=1000.0), FakeVenue(cash=50.0)
+    live.name = "live"
+    active = {"venue": paper}
+    log = []
+    account = Account(venue=lambda: active["venue"], bridge=DataBridge(),
+                      log_func=lambda level, *a: log.append(level))
+    account.refresh()
+
+    active["venue"] = live
+    snap = account.refresh()
+
+    assert snap.peak_equity == pytest.approx(50.0)
+    assert snap.drawdown_pct == 0.0
+    assert snap.drawdown_paused is False
+    assert "CIRCUIT-BREAKER" not in log
+
+    live._cash = 30.0                     # a real 40% drawdown on live still trips it
+    assert account.refresh().drawdown_paused is True

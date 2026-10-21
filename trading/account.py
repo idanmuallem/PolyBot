@@ -80,6 +80,7 @@ class Account:
         self._spent: dict[str, float] = {}
         self._trades: dict[str, int] = {}
         self._day = None  # UTC date today's spend and trade counts belong to
+        self._peak_venue = None  # name of the Venue peak equity was measured on
 
     # -- reads ----------------------------------------------------------------
 
@@ -231,8 +232,16 @@ class Account:
         # (oracle3/risk/risk_manager.py) -
         # https://github.com/YichengYang-Ethan/oracle3, licensed under the
         # Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+        # Peak equity is per Venue: on a switch (Dry run <-> Live run) the
+        # baseline restarts from the new Venue's equity, so the difference
+        # between two accounts never reads as a drawdown.
         equity = cash + position_value
-        peak = max(prev.peak_equity, equity)
+        venue_name = getattr(venue, "name", None)
+        if venue_name != self._peak_venue:
+            self._peak_venue = venue_name
+            peak = equity
+        else:
+            peak = max(prev.peak_equity, equity)
         drawdown_pct = (peak - equity) / peak if peak > 0 else 0.0
         paused = drawdown_pct >= self._max_drawdown_pct
 
