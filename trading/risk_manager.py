@@ -6,6 +6,7 @@ from ui import data_manager
 from brains.pricing_engine import PricingEngine
 from trading.correlation import CorrelationTracker
 from trading.gate import MAX_EXIT_ATTEMPTS, Gate, Ok
+from trading.venue import PositionsUnavailable
 
 
 class PortfolioManager:
@@ -56,8 +57,12 @@ class PortfolioManager:
     def refresh_positions(self):
         """Re-read the open positions risk works from (bridge.current_portfolio)
         from the active Venue. Their value, unrealized P&L and cash are the
-        Account's (trading/account.py)."""
-        positions = self.executor.get_open_positions()
+        Account's (trading/account.py). While the Venue can't read them
+        (PositionsUnavailable), the last list read is kept."""
+        try:
+            positions = self.executor.get_open_positions()
+        except PositionsUnavailable:
+            return
         self.bridge.current_portfolio = positions
         # Dry run mark-to-market snapshot (Phase 3)
         if self._venue() != "live":

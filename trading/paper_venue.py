@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from core.models import Position
 from trading.venue import (
-    FillReasons, LimitOrder, MarketRef, Resolution, log_paper_buy, log_paper_sell,
+    FillReasons, LimitOrder, MarketRef, PositionsUnavailable, Resolution, log_paper_buy, log_paper_sell,
     log_placement_failed, normalize_side, report_resolution,
 )
 
@@ -88,6 +88,7 @@ class PaperVenue:
         # briefly. Every mutation below invalidates it (phantom-sell fix).
         self._positions_cache: List[Position] = []
         self._positions_cache_at: float = 0.0
+        self._positions_cache_current = False  # read since the last buy/sell
         self._positions_cache_ttl: float = 30.0  # seconds
 
         self._token_map_path = path / "token_map.json"
@@ -123,7 +124,11 @@ class PaperVenue:
             portfolio = self.engine.get_portfolio()
         except Exception as exc:
             logger.warning(f"[PAPER] Failed to fetch portfolio: {exc}")
-            return self._positions_cache  # stale data beats an empty list for TP/SL
+            # Stale data beats an empty list for TP/SL, but only data read
+            # since the last buy/sell; otherwise say the read failed.
+            if self._positions_cache_current:
+                return self._positions_cache
+            raise PositionsUnavailable(f"paper portfolio read failed: {exc}") from exc
 
         positions = []
         for p in portfolio:
@@ -152,6 +157,7 @@ class PaperVenue:
 
         self._positions_cache = positions
         self._positions_cache_at = now
+        self._positions_cache_current = True
         return positions
 
     def buy(
@@ -329,6 +335,7 @@ class PaperVenue:
 
     def _invalidate_positions(self) -> None:
         self._positions_cache_at = 0.0
+        self._positions_cache_current = False
 
     def _remember_token(self, token_id: str, slug_or_id: str, outcome: str) -> None:
         self._token_map[str(token_id)] = (slug_or_id, outcome)

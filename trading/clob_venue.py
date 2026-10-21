@@ -20,7 +20,7 @@ from eth_utils import to_checksum_address
 
 from core.models import Position
 from trading.venue import (
-    FillReasons, LimitOrder, MarketRef, log_placement_failed, normalize_side, whole_cent_shares,
+    FillReasons, LimitOrder, MarketRef, PositionsUnavailable, log_placement_failed, normalize_side, whole_cent_shares,
 )
 
 try:
@@ -159,7 +159,9 @@ class ClobVenue:
 
     def open_positions(self) -> List[Position]:
         """Open positions from the Polymarket Data API, marked to the API's
-        current price (py-clob-client has no stable positions listing)."""
+        current price (py-clob-client has no stable positions listing).
+        Raises PositionsUnavailable when the Data API errors, times out or
+        answers with something that isn't a positions list."""
         if not self.proxy_address:
             return []
 
@@ -167,28 +169,24 @@ class ClobVenue:
         try:
             response = self._http_get(url, timeout=10)
             response.raise_for_status()
-        except requests.exceptions.HTTPError as exc:
-            status_code = exc.response.status_code if exc.response is not None else None
-            if status_code != 404:
-                logger.debug(f"Data API positions HTTP error: {exc}")
-            return []
-        except requests.exceptions.RequestException as exc:
-            logger.debug(f"Data API positions request error: {exc}")
-            return []
+            raw_positions = response.json()
+        except Exception as exc:
+            logger.debug(f"Data API positions read failed: {exc}")
+            raise PositionsUnavailable(f"Data API positions read failed: {exc}") from exc
+        if isinstance(raw_positions, dict):
+            raw_positions = raw_positions.get("positions")
+        if not isinstance(raw_positions, list):
+            raise PositionsUnavailable(f"Data API positions answer is not a list: {raw_positions!r}"[:300])
 
         positions: List[Position] = []
-        try:
-            raw_positions = response.json()
-            if isinstance(raw_positions, dict):
-                raw_positions = raw_positions.get("positions", [])
-            if not isinstance(raw_positions, list):
-                return []
-            for raw in raw_positions:
+        for raw in raw_positions:
+            try:
                 position = _position_from_data_api(raw)
-                if position is not None:
-                    positions.append(position)
-        except Exception as exc:
-            logger.warning(f"Could not parse open positions: {exc}")
+            except Exception as exc:
+                logger.warning(f"Could not parse an open position: {exc}")
+                continue
+            if position is not None:
+                positions.append(position)
         return positions
 
     def buy(

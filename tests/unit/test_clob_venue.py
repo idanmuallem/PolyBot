@@ -210,6 +210,52 @@ def test_open_positions_without_a_proxy_wallet_is_empty():
     assert calls == []
 
 
+def _venue_with_http(http_get):
+    from trading.clob_venue import ClobVenue
+    return ClobVenue(client=StubClobClient(), proxy_address="0xabc", http_get=http_get)
+
+
+def _raising(exc):
+    def http_get(url, timeout=None):
+        raise exc
+    return http_get
+
+
+@pytest.mark.parametrize("status", [404, 500, 503])
+def test_open_positions_on_a_data_api_error_is_unavailable_not_empty(status):
+    from trading.venue import PositionsUnavailable
+    venue = _venue_with_http(lambda url, timeout=None: _Resp([], status=status))
+
+    with pytest.raises(PositionsUnavailable):
+        venue.open_positions()
+
+
+@pytest.mark.parametrize("exc_name", ["Timeout", "ConnectionError"])
+def test_open_positions_on_a_data_api_timeout_is_unavailable(exc_name):
+    import requests
+    from trading.venue import PositionsUnavailable
+    venue = _venue_with_http(_raising(getattr(requests.exceptions, exc_name)("down")))
+
+    with pytest.raises(PositionsUnavailable):
+        venue.open_positions()
+
+
+@pytest.mark.parametrize("payload", [ValueError("not json"), "<html>oops</html>", {"error": "x"}])
+def test_open_positions_with_an_unreadable_body_is_unavailable(payload):
+    from trading.venue import PositionsUnavailable
+
+    class Body(_Resp):
+        def json(self):
+            if isinstance(self._payload, Exception):
+                raise self._payload
+            return self._payload
+
+    venue = _venue_with_http(lambda url, timeout=None: Body(payload))
+
+    with pytest.raises(PositionsUnavailable):
+        venue.open_positions()
+
+
 # -- limit orders (arbitrage) -------------------------------------------------
 
 def test_place_limit_buy_posts_floor_shares_at_the_limit_price():

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from core.trading_config import TradingConfig
+from trading.venue import PositionsUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ class Account:
         self._trades: dict[str, int] = {}
         self._day = None  # UTC date today's spend and trade counts belong to
         self._peak_venue = None  # name of the Venue peak equity was measured on
+        self._positions_unavailable = False  # an outage is being logged (see refresh())
 
     # -- reads ----------------------------------------------------------------
 
@@ -224,6 +226,12 @@ class Account:
             positions = list(venue.open_positions())
             position_value = sum(float(getattr(p, "value", 0.0) or 0.0) for p in positions)
             unrealized = self._unrealized_pnl(positions, getattr(venue, "name", None))
+            self._positions_unavailable = False
+        except PositionsUnavailable as exc:
+            # An outage: logged once, not on every refresh it lasts.
+            if not self._positions_unavailable:
+                self._log("SYNC-WARN", "Account", "portfolio", {"reason": "positions_unavailable", "error": str(exc)})
+            self._positions_unavailable = True
         except Exception as exc:
             self._log("SYNC-WARN", "Account", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
 

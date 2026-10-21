@@ -22,7 +22,7 @@ from trading.account import Account, Refused
 from trading.gate import Skip
 from trading.kelly import kelly_bet_size
 from trading.strategies import EventSumStrategy, Strategy
-from trading.venue import MarketRef, whole_cent_shares
+from trading.venue import MarketRef, PositionsUnavailable, whole_cent_shares
 from ui import data_manager
 
 
@@ -119,6 +119,7 @@ class SequentialTradingPipeline:
         self._refused_mode: str | None = None
         self._last_resolve_check_at = 0.0
         self._last_drift = None  # last logged Venue/Ledger drift (see _reconcile())
+        self._positions_unavailable = False  # outage logged (see _reconcile())
         # Live entries are resting limit orders: a holding the CLOB has never
         # shown is closed as unfilled after a grace period (see
         # _close_unfilled_entries()). Only holdings opened since this start.
@@ -1014,6 +1015,11 @@ class SequentialTradingPipeline:
         (RECONCILE-DRIFT) when it first appears or changes, and its
         clearing is logged (RECONCILE-OK), so an unchanged drift doesn't
         flood the event log every tick.
+
+        While the Venue can't read its positions (PositionsUnavailable)
+        the tick's reconcile is skipped, unfilled entries included: an
+        outage is not absence. It is logged once per outage
+        (RECONCILE-UNAVAILABLE).
         """
         if self.ledger is None or self.venue is None:
             return
@@ -1023,9 +1029,17 @@ class SequentialTradingPipeline:
                 token = str(getattr(p, "token_id", "") or "")
                 venue_shares[token] = venue_shares.get(token, 0.0) + float(getattr(p, "shares", 0.0) or 0.0)
             ledger_shares = {h.token_id: float(h.shares) for h in self.ledger.open_positions(venue=self.venue.name)}
+        except PositionsUnavailable as exc:
+            if not self._positions_unavailable:
+                self.log_func("RECONCILE-UNAVAILABLE", "Pipeline", self.venue.name, {
+                    "venue": self.venue.name, "reason": "positions_unavailable", "error": str(exc),
+                })
+            self._positions_unavailable = True
+            return
         except Exception as exc:
             self.log_func("SYNC-WARN", "Pipeline", "reconcile", {"reason": "reconcile_failed", "error": str(exc)})
             return
+        self._positions_unavailable = False
 
         self._seen_on_venue.update(t for t, n in venue_shares.items() if n > 0)
         if self.venue.name == "live" and self._close_unfilled_entries(venue_shares):

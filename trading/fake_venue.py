@@ -4,7 +4,8 @@ Behaves like PaperVenue through the Venue port (see the shared contract in
 tests/unit/test_venue_contract.py): fills at the listed price with no fees
 or slippage, refuses what it can't fill, and settles closed markets.
 
-Exchange controls for tests: list_market(), set_price(), close_market().
+Exchange controls for tests: list_market(), set_price(), close_market(),
+fail_position_reads() / restore_position_reads().
 """
 
 from __future__ import annotations
@@ -15,8 +16,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from core.models import Position
 from trading.venue import (
-    FillReasons, LimitOrder, MarketRef, Resolution, log_paper_buy, log_paper_sell,
-    log_placement_failed, normalize_side, report_resolution,
+    FillReasons, LimitOrder, MarketRef, PositionsUnavailable, Resolution, log_paper_buy,
+    log_paper_sell, log_placement_failed, normalize_side, report_resolution,
 )
 
 MIN_ORDER_USD = 1.0  # same floor pm_trader enforces
@@ -43,6 +44,7 @@ class FakeVenue:
         self._holdings: Dict[str, _Holding] = {}      # token -> holding
         self._pending: Dict[int, dict] = {}           # order id -> order
         self._order_ids = itertools.count(1)
+        self._positions_readable = True
 
         # Every buy/sell that landed, in order: (op, token_id, shares, usd).
         self.fills: List[tuple] = []
@@ -61,12 +63,21 @@ class FakeVenue:
     def close_market(self, market: MarketRef, winning_side: str) -> None:
         self._winners[market] = normalize_side(winning_side)
 
+    def fail_position_reads(self) -> None:
+        """Positions can't be read until restore_position_reads() (an outage)."""
+        self._positions_readable = False
+
+    def restore_position_reads(self) -> None:
+        self._positions_readable = True
+
     # -- Venue port ---------------------------------------------------------
 
     def cash(self) -> float:
         return self._cash
 
     def open_positions(self) -> List[Position]:
+        if not self._positions_readable:
+            raise PositionsUnavailable("positions read is down")
         positions = []
         for token, h in self._holdings.items():
             avg = h.cost / h.shares if h.shares else 0.0

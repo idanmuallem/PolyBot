@@ -259,3 +259,33 @@ def test_on_resolved_failure_does_not_stop_resolution(venue_and_exchange):
 
     assert venue.resolve_closed_markets(on_resolved=boom) == 1
     assert venue.open_positions() == []
+
+
+# -- positions unavailable ------------------------------------------------------
+# "I can't read my positions" must never look like "I hold nothing": the
+# engine would close real holdings as unfilled.
+
+def test_positions_that_cannot_be_read_are_unavailable_not_empty(venue_and_exchange):
+    from trading.venue import PositionsUnavailable
+
+    venue, exchange = venue_and_exchange
+    exchange.list_market(BTC, yes_price=0.40)
+    venue.buy(BTC, "YES", 20.0)
+    exchange.fail_position_reads()
+
+    with pytest.raises(PositionsUnavailable):
+        venue.open_positions()
+
+    exchange.restore_position_reads()
+    assert _position(venue, "btc-yes").shares == pytest.approx(50.0)
+
+
+def test_unavailable_positions_never_hide_a_holding_behind_an_empty_read(venue_and_exchange):
+    """Nothing held and the read fails: still unavailable, not []."""
+    from trading.venue import PositionsUnavailable
+
+    venue, exchange = venue_and_exchange
+    exchange.fail_position_reads()
+
+    with pytest.raises(PositionsUnavailable):
+        venue.open_positions()

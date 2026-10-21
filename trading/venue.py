@@ -87,6 +87,14 @@ def _opt_str(value: Any) -> Optional[str]:
     return str(value)
 
 
+class PositionsUnavailable(RuntimeError):
+    """A Venue could not read its open positions (an API error, a timeout).
+
+    Distinct from holding nothing: open_positions() raises this instead of
+    returning [], so no caller can mistake an outage for "no positions".
+    It is the one ordinary failure the port raises."""
+
+
 @dataclass(frozen=True)
 class LimitOrder:
     """A resting limit order as handed back by Venue.place_limit_buy().
@@ -208,7 +216,9 @@ class Venue(Protocol):
     """The trading engine's view of a market venue.
 
     Every method is best-effort: none raises on an ordinary venue failure;
-    each reports it through its return value instead.
+    each reports it through its return value instead. The one exception is
+    open_positions(), which raises PositionsUnavailable when it can't read
+    them, because an empty list would say "nothing held".
 
     buy/sell take the caller's per-share *price* for the side traded (live
     orders are limit orders at that price; paper fills ignore it) and an
@@ -225,7 +235,8 @@ class Venue(Protocol):
         """Deployable cash."""
 
     def open_positions(self) -> List[Position]:
-        """Currently open positions, reflecting every buy/sell made so far."""
+        """Currently open positions, reflecting every buy/sell made so far.
+        Raises PositionsUnavailable when they can't be read."""
 
     def buy(
         self, market: MarketRef, side: str, usd: float,

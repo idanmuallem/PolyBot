@@ -186,6 +186,26 @@ def test_failed_venue_read_keeps_the_last_known_cash():
     assert "SYNC-WARN" in log
 
 
+def test_positions_outage_keeps_the_last_known_value_and_is_logged_once():
+    venue, log = _holding_venue(), []
+    account = _account(venue, log=log)
+    before = account.refresh()
+
+    venue.fail_position_reads()
+    for _ in range(3):
+        snap = account.refresh()
+
+    assert snap.open_position_value == pytest.approx(before.open_position_value)
+    assert account.drawdown_paused is False      # an outage is not a crash in equity
+    assert log.count("SYNC-WARN") == 1
+
+    venue.restore_position_reads()
+    account.refresh()
+    venue.fail_position_reads()
+    account.refresh()
+    assert log.count("SYNC-WARN") == 2           # a new outage is logged again
+
+
 def test_refresh_follows_the_active_venue():
     """Reads go to whichever Venue is active at refresh time (paper <-> live
     switching swaps it between ticks)."""

@@ -6,6 +6,8 @@ scenario, whatever venue is under test:
     list_market(ref, yes_price)       -- make a binary market tradeable
     set_price(ref, side, price)       -- move one side's price
     close_market(ref, winning_side)   -- close the market with a winner
+    fail_position_reads()             -- positions can't be read (an outage)
+    restore_position_reads()          -- ... until this
 
 PmTraderMarketStub stands in for pm_trader's network client
 (PolymarketClient), so PaperVenue runs a real pm_trader Engine and sqlite
@@ -55,6 +57,15 @@ class PmTraderMarketStub:
         record = self._record(ref)
         record["closed"] = True
         record["winner"] = normalize_side(winning_side)
+
+    def fail_position_reads(self) -> None:
+        """Break the paper engine's portfolio read (its sqlite ledger)."""
+        def down():
+            raise RuntimeError("portfolio read is down")
+        self.venue.engine.get_portfolio = down
+
+    def restore_position_reads(self) -> None:
+        del self.venue.engine.get_portfolio
 
     def _record(self, ref: MarketRef) -> dict:
         return self._markets[ref.slug or ref.condition_id or f"slug-{ref.yes_token_id}"]
@@ -115,6 +126,7 @@ def make_paper_venue(data_dir: Path, starting_balance: float) -> Tuple[object, P
 
     stub = PmTraderMarketStub()
     venue = PaperVenue(data_dir=data_dir, starting_balance=starting_balance, market_api=stub)
+    stub.venue = venue
     return venue, stub
 
 

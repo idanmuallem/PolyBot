@@ -258,6 +258,44 @@ async def test_holdings_from_before_this_run_are_not_closed_as_unfilled(tmp_path
     assert ctx.ledger.holding("eth-yes") is not None
 
 
+# ── positions unavailable (a Data API outage) ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_an_outage_longer_than_the_grace_period_closes_nothing(tmp_path):
+    pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
+    ctx.ledger.record_entry(token_id="eth-yes", condition_id="0xeth", side="YES", shares=5.0, price=0.5,
+                            venue="live", strategy="crypto", at="2026-10-21 12:00:00")
+    live.fail_position_reads()
+
+    for _ in range(3):
+        _minutes(now, 10)
+        await pipeline.tick()
+
+    assert ctx.ledger.holding("eth-yes") is not None
+    assert "RECONCILE-UNFILLED" not in levels(rows)
+    assert _drift(rows) == []                          # an outage is not absence
+    assert levels(rows).count("RECONCILE-UNAVAILABLE") == 1   # logged once, not every tick
+
+
+@pytest.mark.asyncio
+async def test_reconcile_resumes_when_positions_are_readable_again(tmp_path):
+    pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
+    ctx.ledger.record_entry(token_id="eth-yes", condition_id="0xeth", side="YES", shares=5.0, price=0.5,
+                            venue="live", strategy="crypto", at="2026-10-21 12:00:00")
+    live.fail_position_reads()
+    await pipeline.tick()
+    live.restore_position_reads()
+
+    await pipeline.tick()
+
+    [drift] = _drift(rows)
+    assert drift["ledger_only"] == {"eth-yes": pytest.approx(5.0)}
+
+    live.fail_position_reads()
+    await pipeline.tick()
+    assert levels(rows).count("RECONCILE-UNAVAILABLE") == 2   # a new outage is logged again
+
+
 @pytest.mark.asyncio
 async def test_engine_status_names_the_active_venue(tmp_path):
     paper, live = FakeVenue(cash=300.0), live_fake(cash=55.0)
