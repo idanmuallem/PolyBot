@@ -317,11 +317,15 @@ class PaperVenue:
         slug_or_id = market.slug or market.condition_id
         if not slug_or_id:
             key = market.yes_token_id
-            now = time.time()
-            if now - self._skip_warned_at.get(key, 0.0) >= _SKIP_WARNING_INTERVAL_SECONDS:
-                self._skip_warned_at[key] = now
-                logger.warning(f"[PAPER] No slug or condition_id for token {key} -- {what}")
+            self._warn_now_and_then(key, f"[PAPER] No slug or condition_id for token {key} -- {what}")
         return slug_or_id
+
+    def _warn_now_and_then(self, key: str, message: str) -> None:
+        """Log *message* at most once per _SKIP_WARNING_INTERVAL_SECONDS per *key*."""
+        now = time.time()
+        if now - self._skip_warned_at.get(key, 0.0) >= _SKIP_WARNING_INTERVAL_SECONDS:
+            self._skip_warned_at[key] = now
+            logger.warning(message)
 
     def _invalidate_positions(self) -> None:
         self._positions_cache_at = 0.0
@@ -343,15 +347,12 @@ class PaperVenue:
             if o == outcome and s == slug:
                 return tok
 
-        warn_key = f"unmapped:{slug}:{outcome}"
-        now = time.time()
-        if now - self._skip_warned_at.get(warn_key, 0.0) >= _SKIP_WARNING_INTERVAL_SECONDS:
-            self._skip_warned_at[warn_key] = now
-            logger.warning(
-                f"[PAPER] Open position {slug}/{outcome} has no _token_map "
-                "entry -- it cannot be sold until this is resolved (see "
-                "PaperVenue._token_for_position())"
-            )
+        self._warn_now_and_then(
+            f"unmapped:{slug}:{outcome}",
+            f"[PAPER] Open position {slug}/{outcome} has no _token_map "
+            "entry -- it cannot be sold until this is resolved (see "
+            "PaperVenue._token_for_position())",
+        )
         return f"__unmapped__:{slug}:{outcome}"
 
     def _resolution(self, resolve_result, shares_before: dict) -> Resolution:

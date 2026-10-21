@@ -25,7 +25,7 @@ def _config(**overrides):
 
 def _account(bridge=None, cash=100.0, **config):
     return Account(
-        venue=lambda: FakeVenue(cash=cash),
+        active_venue=lambda: FakeVenue(cash=cash),
         bridge=bridge if bridge is not None else DataBridge(),
         config=_config(**config),
     )
@@ -204,7 +204,7 @@ def _restarted_account(ledger, bridge=None, **config):
     """A fresh Account over a Ledger that already holds today's entries,
     as after an engine restart."""
     return Account(
-        venue=lambda: FakeVenue(cash=100.0),
+        active_venue=lambda: FakeVenue(cash=100.0),
         bridge=bridge if bridge is not None else DataBridge(),
         ledger=ledger,
         config=_config(**config),

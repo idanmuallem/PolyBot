@@ -216,7 +216,7 @@ class Ledger:
 
         payout_price is the per-share payout (1.0 winning / 0.0 losing).
         None means an unconfirmed expiry: the market most likely resolved
-        but no payout is confirmed (live mode's gave-up-selling case), so
+        but no payout is confirmed (Live run's gave-up-selling case), so
         the position is closed as 'expired' with no realized P&L."""
         confirmed = payout_price is not None
         return self._close(

@@ -51,15 +51,16 @@ class PortfolioManager:
         # the Gate (trading/gate.py). Every exit path here asks
         # gate.can_exit before selling and reports the outcome; the pipeline
         # asks the same Gate before entering.
-        self.gate = gate if gate is not None else Gate(ledger, venue=self._venue)
+        self.gate = gate if gate is not None else Gate(ledger, venue_name_fn=self._venue)
 
-    def _refresh_portfolio(self):
+    def refresh_positions(self):
+        """Re-read the open positions risk works from (bridge.current_portfolio)
+        from the active Venue. Their value, unrealized P&L and cash are the
+        Account's (trading/account.py)."""
         positions = self.executor.get_open_positions()
-        # The positions list risk works from. Their value, unrealized P&L
-        # and cash are the Account's (trading/account.py).
         self.bridge.current_portfolio = positions
-        # Paper tracking mark-to-market snapshot (Phase 3)
-        if getattr(self.executor, "dry_run", True):
+        # Dry run mark-to-market snapshot (Phase 3)
+        if self._venue() != "live":
             now = time.time()
             if now - self._last_snapshot_at >= 180.0:
                 cash = self.executor.get_balance()
@@ -177,7 +178,8 @@ class PortfolioManager:
         return self.correlation_tracker.exposure_for_new_position(asset_type, self.get_book_asset_types())
 
     def _venue(self) -> str:
-        return "paper" if getattr(self.executor, "dry_run", True) else "live"
+        """The active Venue's name: the venue tag for this module's Ledger rows."""
+        return self.executor.venue.name
 
     def _record_sale(self, position, reason: str) -> None:
         """Record one confirmed sale of this position in the Ledger. Strategy
@@ -297,7 +299,7 @@ class PortfolioManager:
         equivalent (PaperVenue.resolve_closed_markets) already logs a
         sold=True EXPIRED row with a real payout, so this would only double
         up on that."""
-        if getattr(self.executor, "dry_run", True):
+        if self._venue() != "live":
             return
         token_id = str(self._position_field(position, "token_id", "") or "")
         shares = float(self._position_field(position, "shares", 0.0) or 0.0)
@@ -325,7 +327,7 @@ class PortfolioManager:
     def optimize_for_candidate(self, new_candidate_ev: float, min_improvement: float = 0.10, log_func=None) -> float:
         """Liquidate positions materially weaker than the new candidate to pool capital."""
         try:
-            self._refresh_portfolio()
+            self.refresh_positions()
             open_positions = list(getattr(self.bridge, "current_portfolio", []) or [])
             if not open_positions:
                 return 0.0
@@ -387,7 +389,7 @@ class PortfolioManager:
                     "min_improvement": round(float(min_improvement), 4),
                 })
 
-            self._refresh_portfolio()
+            self.refresh_positions()
             return float(freed_capital)
         except Exception as exc:
             print(f"[PORTFOLIO-CULL] Optimization failed: {exc}")
@@ -395,7 +397,7 @@ class PortfolioManager:
 
     def free_up_capital(self, required_amount: float, log_func) -> bool:
         """Sell weakest positions (by PnL) until required_amount of cash is available."""
-        self._refresh_portfolio()
+        self.refresh_positions()
 
         if self._cash() >= float(required_amount):
             return True
@@ -427,10 +429,10 @@ class PortfolioManager:
             })
 
             if cash >= float(required_amount):
-                self._refresh_portfolio()
+                self.refresh_positions()
                 return True
 
-        self._refresh_portfolio()
+        self.refresh_positions()
         return self._cash() >= float(required_amount)
 
     def _update_position_analytics(self, position, wang_result: Optional[dict]) -> None:
@@ -463,7 +465,7 @@ class PortfolioManager:
         }
 
     def manage_portfolio(self, log_func):
-        self._refresh_portfolio()
+        self.refresh_positions()
 
         for position in list(self.bridge.current_portfolio):
             # ENABLE_ARBITRAGE kill switch: while arbitrage is disabled, no
@@ -510,4 +512,4 @@ class PortfolioManager:
                 self._exit_position(position, "EV-CONVERGENCE", self.min_hold_ev,
                                     {"estimated_ev": round(estimated_hold_ev, 4)}, log_func)
 
-        self._refresh_portfolio()
+        self.refresh_positions()

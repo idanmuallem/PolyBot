@@ -73,16 +73,14 @@ class Gate:
     def __init__(
         self,
         ledger,
-        venue: Optional[Callable[[], str]] = None,
+        venue_name_fn: Optional[Callable[[], str]] = None,
     ):
-        """`ledger` may be None (nothing is held). `venue()` names the
-        active venue ("paper" | "live"); when given, holdings recorded on the
-        other venue don't count."""
+        """`ledger` may be None (nothing is held). `venue_name_fn()` names
+        the active venue ("paper" | "live"); when given, holdings recorded
+        on the other venue don't count."""
         self._ledger = ledger
-        self._venue = venue
-        self.MAX_EXIT_ATTEMPTS = MAX_EXIT_ATTEMPTS
+        self._venue_name_fn = venue_name_fn
         self._exit_attempts: dict = {}  # token_id -> consecutive failed sells
-        self.EXIT_COOLDOWN_HOURS = EXIT_COOLDOWN_HOURS
         self._exit_cooldowns: dict = {}  # token_id -> earliest re-entry time (UTC)
 
     # ------------------------------------------------------------------
@@ -140,7 +138,7 @@ class Gate:
         selling, and reports the outcome with `record_exit_attempt`."""
         token = _token_of(position)
         attempts = self._exit_attempts.get(token, 0)
-        if token and attempts >= self.MAX_EXIT_ATTEMPTS:
+        if token and attempts >= MAX_EXIT_ATTEMPTS:
             return Skip(EXIT_ATTEMPTS_EXHAUSTED, {"attempts": attempts})
         return Ok()
 
@@ -154,12 +152,12 @@ class Gate:
             self._exit_attempts.pop(token, None)
             if reason not in NO_COOLDOWN_REASONS:
                 self._exit_cooldowns[token] = (
-                    datetime.now(timezone.utc) + timedelta(hours=self.EXIT_COOLDOWN_HOURS)
+                    datetime.now(timezone.utc) + timedelta(hours=EXIT_COOLDOWN_HOURS)
                 )
             return False
         attempts = self._exit_attempts.get(token, 0) + 1
         self._exit_attempts[token] = attempts
-        return attempts == self.MAX_EXIT_ATTEMPTS
+        return attempts == MAX_EXIT_ATTEMPTS
 
     def exit_cooldown_until(self, token_id: str) -> Optional[datetime]:
         """When the token's post-exit cooldown ends, or None if it has none.
@@ -174,7 +172,7 @@ class Gate:
     def _open_holdings(self) -> list:
         if self._ledger is None:
             return []
-        venue = self._venue() if self._venue is not None else None
+        venue = self._venue_name_fn() if self._venue_name_fn is not None else None
         return self._ledger.open_positions(venue=venue)
 
     class _Holdings:

@@ -175,8 +175,10 @@ def log_placement_failed(
         log_func("EXECUTION-ERROR", "Portfolio", token_id, {"reason": reason, **detail})
 
 
-def paper_shares(usd: float, price: Optional[float]) -> Optional[float]:
-    """Shares *usd* buys at *price*, floored to 2 decimals; None without a price."""
+def whole_cent_shares(usd: float, price: Optional[float]) -> Optional[float]:
+    """Shares *usd* buys at *price*, floored to whole cents of a share (so
+    never over budget); None without a price. The one share-rounding rule:
+    every venue, the executor and the pipeline size orders with it."""
     if not price or float(price) <= 0:
         return None
     return math.floor((float(usd) / float(price)) * 100.0) / 100.0
@@ -186,7 +188,7 @@ def log_paper_buy(
     log_func: Optional[Callable], token_id: str, side: str, usd: float, price: Optional[float],
 ) -> None:
     """The DRY-RUN row a paper venue writes for every buy it attempts."""
-    shares = paper_shares(usd, price)
+    shares = whole_cent_shares(usd, price)
     print(f"[DRY-RUN] Would buy {shares} of {token_id} ({side}) for ${usd}.")
     if log_func is not None:
         log_func("DRY-RUN", "Portfolio", token_id, {

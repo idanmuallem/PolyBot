@@ -98,8 +98,8 @@ def test_closed_position_no_longer_blocks(ledger):
 def test_holdings_on_the_other_venue_do_not_block(ledger):
     _buy(ledger, "tok1", "YES", venue="paper")
 
-    assert isinstance(Gate(ledger, venue=lambda: "live").can_enter(_market()), Ok)
-    assert isinstance(Gate(ledger, venue=lambda: "paper").can_enter(_market()), Skip)
+    assert isinstance(Gate(ledger, venue_name_fn=lambda: "live").can_enter(_market()), Ok)
+    assert isinstance(Gate(ledger, venue_name_fn=lambda: "paper").can_enter(_market()), Skip)
 
 
 def test_no_ledger_holds_nothing():

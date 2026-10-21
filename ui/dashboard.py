@@ -362,7 +362,7 @@ def _render_equity_chart() -> None:
 # white/grey flash. Riding the same 2s live_fragment as the rest of the
 # dashboard meant that flash fired every 2s. Its underlying data can't
 # change that fast anyway — paper snapshots are only written every ~3
-# minutes (see PortfolioManager._refresh_portfolio()'s 180s throttle) — so
+# minutes (see PortfolioManager.refresh_positions()'s 180s throttle) — so
 # it gets its own slower-refreshing fragment instead. Nested fragments
 # rerun independently of their parent in Streamlit >= 1.37, so this cuts
 # the flicker rate ~30x without restructuring the rest of the live loop.

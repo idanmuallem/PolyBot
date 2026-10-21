@@ -2,19 +2,29 @@
 Trade execution engine: order sizing, gating and logging on top of a Venue.
 
 The executor trades on one Venue at a time (trading/venue.py): a PaperVenue
-in paper mode, a ClobVenue in live mode. It never branches on the mode
+in Dry run, a ClobVenue in Live run. It never branches on the trading mode
 itself; dry_run only reports which Venue is active.
 """
 
 import asyncio
 import logging
-import math
 import time
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, Callable, List
 
 from core.models import MarketData, Position, PRICE_FLOOR, PRICE_CEILING
 from core.trading_config import TradingConfig
-from trading.venue import LimitOrder, MarketRef, Venue, normalize_side, side_price
+from trading.venue import LimitOrder, MarketRef, Venue, normalize_side, side_price, whole_cent_shares
+
+
+@dataclass(frozen=True)
+class PlacedEntry:
+    """A model entry the Venue accepted: the token bought (the NO token for
+    a NO entry), at the side's price, for whole-cent shares of the bet."""
+    token_id: str
+    side: str
+    price: float
+    shares: float
 
 
 def _with_asset_type(log_func: Callable, asset_type: str) -> Callable:
@@ -32,26 +42,33 @@ def _order_rows(log_func: Callable, asset_type: str, **defaults) -> Callable:
     return _log
 
 
-def _venue_name(venue: Any) -> str:
-    return getattr(venue, "name", "paper")
-
-
 class TradeExecutor:
     """Gates, sizes and places trades on the active Venue.
 
-    venue is the Venue traded on now. The pipeline owns which Venue that is
-    and swaps it at a tick boundary (SequentialTradingPipeline
-    ._apply_mode_request()); the executor never switches it itself.
+    `venue` is the Venue traded on now. The pipeline owns which Venue that
+    is and swaps it at a tick boundary (SequentialTradingPipeline
+    ._apply_mode_request()): it hands the executor its own reference with
+    trade_on(), so the executor holds no copy that could go stale. Until
+    then (a bare executor, as in tests) it trades on the Venue it was built
+    with.
     """
 
     def __init__(self, config: TradingConfig, venue: Venue):
         self.config = config
-        self.venue = venue
+        self._active_venue: Callable[[], Venue] = lambda: venue
+
+    def trade_on(self, active_venue: Callable[[], Venue]) -> None:
+        """Trade on whatever Venue *active_venue()* returns at each call."""
+        self._active_venue = active_venue
+
+    @property
+    def venue(self) -> Venue:
+        return self._active_venue()
 
     @property
     def dry_run(self) -> bool:
-        """True while trading on a paper venue."""
-        return _venue_name(self.venue) != "live"
+        """True while trading on a paper venue (Dry run)."""
+        return self.venue.name != "live"
 
     def get_balance(self) -> float:
         """Deployable cash on the active venue."""
@@ -65,7 +82,6 @@ class TradeExecutor:
         self,
         token_id: str,
         current_poly_price: float,
-        shares: float,
         bet_amount: float,
         asset_type: str,
         side: str,
@@ -112,7 +128,7 @@ class TradeExecutor:
 
     async def _execute_limit_arbitrage_group(
         self, legs: List[Dict[str, Any]], timeout_seconds: float, log_func: Callable,
-        strategy_tag: str, asset_type: str, group_id: Optional[str],
+        asset_type: str, group_id: Optional[str],
     ) -> Dict[str, Any]:
         """Arbitrage execution via limit orders on self.venue: submit every
         leg, poll with a bounded async loop, collect fills as they land,
@@ -208,7 +224,6 @@ class TradeExecutor:
         legs: List[Dict[str, Any]],
         timeout_seconds: float,
         log_func: Callable,
-        strategy_tag: str = "arbitrage",
     ) -> Dict[str, Any]:
         """Place limit orders for every leg of an arbitrage group, wait up
         to timeout_seconds for fills, then settle the group:
@@ -236,7 +251,7 @@ class TradeExecutor:
         group_id = legs[0].get("group_id")
 
         return await self._execute_limit_arbitrage_group(
-            legs, float(timeout_seconds), log_func, strategy_tag, asset_type, group_id,
+            legs, float(timeout_seconds), log_func, asset_type, group_id,
         )
 
     def evaluate_and_execute(
@@ -248,11 +263,11 @@ class TradeExecutor:
         bet_amount_usd: float,
         side: str,
         log_func: Callable,
-        strategy_tag: str = "crypto",
-    ) -> bool:
-        """Gate on EV + price bounds, then fire the order. Daily spend and
-        trade-count limits are the Account's (Account.reserve()), checked by
-        the caller before sizing."""
+    ) -> Optional[PlacedEntry]:
+        """Gate on EV + price bounds, then fire the order. The PlacedEntry
+        if the Venue accepted it, else None. Daily spend and trade-count
+        limits are the Account's (Account.reserve()), checked by the caller
+        before sizing."""
         asset_type = market.asset_type
         token_id = market.market_id
         execution_side = normalize_side(side)
@@ -264,10 +279,10 @@ class TradeExecutor:
             execution_fair_value = 1.0 - float(fair_value)
 
         if ev < self.config.min_ev:
-            return False
+            return None
 
         if not self._validate_market(market, log_func):
-            return False
+            return None
 
         if execution_price < PRICE_FLOOR or execution_price > PRICE_CEILING:
             log_func("EXECUTION", asset_type, execution_token_id, {
@@ -277,18 +292,18 @@ class TradeExecutor:
                 "price_floor": PRICE_FLOOR,
                 "price_ceiling": PRICE_CEILING,
             })
-            return False
+            return None
 
         if execution_price <= 0:
             log_func("EXECUTION", asset_type, execution_token_id,
                      f"Invalid market price for execution: {execution_price}")
-            return False
+            return None
 
-        shares = math.floor((bet_amount_usd / execution_price) * 100.0) / 100.0
-        if shares <= 0:
+        shares = whole_cent_shares(bet_amount_usd, execution_price)
+        if not shares or shares <= 0:
             log_func("EXECUTION", asset_type, execution_token_id,
                      f"Calculated zero shares for bet_amount_usd={bet_amount_usd}")
-            return False
+            return None
 
         log_func("AUTO-TRADE", asset_type, execution_token_id, {
             "market_price": execution_price,
@@ -302,7 +317,6 @@ class TradeExecutor:
         executed = self.execute_trade(
             token_id=token_id,
             current_poly_price=float(current_poly_price),
-            shares=shares,
             bet_amount=bet_amount_usd,
             asset_type=asset_type,
             side=execution_side,
@@ -311,7 +325,10 @@ class TradeExecutor:
             condition_id=getattr(market, "condition_id", None),
             slug=getattr(market, "slug", None),
         )
-        return bool(executed)
+        if not executed:
+            return None
+        return PlacedEntry(token_id=execution_token_id, side=execution_side,
+                           price=execution_price, shares=shares)
 
     def _validate_market(self, market: MarketData, log_func: Callable) -> bool:
         for field_name, field_value in [

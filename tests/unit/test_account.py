@@ -19,7 +19,7 @@ def ledger(tmp_path):
 
 def _account(venue, ledger=None, bridge=None, max_drawdown_pct=0.20, log=None):
     return Account(
-        venue=lambda: venue,
+        active_venue=lambda: venue,
         bridge=bridge if bridge is not None else DataBridge(),
         ledger=ledger,
         max_drawdown_pct=max_drawdown_pct,
@@ -191,7 +191,7 @@ def test_refresh_follows_the_active_venue():
     switching swaps it between ticks)."""
     paper, live = FakeVenue(cash=100.0), FakeVenue(cash=40.0)
     active = {"venue": paper}
-    account = Account(venue=lambda: active["venue"], bridge=DataBridge())
+    account = Account(active_venue=lambda: active["venue"], bridge=DataBridge())
     assert account.refresh().cash == pytest.approx(100.0)
 
     active["venue"] = live
@@ -205,7 +205,7 @@ def test_switching_venue_starts_the_drawdown_baseline_from_the_new_venues_equity
     live.name = "live"
     active = {"venue": paper}
     log = []
-    account = Account(venue=lambda: active["venue"], bridge=DataBridge(),
+    account = Account(active_venue=lambda: active["venue"], bridge=DataBridge(),
                       log_func=lambda level, *a: log.append(level))
     account.refresh()
 

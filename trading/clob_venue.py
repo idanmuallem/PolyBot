@@ -6,21 +6,22 @@ price, cash is the CLOB collateral balance, and open positions come from
 the Data API for the proxy wallet.
 
 Build one with ClobVenue.from_config(); it raises ClobUnavailable when no
-usable client can be built, so live mode fails at startup instead of
+usable client can be built, so Live run fails at startup instead of
 reporting fake trades. Tests inject a stub client (tests/unit/test_clob_venue.py).
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import requests
 from eth_utils import to_checksum_address
 
 from core.models import Position
-from trading.venue import FillReasons, LimitOrder, MarketRef, log_placement_failed, normalize_side
+from trading.venue import (
+    FillReasons, LimitOrder, MarketRef, log_placement_failed, normalize_side, whole_cent_shares,
+)
 
 try:
     from py_clob_client.client import ClobClient
@@ -65,11 +66,6 @@ def _pick_float(payload: Dict[str, Any], *keys: str) -> float:
         except Exception:
             continue
     return 0.0
-
-
-def _whole_cents_of_shares(usd: float, price: float) -> float:
-    """Shares *usd* buys at *price*, floored to 2 decimals (never over budget)."""
-    return math.floor((float(usd) / float(price)) * 100.0) / 100.0
 
 
 def is_valid_order_response(response: Any) -> bool:
@@ -133,7 +129,7 @@ class ClobVenue:
             client.set_api_creds(client.create_or_derive_api_creds())
         except Exception as exc:
             raise ClobUnavailable(f"could not derive CLOB API credentials: {exc}") from exc
-        print(f"[AUTH] Live CLOB client ready for proxy {config.proxy_address}")
+        logger.info(f"[AUTH] Live CLOB client ready for proxy {config.proxy_address}")
         return cls(client=client, proxy_address=config.proxy_address)
 
     # -- Venue port ---------------------------------------------------------
@@ -158,7 +154,7 @@ class ClobVenue:
                                 return _usd(balance_raw[key])
                     return _usd(balance_raw)
         except Exception as exc:
-            logging.warning(f"Live collateral balance fetch failed: {exc}")
+            logger.warning(f"Live collateral balance fetch failed: {exc}")
         return 0.0
 
     def open_positions(self) -> List[Position]:
@@ -174,10 +170,10 @@ class ClobVenue:
         except requests.exceptions.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
             if status_code != 404:
-                logging.debug(f"Data API positions HTTP error: {exc}")
+                logger.debug(f"Data API positions HTTP error: {exc}")
             return []
         except requests.exceptions.RequestException as exc:
-            logging.debug(f"Data API positions request error: {exc}")
+            logger.debug(f"Data API positions request error: {exc}")
             return []
 
         positions: List[Position] = []
@@ -192,7 +188,7 @@ class ClobVenue:
                 if position is not None:
                     positions.append(position)
         except Exception as exc:
-            logging.warning(f"Could not parse open positions: {exc}")
+            logger.warning(f"Could not parse open positions: {exc}")
         return positions
 
     def buy(
@@ -207,7 +203,7 @@ class ClobVenue:
         if not price or float(price) <= 0:
             logger.warning(f"[LIVE] No price for {token_id} -- not placing a buy")
             return False
-        shares = _whole_cents_of_shares(usd, price)
+        shares = whole_cent_shares(usd, price)
 
         order_resp = self._submit_order(token_id, float(price), BUY, shares)
         if not is_valid_order_response(order_resp):
@@ -216,7 +212,7 @@ class ClobVenue:
                 "response": order_resp, "side": execution_side,
                 "price": float(price), "shares": shares,
             }
-            logging.error(f"LIVE order rejected: {error_payload}")
+            logger.error(f"LIVE order rejected: {error_payload}")
             log("LIVE-TRADE-ERROR", "Portfolio", token_id, error_payload)
             return False
 
@@ -243,7 +239,7 @@ class ClobVenue:
                 "error": "order_rejected_or_unconfirmed",
                 "response": order_resp, "price": price, "shares": shares,
             }
-            logging.error(f"SELL order rejected: {error_payload}")
+            logger.error(f"SELL order rejected: {error_payload}")
             log("SELL-ERROR", "Portfolio", token_id, error_payload)
             return False
 
@@ -261,7 +257,7 @@ class ClobVenue:
         CLOB's response."""
         token_id = market.token_for(side)
         if shares is None:
-            shares = _whole_cents_of_shares(usd, limit_price)
+            shares = whole_cent_shares(usd, limit_price) or 0.0
         order_resp = self._submit_order(token_id, float(limit_price), BUY, float(shares))
         order_id = _order_id(order_resp) if is_valid_order_response(order_resp) else None
         if order_id is None:
@@ -279,7 +275,7 @@ class ClobVenue:
             try:
                 status = self.client.get_order(order.id)
             except Exception as exc:
-                logging.warning(f"get_order failed for {order.id}: {exc}")
+                logger.warning(f"get_order failed for {order.id}: {exc}")
                 status = None
             filled[order.id] = (
                 _pick_float(status, "size_matched", "matched_size", "sizeMatched", "filled_size", "filledSize")
@@ -316,12 +312,12 @@ class ClobVenue:
         try:
             price = round(float(price), 2)
             size = round(float(size), 2)
-            print(f"[EXECUTION] Attempting {side} order: {size} shares at ${price}")
+            logger.info(f"[EXECUTION] Attempting {side} order: {size} shares at ${price}")
             return self.client.create_and_post_order(
                 OrderArgs(token_id=token_id, price=price, side=side, size=size)
             )
         except Exception as exc:
-            print(f"[LIVE-TRADE-ERROR] {token_id} - {exc}")
+            logger.error(f"[LIVE-TRADE-ERROR] {token_id} - {exc}")
             return None
 
 

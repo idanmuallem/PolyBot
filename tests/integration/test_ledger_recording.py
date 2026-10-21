@@ -20,6 +20,7 @@ from polymarket import PolymarketScannerHunter
 from trading.executor import TradeExecutor
 from trading.fake_venue import FakeVenue
 from trading.venue import MarketRef
+from trading.gate import MAX_EXIT_ATTEMPTS
 from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
 
@@ -160,7 +161,7 @@ def _portfolio(tmp_path, positions, dry_run=True):
     ledger = Ledger(db)
     config = TradingConfig(trading_mode="dry_run", take_profit_pct=0.5, stop_loss_pct=-0.5)
     executor = MagicMock()
-    executor.dry_run = dry_run
+    executor.venue.name = "paper" if dry_run else "live"
     executor.get_open_positions.return_value = positions
     executor.get_balance.return_value = 100.0
     bridge = DataBridge()
@@ -245,7 +246,7 @@ def test_live_position_given_up_after_max_attempts_is_recorded_as_one_expiry(tmp
                         price=0.40, venue="live", strategy="crypto")
     executor.sell_position.return_value = False
 
-    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS + 2):
+    for _ in range(MAX_EXIT_ATTEMPTS + 2):
         pm.manage_portfolio(lambda *a: None)
 
     expiries = [t for t in ledger.transactions() if t["kind"] == "EXPIRED"]

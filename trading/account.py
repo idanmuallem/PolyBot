@@ -63,7 +63,7 @@ class Refused:
 class Account:
     def __init__(
         self,
-        venue: Callable[[], object],
+        active_venue: Callable[[], object],
         bridge,
         ledger=None,
         max_drawdown_pct: float = 0.20,
@@ -71,7 +71,7 @@ class Account:
         config: Optional[TradingConfig] = None,
     ):
         self._config = config if config is not None else TradingConfig()
-        self._venue = venue
+        self._active_venue = active_venue
         self._bridge = bridge
         self._ledger = ledger
         self._max_drawdown_pct = float(max_drawdown_pct)
@@ -211,7 +211,7 @@ class Account:
         equity and the drawdown breaker, and publish the snapshot. A Venue
         read that fails keeps the last known value for that field."""
         prev = self._snapshot
-        venue = self._venue()
+        venue = self._active_venue()
 
         cash = prev.cash
         try:

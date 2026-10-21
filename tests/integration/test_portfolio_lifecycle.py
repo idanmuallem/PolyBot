@@ -28,7 +28,7 @@ def _make_components(cash=50.0, take_profit=0.20, stop_loss=-0.50):
         daily_limit_usd=15.0,
     )
     executor = TradeExecutor(config=config, venue=venue)
-    account = Account(venue=lambda: executor.venue, bridge=bridge, config=config)
+    account = Account(active_venue=lambda: executor.venue, bridge=bridge, config=config)
     pm = PortfolioManager(bridge=bridge, executor=executor, config=config, account=account)
     return pm, account, venue
 

@@ -74,7 +74,7 @@ def test_no_name_error_on_auto_trade_log():
         log_func=lambda level, *a, **kw: log_calls.append(level),
     )
 
-    assert result is True
+    assert result
     assert "AUTO-TRADE" in log_calls
     assert "DRY-RUN" in log_calls
 
@@ -95,7 +95,7 @@ def test_ev_at_threshold_is_allowed():
         side="YES",
         log_func=lambda *a, **kw: None,
     )
-    assert result is True
+    assert result
 
 
 def test_ev_below_threshold_is_rejected():
@@ -111,7 +111,7 @@ def test_ev_below_threshold_is_rejected():
         side="YES",
         log_func=lambda *a, **kw: None,
     )
-    assert result is False
+    assert result is None
 
 
 # ── Price bounds ──────────────────────────────────────────────────────────────
@@ -130,7 +130,7 @@ def test_price_below_floor_rejected():
         side="YES",
         log_func=lambda level, *a, **kw: log_calls.append(level),
     )
-    assert result is False
+    assert result is None
     assert "EXECUTION" in log_calls
 
 
@@ -148,7 +148,7 @@ def test_price_above_ceiling_rejected():
         side="YES",
         log_func=lambda level, *a, **kw: log_calls.append(level),
     )
-    assert result is False
+    assert result is None
     assert "EXECUTION" in log_calls
 
 
@@ -168,7 +168,7 @@ def test_no_side_flips_price_to_complement():
         side="NO",
         log_func=lambda level, *a, **kw: log_calls.append(level),
     )
-    assert result is False
+    assert result is None
 
 
 def test_no_side_uses_no_token_id():
@@ -208,7 +208,7 @@ def test_dry_run_returns_true_and_logs():
         side="YES",
         log_func=lambda level, *a, **kw: log_calls.append(level),
     )
-    assert result is True
+    assert result
     assert "DRY-RUN" in log_calls
 
 
@@ -267,7 +267,7 @@ def test_dry_run_yes_buy_fills_on_the_venue():
     venue = _listed_venue(yes_price=0.50)
     executor = _make_executor(venue=venue)
 
-    assert _evaluate(executor, side="YES", bet=2.0) is True
+    assert _evaluate(executor, side="YES", bet=2.0)
 
     assert venue.fills == [("buy", "tok1", pytest.approx(4.0), 2.0)]
 
@@ -285,7 +285,7 @@ def test_dry_run_no_buy_trades_the_no_token_through_the_venue():
         log_func=lambda level, asset, token, payload: log_rows.append((level, token, payload)),
     )
 
-    assert result is True
+    assert result
     assert venue.fills == [("buy", "tok1_no", pytest.approx(5.0), 3.0)]
     dry_run = [(token, payload) for level, token, payload in log_rows if level == "DRY-RUN"]
     assert dry_run[0][0] == "tok1_no"
@@ -299,7 +299,7 @@ def test_dry_run_buy_the_venue_refuses_is_not_reported_as_success():
     executor = _make_executor(venue=FakeVenue(cash=1000.0))  # tok1 not listed: unfillable
     log_calls = []
 
-    assert _evaluate(executor, log_calls=log_calls) is False
+    assert _evaluate(executor, log_calls=log_calls) is None
     assert "DRY-RUN" in log_calls  # the attempt itself isn't hidden
 
 
@@ -315,7 +315,7 @@ class _ExplodingVenue:
 
 def test_dry_run_venue_raising_on_buy_does_not_raise_but_reports_failure():
     executor = _make_executor(venue=_ExplodingVenue())
-    assert _evaluate(executor) is False
+    assert _evaluate(executor) is None
 
 
 # ── Dry-run sells go through the Venue ────────────────────────────────────────
@@ -427,7 +427,7 @@ def test_live_buy_posts_the_order_and_logs_live_trade_under_the_market_asset_typ
         log_func=lambda level, asset, token, payload: rows.append((level, asset, token)),
     )
 
-    assert result is True
+    assert result
     assert client.orders == [("tok1_no", 0.6, "BUY", 5.0)]
     assert ("LIVE-TRADE", "Crypto::BTCUSDT", "tok1_no") in rows
 
@@ -436,7 +436,7 @@ def test_live_rejected_buy_is_not_a_trade():
     executor, client = _live_executor({})
     client.order_response = {"error": "insufficient_funds"}
 
-    assert _evaluate(executor) is False
+    assert _evaluate(executor) is None
 
 
 def test_live_sell_posts_a_sell_at_the_given_price():
@@ -628,3 +628,28 @@ def test_paper_arbitrage_keeps_its_own_reasons():
     venue = _arb_venue({"A": 0.30})
     rows = _run_arb_logged(_make_executor(venue=venue), [_leg("A", 0.30, 3.0)])
     assert _reasons(rows, "ARBITRAGE-FILL") == ["all_legs_filled_via_limit_order"]
+
+
+# ── An entry reports what was ordered: the Ledger records exactly that ───────
+
+def test_an_entry_reports_the_token_side_price_and_shares_ordered():
+    from trading.executor import PlacedEntry
+    executor = _make_executor(venue=_listed_venue(yes_price=0.40))
+
+    entry = _evaluate(executor, side="NO", price=0.40, bet=3.0)
+
+    assert entry == PlacedEntry(token_id="tok1_no", side="NO", price=pytest.approx(0.60), shares=5.0)
+
+
+def test_a_refused_entry_reports_nothing():
+    from trading.fake_venue import FakeVenue
+    executor = _make_executor(venue=FakeVenue(cash=1000.0))  # tok1 not listed
+
+    assert _evaluate(executor) is None
+
+
+def test_shares_are_whole_cents_never_over_budget():
+    from trading.venue import whole_cent_shares
+    assert whole_cent_shares(1.0, 0.3) == 3.33
+    assert whole_cent_shares(3.0, 0.6) == 5.0
+    assert whole_cent_shares(1.0, 0) is None

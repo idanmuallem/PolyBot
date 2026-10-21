@@ -8,7 +8,6 @@ Pipeline order per loop:
 """
 
 import asyncio
-import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -23,7 +22,7 @@ from trading.account import Account, Refused
 from trading.gate import Skip
 from trading.kelly import kelly_bet_size
 from trading.strategies import EventSumStrategy, Strategy
-from trading.venue import MarketRef, normalize_side
+from trading.venue import MarketRef, whole_cent_shares
 from ui import data_manager
 
 
@@ -107,13 +106,16 @@ class SequentialTradingPipeline:
         self.hunter = ctx.scanner
 
         # The pipeline owns the active Venue: every Venue this wallet can
-        # trade on, by name, and the one the executor trades on now. A mode
-        # change from the dashboard swaps it at a tick boundary (see
-        # _apply_mode_request()), so no tick runs half-paper, half-live.
-        self.venue = getattr(self.executor, "venue", None)
+        # trade on, by name, and the one traded on now. A mode change from
+        # the dashboard swaps it at a tick boundary (see
+        # _apply_mode_request()), so no tick runs half Dry run, half Live
+        # run. self.venue is the only reference: the executor, the Account
+        # and (through the executor) the Gate and PortfolioManager all read
+        # it, and its `name` is the venue tag on every Ledger row.
+        self.venue = self.executor.venue
+        self.executor.trade_on(lambda: self.venue)
         self.venues = dict(getattr(ctx, "venues", None) or {})
-        if self.venue is not None:
-            self.venues.setdefault(self.venue.name, self.venue)
+        self.venues.setdefault(self.venue.name, self.venue)
         self._refused_mode: str | None = None
         self._last_resolve_check_at = 0.0
         self._last_drift = None  # last logged Venue/Ledger drift (see _reconcile())
@@ -157,7 +159,7 @@ class SequentialTradingPipeline:
         # cash with it. Exits that need fresh cash (free_up_capital) read it
         # through the same Account.
         self.account = Account(
-            venue=lambda: self.venue,
+            active_venue=lambda: self.venue,
             bridge=self.bridge,
             ledger=self.ledger,
             max_drawdown_pct=float(getattr(self.config, "max_drawdown_pct", 0.20)),
@@ -176,7 +178,7 @@ class SequentialTradingPipeline:
         """Refresh the positions list risk works from, then the Account
         (cash, equity, drawdown breaker) from the active Venue."""
         try:
-            self.portfolio_manager._refresh_portfolio()
+            self.portfolio_manager.refresh_positions()
         except Exception as exc:
             self.log_func("SYNC-WARN", "Pipeline", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
         self.account.refresh()
@@ -411,8 +413,8 @@ class SequentialTradingPipeline:
 
         legs = []
         for signal in missing_signals:
-            shares = math.floor((signal.bet_amount_usd / signal.price) * 100.0) / 100.0
-            if shares <= 0:
+            shares = whole_cent_shares(signal.bet_amount_usd, signal.price)
+            if not shares or shares <= 0:
                 continue
             legs.append({
                 "token_id": self._leg_token_id(signal),
@@ -431,7 +433,6 @@ class SequentialTradingPipeline:
             legs=legs,
             timeout_seconds=float(getattr(self.config, "arbitrage_order_timeout_seconds", 60.0)),
             log_func=tagged_log,
-            strategy_tag="arbitrage",
         )
 
         fills: dict = dict(result.get("fills") or {})
@@ -895,23 +896,19 @@ class SequentialTradingPipeline:
             "desired_bet": desired_bet,
         }
 
-    def _record_model_entry(self, candidate: CandidateTrade, approved_bet: float) -> None:
-        """Record one model entry fill in the Ledger, with its entry details.
-        Token, price and shares mirror TradeExecutor.evaluate_and_execute():
-        a NO-side buy is of the NO token at 1 - YES price."""
+    def _record_model_entry(self, candidate: CandidateTrade, entry) -> None:
+        """Record one model entry in the Ledger, with its entry details.
+        Token, side, price and shares are what the executor placed
+        (TradeExecutor.evaluate_and_execute()'s PlacedEntry)."""
         if self.ledger is None:
             return
-        side = normalize_side(candidate.side)
-        token_id = MarketRef.from_market(candidate.market).token_for(side)
-        price = float(candidate.entry_price)
-        shares = math.floor((float(approved_bet) / price) * 100.0) / 100.0 if price > 0 else 0.0
         self.ledger.record_entry(
-            token_id=token_id,
+            token_id=entry.token_id,
             condition_id=getattr(candidate.market, "condition_id", None),
-            side=side,
-            shares=shares,
-            price=price,
-            venue=self._ledger_venue(),
+            side=entry.side,
+            shares=entry.shares,
+            price=entry.price,
+            venue=self.venue.name,
             strategy="crypto",
             asset_type=candidate.asset_type,
             market_name=candidate.question,
@@ -919,11 +916,6 @@ class SequentialTradingPipeline:
             post_prob=float(candidate.post_prob),
             wang_edge=candidate.wang_edge,
         )
-
-    def _ledger_venue(self) -> str:
-        """Ledger venue tag for a fill: the name ("paper" / "live") of the
-        active Venue."""
-        return getattr(self.venue, "name", "paper")
 
     def _apply_mode_request(self) -> None:
         """Tick boundary: trade on the Venue the dashboard asked for.
@@ -936,7 +928,7 @@ class SequentialTradingPipeline:
         request.
         """
         wanted = "live" if data_manager.read_live_trading_requested(self.db_path) else "paper"
-        current = getattr(self.venue, "name", None)
+        current = self.venue.name
         if wanted == current:
             self._refused_mode = None
             return
@@ -950,7 +942,6 @@ class SequentialTradingPipeline:
             return
         self._refused_mode = None
         self.venue = venue
-        self.executor.venue = venue
         self.log_func("MODE-SWITCH", "Engine", wanted, {"from": current, "to": wanted})
 
     def _record_arbitrage_entry(self, signal, group_id: str, filled_shares: float) -> None:
@@ -964,7 +955,7 @@ class SequentialTradingPipeline:
             side=signal.side,
             shares=filled_shares,
             price=float(signal.price),
-            venue=self._ledger_venue(),
+            venue=self.venue.name,
             strategy="arbitrage",
             asset_type=signal.market.asset_type,
             market_name=signal.market.market_name,
@@ -977,7 +968,7 @@ class SequentialTradingPipeline:
             return
         self.ledger.record_exit(
             token_id=token_id, shares=float(shares), price=float(signal.price), reason=reason,
-            venue=self._ledger_venue(), strategy="arbitrage", side=signal.side,
+            venue=self.venue.name, strategy="arbitrage", side=signal.side,
             market_name=signal.market.market_name,
         )
 
@@ -1105,7 +1096,7 @@ class SequentialTradingPipeline:
         )
 
     def _stage_execute(self, candidate: CandidateTrade, approved_bet: float, risk_context: dict):
-        executed = self.executor.evaluate_and_execute(
+        entry = self.executor.evaluate_and_execute(
             market=candidate.market,
             fair_value=float(candidate.post_prob),
             ev=float(candidate.final_ev),
@@ -1113,11 +1104,11 @@ class SequentialTradingPipeline:
             bet_amount_usd=float(approved_bet),
             side=candidate.side,
             log_func=self.log_func,
-            strategy_tag="crypto",
         )
+        executed = entry is not None
 
         if executed:
-            self._record_model_entry(candidate, approved_bet)
+            self._record_model_entry(candidate, entry)
             self.account.record_fill("crypto", float(approved_bet))
             account = self.account.refresh()
             total_equity = account.equity

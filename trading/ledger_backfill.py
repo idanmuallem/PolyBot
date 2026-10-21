@@ -46,6 +46,7 @@ import sqlite3
 from typing import Optional
 
 from trading.ledger import Ledger
+from trading.venue import whole_cent_shares
 
 MIGRATION = "hunt_history_backfill_v1"
 
@@ -167,7 +168,7 @@ class _Replay:
         shares = _num(fill.payload.get("shares")) or self.auto_shares.get(fill.token)
         if not shares:
             bet = _num(fill.payload.get("bet_amount_usd")) or _num(p.get("bet_usd")) or 0.0
-            shares = math.floor((bet / price) * 100.0) / 100.0
+            shares = whole_cent_shares(bet, price)
         if shares <= 0:
             return
         post_prob = next((_num(p.get(k)) for k in ("post_prob", "fair", "fair_value")

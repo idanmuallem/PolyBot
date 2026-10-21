@@ -8,7 +8,7 @@ from core.bridge import DataBridge
 from core.models import Position
 from core.trading_config import TradingConfig
 from core.wallet_context import WalletContext
-from trading.gate import Ok
+from trading.gate import MAX_EXIT_ATTEMPTS, Ok
 from trading.ledger import Ledger
 from trading.risk_manager import PortfolioManager
 
@@ -27,6 +27,7 @@ def _make_pm(take_profit=0.20, stop_loss=-0.50, min_hold_ev=-0.10, ledger=None):
     )
     ctx = WalletContext(wallet_id="test_wallet", config=config, bridge=bridge, db_path="test_wallet_trades.db")
     executor = MagicMock()
+    executor.venue.name = "paper"
     executor.get_open_positions.return_value = []
     pm = PortfolioManager(bridge=ctx.bridge, executor=executor, config=ctx.config,
                           db_path=ctx.db_path, ledger=ledger)
@@ -115,11 +116,11 @@ def test_exit_position_stops_retrying_after_max_attempts():
     log_calls = []
     log_func = lambda level, asset_type, token_id, payload: log_calls.append(payload)
 
-    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS + 5):
+    for _ in range(MAX_EXIT_ATTEMPTS + 5):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
 
-    assert executor.sell_position.call_count == pm.gate.MAX_EXIT_ATTEMPTS
-    assert len(log_calls) == pm.gate.MAX_EXIT_ATTEMPTS
+    assert executor.sell_position.call_count == MAX_EXIT_ATTEMPTS
+    assert len(log_calls) == MAX_EXIT_ATTEMPTS
     assert log_calls[-1]["gave_up_after_max_attempts"] is True
     assert "gave_up_after_max_attempts" not in log_calls[0]
 
@@ -130,30 +131,30 @@ def test_exit_position_retry_count_resets_after_a_successful_sell():
     log_func = lambda *a, **kw: None
 
     executor.sell_position.return_value = False
-    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS - 1):
+    for _ in range(MAX_EXIT_ATTEMPTS - 1):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
     executor.sell_position.return_value = True
     pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
 
     executor.sell_position.return_value = False
-    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS - 1):
+    for _ in range(MAX_EXIT_ATTEMPTS - 1):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {}, log_func)
     assert isinstance(pm.gate.can_exit(pos), Ok)
 
 
 def test_gave_up_in_live_mode_logs_expired_flag():
-    """Live mode's gave-up signal (unsellable — see __init__'s comment on
+    """Live run's gave-up signal (unsellable — see __init__'s comment on
     what a resolved/closed market looks like via the positions API) should
     surface as a visible EXPIRED row, not just silently stop retrying."""
     pm, bridge, executor = _make_pm()
-    executor.dry_run = False  # live mode
+    executor.venue.name = "live"
     pos = _pos(pnl_ratio=-1.0, token_id="dead_tok")
     executor.sell_position.return_value = False
 
     log_calls = []
     log_func = lambda level, asset_type, token_id, payload: log_calls.append((level, payload))
 
-    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS):
+    for _ in range(MAX_EXIT_ATTEMPTS):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
 
     expired_calls = [p for level, p in log_calls if level == "EXPIRED"]
@@ -164,19 +165,19 @@ def test_gave_up_in_live_mode_logs_expired_flag():
 
 
 def test_gave_up_in_dry_run_mode_does_not_log_expired():
-    """Paper mode's real resolutions are logged separately by
+    """Dry run's real resolutions are logged separately by
     PaperVenue.resolve_closed_markets(); a paper position that's merely
     unsellable (e.g. a broken token mapping — not a market resolution)
     should not be mislabeled EXPIRED here."""
     pm, bridge, executor = _make_pm()
-    executor.dry_run = True
+    executor.venue.name = "paper"
     pos = _pos(pnl_ratio=-1.0, token_id="dead_tok")
     executor.sell_position.return_value = False
 
     log_levels = []
     log_func = lambda level, *a, **kw: log_levels.append(level)
 
-    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS):
+    for _ in range(MAX_EXIT_ATTEMPTS):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
 
     assert "EXPIRED" not in log_levels
@@ -184,7 +185,7 @@ def test_gave_up_in_dry_run_mode_does_not_log_expired():
 
 def test_successful_live_exit_never_logs_expired():
     pm, bridge, executor = _make_pm()
-    executor.dry_run = False
+    executor.venue.name = "live"
     pos = _pos(pnl_ratio=-0.60, token_id="stop_tok")
     executor.sell_position.return_value = True
 
@@ -426,7 +427,7 @@ def test_get_book_asset_types_resolves_via_ledger(ledger):
     _enter(ledger, "tokB", asset_type="Weather::Miami")
     executor.get_open_positions.return_value = [pos_a, pos_b]
 
-    pm._refresh_portfolio()
+    pm.refresh_positions()
     asset_types = pm.get_book_asset_types()
 
     assert set(asset_types) == {"Crypto::BTCUSDT", "Weather::Miami"}
@@ -437,7 +438,7 @@ def test_correlation_exposure_for_averages_against_book(ledger):
     pos = _pos(token_id="tokA", price=0.5)
     _enter(ledger, "tokA", asset_type="Crypto::BTCUSDT")
     executor.get_open_positions.return_value = [pos]
-    pm._refresh_portfolio()
+    pm.refresh_positions()
 
     # Same market already open -> exposure to another BTC candidate is 1.0.
     assert pm.correlation_exposure_for("Crypto::BTCUSDT") == 1.0
@@ -448,7 +449,7 @@ def test_correlation_exposure_for_averages_against_book(ledger):
 def test_correlation_exposure_zero_with_no_open_positions():
     pm, bridge, executor = _make_pm()
     executor.get_open_positions.return_value = []
-    pm._refresh_portfolio()
+    pm.refresh_positions()
 
     assert pm.correlation_exposure_for("Crypto::BTCUSDT") == 0.0
 
@@ -580,7 +581,7 @@ def test_cull_and_swap_sales_start_the_post_exit_cooldown(ledger, path):
 
 def _live_dead_position(ledger):
     pm, bridge, executor = _make_pm(ledger=ledger)
-    executor.dry_run = False  # Live run
+    executor.venue.name = "live"
     executor.sell_position.return_value = False
     executor.get_balance.return_value = 0.0
     ledger.record_entry(token_id="dead_tok", condition_id="c", side="YES", shares=10.0, price=0.40,
@@ -598,7 +599,7 @@ def test_cull_that_gives_up_in_live_run_records_the_expiry(ledger):
     rows = []
     log_func = lambda level, asset_type, token_id, payload: rows.append((level, payload))
 
-    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS):
+    for _ in range(MAX_EXIT_ATTEMPTS):
         pm._liquidate_position_value(pos, log_func)
 
     [expired] = _expired(rows)
@@ -613,7 +614,7 @@ def test_free_up_capital_that_gives_up_in_live_run_records_the_expiry(ledger):
     rows = []
     log_func = lambda level, asset_type, token_id, payload: rows.append((level, payload))
 
-    for _ in range(pm.gate.MAX_EXIT_ATTEMPTS):
+    for _ in range(MAX_EXIT_ATTEMPTS):
         pm.free_up_capital(100.0, log_func)
 
     assert len(_expired(rows)) == 1
