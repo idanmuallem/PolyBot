@@ -11,7 +11,7 @@ import asyncio
 import math
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from brains import get_brain_for_asset_type
@@ -117,6 +117,11 @@ class SequentialTradingPipeline:
         self._refused_mode: str | None = None
         self._last_resolve_check_at = 0.0
         self._last_drift = None  # last logged Venue/Ledger drift (see _reconcile())
+        # Live entries are resting limit orders: a holding the CLOB has never
+        # shown is closed as unfilled after a grace period (see
+        # _close_unfilled_entries()). Only holdings opened since this start.
+        self._started_at = self.clock()
+        self._seen_on_venue: set[str] = set()
         # Typed trade record (trading/ledger.py). The engine is its only
         # writer; None (e.g. a bare test context) means not recording.
         self.ledger = getattr(ctx, "ledger", None)
@@ -1031,6 +1036,10 @@ class SequentialTradingPipeline:
             self.log_func("SYNC-WARN", "Pipeline", "reconcile", {"reason": "reconcile_failed", "error": str(exc)})
             return
 
+        self._seen_on_venue.update(t for t, n in venue_shares.items() if n > 0)
+        if self.venue.name == "live" and self._close_unfilled_entries(venue_shares):
+            ledger_shares = {h.token_id: float(h.shares) for h in self.ledger.open_positions(venue=self.venue.name)}
+
         venue_only = {t: n for t, n in venue_shares.items() if t not in ledger_shares and n > 0}
         ledger_only = {t: n for t, n in ledger_shares.items() if t not in venue_shares}
         mismatch = {
@@ -1048,6 +1057,37 @@ class SequentialTradingPipeline:
         elif previous is not None:
             self.log_func("RECONCILE-OK", "Pipeline", self.venue.name, {"venue": self.venue.name})
             self._last_drift = None
+
+    # How long a live entry may go unseen on the CLOB before it counts as
+    # never filled (the Data API lags fills by up to a minute or so).
+    _UNFILLED_GRACE = timedelta(minutes=5)
+
+    def _close_unfilled_entries(self, venue_shares: dict) -> bool:
+        """Close, as unfilled, the live model entries opened since this
+        engine started that the venue has never shown once the grace period
+        is over. ClobVenue.buy() posts a GTC limit order, and the CLOB's
+        response only says it was accepted, not that it filled; an order
+        that rests unfilled would otherwise stay a Ledger holding for ever.
+        Arbitrage legs are recorded from polled fills, so they are left
+        alone. True if anything was closed."""
+        now = self.clock()
+        closed = False
+        for h in self.ledger.open_positions(venue=self.venue.name):
+            if h.strategy != "crypto" or h.token_id in venue_shares or h.token_id in self._seen_on_venue:
+                continue
+            opened = _parse_utc(h.opened_at)
+            if opened is None or opened < self._started_at - timedelta(seconds=1):
+                continue
+            if now - opened < self._UNFILLED_GRACE:
+                continue
+            self.ledger.record_unfilled(token_id=h.token_id, venue=self.venue.name)
+            self.log_func("RECONCILE-UNFILLED", "Pipeline", h.token_id, {
+                "venue": self.venue.name, "shares": h.shares, "entry_price": h.entry_price,
+                "opened_at": h.opened_at,
+                "reason": "live entry order never showed up as a position on the venue",
+            })
+            closed = True
+        return closed
 
     def _record_resolution(self, resolved: dict, venue: str) -> None:
         """Record one market resolution reported by *venue* (see
@@ -1177,6 +1217,14 @@ class SequentialTradingPipeline:
             return
 
         self._stage_execute(candidate, approved_bet, risk_context)
+
+
+def _parse_utc(stamp: str) -> Optional[datetime]:
+    """A Ledger time ("YYYY-MM-DD HH:MM:SS", UTC) as an aware datetime."""
+    try:
+        return datetime.strptime(str(stamp), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
 
 
 def _default_log_func(ctx: WalletContext):

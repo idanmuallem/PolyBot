@@ -566,6 +566,8 @@ def _transaction_type_label(trade: dict) -> str:
         return "BUY"
     if trade["kind"] == "SELL":
         return _SELL_REASON_LABELS.get(trade.get("reason") or "", "SELL")
+    if trade["kind"] == "UNFILLED":
+        return "UNFILLED"  # a live entry order that never filled
     return "EXPIRED"  # RESOLVED (paid out) or EXPIRED (unconfirmed)
 
 

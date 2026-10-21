@@ -9,7 +9,8 @@ Two tables:
               until sold down to zero shares, resolved or expired.
   trades    — one row per trade event: an entry fill (BUY), a sale (SELL),
               a market resolution (RESOLVED) or an unconfirmed expiry
-              (EXPIRED). Every row is tagged with venue (paper | live) and
+              (EXPIRED), or a live entry order that never filled
+              (UNFILLED). Every row is tagged with venue (paper | live) and
               strategy tag (crypto | arbitrage).
 
 Authority split: the Venue is authoritative for share quantities and cash;
@@ -225,11 +226,24 @@ class Ledger:
             at=at,
         )
 
+    def record_unfilled(self, *, token_id: str, venue: str, at: Optional[str] = None) -> Optional[int]:
+        """Close the open holding for token_id as an entry order that never
+        filled: its whole size, no exit price and no realized P&L. Returns
+        the trade id, or None if nothing was open."""
+        holding = self.holding(token_id)
+        if holding is None:
+            return None
+        return self._close(
+            kind="UNFILLED", token_id=token_id, shares=holding.shares, price=None,
+            reason="UNFILLED", venue=venue, strategy=None, entry_price=None, side=None,
+            market_name=None, confirmed=False, at=at, closed_status="unfilled",
+        )
+
     def _close(
         self, *, kind: str, token_id: str, shares: float, price: Optional[float],
         reason: Optional[str], venue: str, strategy: Optional[str],
         entry_price: Optional[float], side: Optional[str], market_name: Optional[str],
-        confirmed: bool, at: Optional[str] = None,
+        confirmed: bool, at: Optional[str] = None, closed_status: Optional[str] = None,
     ) -> int:
         ts = at or _now()
         shares = float(shares)
@@ -263,7 +277,7 @@ class Ledger:
                 fully_closed = kind != "SELL" or remaining <= 1e-9
                 status = "open"
                 if fully_closed:
-                    status = "closed" if confirmed else "expired"
+                    status = closed_status or ("closed" if confirmed else "expired")
                 conn.execute(
                     "UPDATE positions SET shares = ?, status = ?, closed_at = ?, "
                     "realized_pnl = realized_pnl + ? WHERE id = ?",

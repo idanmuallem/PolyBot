@@ -185,3 +185,74 @@ async def test_unchanged_drift_is_logged_once_and_its_clearing_is_logged(tmp_pat
     await pipeline.tick()
 
     assert "RECONCILE-OK" in levels(rows)
+
+
+# ── Live run: entries the venue never shows are closed as unfilled ───────────
+# A live entry is a resting limit order: posting it is not a fill. A model
+# entry the CLOB never shows as a position is closed in the Ledger once a
+# grace period has passed, as unfilled (no P&L), so it isn't a phantom
+# holding.
+
+def _clocked_live_pipeline(tmp_path):
+    from datetime import datetime, timezone
+    now = {"t": datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)}
+    live = live_fake(cash=100.0)
+    pipeline, ctx, rows = make_tick_pipeline(tmp_path, live=live, active="live", clock=lambda: now["t"])
+    dm.write_live_trading_requested(ctx.db_path, True)
+    return pipeline, ctx, rows, live, now
+
+
+def _minutes(now, n):
+    from datetime import timedelta
+    now["t"] = now["t"] + timedelta(minutes=n)
+
+
+@pytest.mark.asyncio
+async def test_a_live_entry_the_venue_never_shows_is_closed_as_unfilled(tmp_path):
+    pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
+    ctx.ledger.record_entry(token_id="eth-yes", condition_id="0xeth", side="YES", shares=5.0, price=0.5,
+                            venue="live", strategy="crypto", at="2026-10-21 12:00:00")
+
+    _minutes(now, 1)
+    await pipeline.tick()
+    assert ctx.ledger.holding("eth-yes") is not None   # still inside the grace period
+
+    _minutes(now, 10)
+    await pipeline.tick()
+
+    assert ctx.ledger.holding("eth-yes") is None
+    [closed] = [t for t in ctx.ledger.transactions() if t["kind"] != "BUY"]
+    assert closed["kind"] == "UNFILLED"
+    assert closed["confirmed"] is False
+    assert closed["pnl_per_share"] is None
+    assert ctx.ledger.realized_pnl() == 0.0
+    assert "RECONCILE-UNFILLED" in levels(rows)
+
+
+@pytest.mark.asyncio
+async def test_a_live_entry_the_venue_has_shown_is_not_closed_as_unfilled(tmp_path):
+    pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
+    live.list_market(BTC, yes_price=0.40)
+    live.buy(BTC, "YES", 4.0)
+    ctx.ledger.record_entry(token_id="btc-yes", condition_id="0xbtc", side="YES", shares=10.0, price=0.4,
+                            venue="live", strategy="crypto", at="2026-10-21 12:00:00")
+    await pipeline.tick()                       # the venue shows it: it filled
+
+    live.sell("btc-yes", 10.0)                  # gone from the venue later (sold elsewhere)
+    _minutes(now, 30)
+    await pipeline.tick()
+
+    assert ctx.ledger.holding("btc-yes") is not None
+    assert "RECONCILE-UNFILLED" not in levels(rows)
+
+
+@pytest.mark.asyncio
+async def test_holdings_from_before_this_run_are_not_closed_as_unfilled(tmp_path):
+    pipeline, ctx, rows, live, now = _clocked_live_pipeline(tmp_path)
+    ctx.ledger.record_entry(token_id="eth-yes", condition_id="0xeth", side="YES", shares=5.0, price=0.5,
+                            venue="live", strategy="crypto", at="2026-10-20 08:00:00")
+
+    _minutes(now, 30)
+    await pipeline.tick()
+
+    assert ctx.ledger.holding("eth-yes") is not None
