@@ -111,6 +111,12 @@ jobs:
     # otherwise be destroyed, unflushed, by `docker rm`. Discovered via the
     # meta-harness's "Trade history not wiped" check catching a real
     # hunt_history row-count drop on an ordinary deploy.
+    #
+    # The container runs the image tagged with this commit's SHA, not
+    # `:latest`, so `docker ps` shows exactly which build is live. The prune
+    # is `docker image prune -a`, not `docker system prune -a`: it removes
+    # only images no container uses, so it never deletes the image another
+    # running container (e.g. Staging) is on.
     - name: Deploy to EC2 via AWS SSM
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -124,13 +130,13 @@ jobs:
             "docker exec polybot python3 config/ci/wal_checkpoint.py || true",
             "docker stop polybot || true",
             "docker rm polybot || true",
-            "docker system prune -a -f",
-            "docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest",
+            "docker image prune -a -f",
+            "docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}",
             "touch /home/ec2-user/trades.db",
             "chmod 666 /home/ec2-user/trades.db",
             "mkdir -p /home/ec2-user/paper_trading",
             "chmod 777 /home/ec2-user/paper_trading",
-            "docker run -d --name polybot --restart always --log-opt max-size=20m --log-opt max-file=3 -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db -v /home/ec2-user/paper_trading:/app/paper_trading --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+            "docker run -d --name polybot --restart always --log-opt max-size=20m --log-opt max-file=3 -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db -v /home/ec2-user/paper_trading:/app/paper_trading --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
           ]' \
           --query 'Command.CommandId' --output text)
         echo "SSM command ID: $COMMAND_ID"

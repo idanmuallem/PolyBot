@@ -450,8 +450,12 @@ Pushing to `main` triggers `.github/workflows/deploy.yml`:
 3. Starts the EC2 instance if stopped
 4. Deploys via AWS SSM (`docker compose pull && up -d`)
 
-The deploy step stops/removes the old container and prunes the Docker filesystem
-before starting the new one, so anything not explicitly volume-mounted is wiped
+The image is tagged with the commit SHA and the container runs that SHA-tagged
+image, so `docker ps` on the instance shows which commit is live.
+
+The deploy step stops/removes the old container and prunes unused Docker images
+(any image a container still uses is kept) before starting the new one, so
+anything not explicitly volume-mounted is wiped
 on every push. Two host paths are mounted into the container to survive that:
 `/home/ec2-user/trades.db` → `/app/trades.db` and `/home/ec2-user/paper_trading`
 → `/app/paper_trading` (the latter holds the paper engine's positions/balance
