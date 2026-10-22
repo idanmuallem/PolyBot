@@ -36,15 +36,58 @@ jobs:
     - name: Run test suite
       run: pytest
 
+  # Path filter: decides whether a push to main touched runtime code.
+  # Docs, Markdown, scripts/ and tests/-only pushes run `test` above and
+  # stop there (deploy and meta-harness show as skipped, so no failure
+  # email); anything else deploys. Plain git diff, no third-party action.
+  changes:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      runtime: ${{ steps.filter.outputs.runtime }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Detect runtime changes
+      id: filter
+      env:
+        BEFORE: ${{ github.event.before }}
+        AFTER: ${{ github.sha }}
+      run: |
+        # No usable "before" commit (new branch, force-push to an unknown
+        # commit): we can't tell what changed, so deploy to be safe.
+        if [ -z "$BEFORE" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+          echo "No usable before-commit ($BEFORE) - treating as a runtime change"
+          echo "runtime=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        CHANGED=$(git diff --name-only "$BEFORE" "$AFTER")
+        echo "Changed files:"
+        echo "$CHANGED"
+        RUNTIME=$(echo "$CHANGED" | grep -vE '^(docs/|scripts/|tests/)|\.md$' | grep -v '^$' || true)
+        if [ -n "$RUNTIME" ]; then
+          echo "Runtime files changed:"
+          echo "$RUNTIME"
+          echo "runtime=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "Only docs/Markdown/scripts/tests changed - skipping deploy"
+          echo "runtime=false" >> "$GITHUB_OUTPUT"
+        fi
+
   # Build/push/deploy only for an actual push to main — a PR or a push to
   # any other branch runs the `test` job above (via the on.push/pull_request
   # triggers) and stops there, same as before this workflow grew a test job.
   deploy:
-    needs: test
+    needs: [test, changes]
     # A custom `if:` on a job with `needs:` REPLACES the implicit success()
     # check GitHub would otherwise add — so `success()` has to be spelled
     # out here, or a failing `test` job would not actually block this one.
-    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # A skipped deploy also skips meta-harness (it needs deploy), so a
+    # docs-only push shows both as skipped and sends no failure email.
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-latest
     outputs:
       hunt_history_before: ${{ steps.pre_snapshot.outputs.count }}
