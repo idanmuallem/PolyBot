@@ -42,7 +42,8 @@ def _make_pipeline(config=None, balance=100.0, ledger=None):
     ctx.ledger = ledger
 
     log_calls = []
-    log_func = lambda level, *a, **kw: log_calls.append(level)
+    def log_func(level, *a, **kw):
+        return log_calls.append(level)
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):

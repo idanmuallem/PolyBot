@@ -33,7 +33,11 @@ jobs:
     - name: Install dependencies
       run: pip install --no-cache-dir -r config/requirements-dev.txt
 
+    - name: Lint with ruff
+      run: ruff check --output-format=github .
+
     - name: Run test suite
+      if: ${{ !cancelled() }}
       run: pytest
 
   # Path filter: decides whether a push to main touched runtime code.

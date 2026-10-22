@@ -320,6 +320,16 @@ cp config/.env config/.env.local   # or edit config/.env directly
 # Fill in POLYMARKET_PRIVATE_KEY and POLYMARKET_PROXY_ADDRESS
 ```
 
+### Pre-commit Hooks
+
+Install the git hooks once per clone (`pre-commit` comes with `config/requirements-dev.txt`):
+
+```bash
+pre-commit install
+```
+
+Every commit then runs four checks from `.pre-commit-config.yaml` and is rejected if any fails: leftover merge-conflict markers, files over 500 KB (so a local database like `trades.db` is never committed), private keys, and `ruff check` on the changed files. The ruff hook reads the same `ruff.toml` and ruff version as CI. Run them on every file with `pre-commit run --all-files`.
+
 ---
 
 ## Configuration

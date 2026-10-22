@@ -10,19 +10,19 @@ for _s in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-import threading
-import time
-from datetime import datetime, timedelta
+import threading  # noqa: E402
+import time  # noqa: E402
+from datetime import datetime, timedelta  # noqa: E402
 
-import pandas as pd
-import streamlit as st
+import pandas as pd  # noqa: E402
+import streamlit as st  # noqa: E402
 
-import ui.data_manager as data_manager
-from core.polymarket_client import PolymarketClient
-from core.bridge import get_bridge, DataBridge
-from core.runtime_env import get_env as _get_env, restore_wallet_state, validate_runtime_env
-from core.wallet_context import WalletContext
-from ui.components import (
+import ui.data_manager as data_manager  # noqa: E402
+from core.polymarket_client import PolymarketClient  # noqa: E402
+from core.bridge import get_bridge, DataBridge  # noqa: E402
+from core.runtime_env import get_env as _get_env, restore_wallet_state, validate_runtime_env  # noqa: E402
+from core.wallet_context import WalletContext  # noqa: E402
+from ui.components import (  # noqa: E402
     fmt_dollars, render_activity_chart, render_equity_curve,
     render_ev_chart, render_positions, render_transactions_table,
 )
