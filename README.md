@@ -454,12 +454,18 @@ persisted the same way, so paper positions/balance survive a container restart.
 
 ### GitHub Actions (CI/CD)
 
-Pushing to `main` triggers `.github/workflows/deploy.yml`:
+Pushing to `main` triggers `.github/workflows/deploy.yml`. A push that changes
+runtime code then goes through these jobs, each waiting for the one before:
 
-1. Builds the Docker image
-2. Pushes to Amazon ECR (`eu-north-1`)
-3. Starts the EC2 instance if stopped
-4. Deploys via AWS SSM (`docker compose pull && up -d`)
+1. `build`: builds the Docker image and pushes it to Amazon ECR (`eu-north-1`)
+2. `deploy-staging`: starts the EC2 instance if stopped and replaces the
+   Staging container (see below)
+3. `verify-staging`: runs the meta-harness against Staging
+4. `deploy-production`: replaces the Production container via AWS SSM
+5. `meta-harness`: runs the meta-harness against Production
+
+If any of them fails, the jobs after it are skipped (so a failing Staging check
+stops Production) and the owner gets a failure email.
 
 The image is tagged with the commit SHA and the container runs that SHA-tagged
 image, so `docker ps` on the instance shows which commit is live.
@@ -472,6 +478,40 @@ on every push. Two host paths are mounted into the container to survive that:
 → `/app/paper_trading` (the latter holds the paper engine's positions/balance
 and the token→slug map — losing it silently resets the paper equity curve and
 orphans open paper positions on every deploy).
+
+### Staging
+
+Staging is a second container, `polybot-staging`, on the same EC2 instance as
+Production. It runs the same SHA-tagged image Production will get, with:
+
+- its dashboard on port **8502** (`http://<elastic IP>:8502`), open only to the
+  owner's IP
+- the env file `/home/ec2-user/.env.staging`, plus `DEPLOYMENT_ENV=staging`
+  set by the deploy. With that marker the bot refuses to start in Live run
+- no wallet key. The deploy refuses to run if the Staging env file sets one
+- its own trade database and paper directory under `/home/ec2-user/staging/`,
+  wiped on every Staging deploy. They are bind-mounted, so they survive a
+  container restart within a run
+
+The meta-harness runs against Staging without the "Trade history not wiped"
+check, since Staging's history is wiped on purpose. Its dashboard check runs on
+the instance itself, since port 8502 is closed to GitHub's runners.
+
+**Owner's one-time manual steps** (the pipeline cannot do these):
+
+1. In the EC2 security group, add an inbound rule for TCP port 8502 with your
+   own IP as the source (`<your IP>/32`), not `0.0.0.0/0`.
+2. On the instance, create `/home/ec2-user/.env.staging` with Dry run and no
+   wallet key. Start from a copy of Production's `.env`, then remove
+   `POLYMARKET_PRIVATE_KEY` / `POLYGON_PRIVATE_KEY` and set
+   `TRADING_MODE=dry_run`:
+
+   ```bash
+   grep -vE '^(POLYMARKET_PRIVATE_KEY|POLYGON_PRIVATE_KEY|TRADING_MODE)=' \
+     /home/ec2-user/.env > /home/ec2-user/.env.staging
+   echo 'TRADING_MODE=dry_run' >> /home/ec2-user/.env.staging
+   chmod 600 /home/ec2-user/.env.staging
+   ```
 
 Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 
