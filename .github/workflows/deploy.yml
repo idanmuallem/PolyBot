@@ -172,13 +172,13 @@ jobs:
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/meta-harness.yml
     with:
-      environment: Staging
       container: polybot-staging
       env_file: /home/ec2-user/.env.staging
       deployment_env: staging
       dashboard_url: http://localhost:8502
       dashboard_from_host: true
-      check_history: false
+      check_history_not_wiped: false
+      record_baseline: true
 
   # Production deploys only after Staging passed, and runs the same
   # SHA-tagged image Staging ran. The `production` GitHub environment holds
@@ -324,7 +324,6 @@ jobs:
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/meta-harness.yml
     with:
-      environment: Production
       container: polybot
       env_file: /home/ec2-user/.env
       deployment_env: production
