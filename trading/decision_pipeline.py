@@ -912,6 +912,7 @@ class SequentialTradingPipeline:
             post_prob=float(candidate.post_prob),
             wang_edge=candidate.wang_edge,
             order_id=getattr(entry, "order_id", None),
+            at=self._stamp(),
         )
 
     def _apply_mode_request(self) -> None:
@@ -957,6 +958,7 @@ class SequentialTradingPipeline:
             asset_type=signal.market.asset_type,
             market_name=signal.market.market_name,
             group_id=group_id,
+            at=self._stamp(),
         )
 
     def _record_arbitrage_sale(self, signal, token_id: str, shares: float, reason: str) -> None:
@@ -966,7 +968,7 @@ class SequentialTradingPipeline:
         self.ledger.record_exit(
             token_id=token_id, shares=float(shares), price=float(signal.price), reason=reason,
             venue=self.venue.name, strategy="arbitrage", side=signal.side,
-            market_name=signal.market.market_name,
+            market_name=signal.market.market_name, at=self._stamp(),
         )
 
     def _resolve_closed_markets(self) -> None:
@@ -1139,7 +1141,13 @@ class SequentialTradingPipeline:
             entry_price=resolved.get("entry_price"),
             side=resolved.get("side"),
             market_name=resolved.get("market_name"),
+            at=self._stamp(),
         )
+
+    def _stamp(self) -> str:
+        """The pipeline's clock as a Ledger time, so recorded entries fall
+        on the same budget day the Account reads them back for."""
+        return self.clock().astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     def _stage_execute(self, candidate: CandidateTrade, approved_bet: float, risk_context: dict):
         entry = self.executor.evaluate_and_execute(
