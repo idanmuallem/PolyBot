@@ -12,6 +12,15 @@ permissions:
   id-token: write   # Required for AWS OIDC authentication
   contents: read    # Required to checkout code
 
+# A newer push to main supersedes an older run: it cancels the older run
+# whether it is still deploying or waiting on the Production approval / 24h
+# timer, so Production only ever gets a version that ran a full day on
+# Staging, and the 24 hours restart. Every other run (branch pushes, PRs)
+# gets a group of its own, so it never cancels main's run or another run.
+concurrency:
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'deploy-main' || format('run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
 env:
   AWS_REGION: eu-north-1
   ECR_REPOSITORY: polybot/main
@@ -172,13 +181,21 @@ jobs:
       check_history: false
 
   # Production deploys only after Staging passed, and runs the same
-  # SHA-tagged image Staging ran.
+  # SHA-tagged image Staging ran. The `production` GitHub environment holds
+  # the job until the owner approves and a 24-hour wait timer has run out
+  # (repo admins may bypass the timer in an emergency; see README,
+  # Deployment > Production gate). Its first step then checks Staging's
+  # trade history did not shrink during those 24 hours.
   deploy-production:
     needs: verify-staging
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ env.DASHBOARD_URL }}
     outputs:
       hunt_history_before: ${{ steps.pre_snapshot.outputs.count }}
+      failed_checks: ${{ steps.gate_result.outputs.failed_checks }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -196,6 +213,23 @@ jobs:
     - name: Ensure EC2 instance is running
       run: bash config/ci/ensure_ec2_running.sh
 
+    # The Production gate: Staging still runs this commit's image and its
+    # hunt_history row count is not below the baseline verify-staging
+    # recorded. See config/ci/check_staging_history.sh.
+    - name: Check Staging history did not shrink
+      id: staging_history
+      env:
+        BASELINE: ${{ needs.verify-staging.outputs.hunt_history_count }}
+        IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+      run: |
+        bash config/ci/ssm_run.sh "BASELINE='$BASELINE' IMAGE='$IMAGE'
+        $(cat config/ci/check_staging_history.sh)"
+
+    # Names the gate in the failure email (notify-failure reads this output).
+    - name: Report Production gate failure
+      id: gate_result
+      if: failure() && steps.staging_history.outcome == 'failure'
+      run: echo "failed_checks=Staging history did not shrink" >> "$GITHUB_OUTPUT"
 
     # Baseline for the post-deploy meta-harness's "trade history not wiped"
     # check (see the meta-harness job below). Best-effort: the container
@@ -316,12 +350,16 @@ jobs:
       env:
         NEEDS: ${{ toJSON(needs) }}
         STAGING_CHECKS: ${{ needs.verify-staging.outputs.failed_checks }}
+        GATE_CHECKS: ${{ needs.deploy-production.outputs.failed_checks }}
         PRODUCTION_CHECKS: ${{ needs.meta-harness.outputs.failed_checks }}
       run: |
         FAILED_JOBS=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")')
         FAILED_CHECKS=""
         if [ -n "$STAGING_CHECKS" ]; then
           FAILED_CHECKS="Staging: $STAGING_CHECKS"
+        fi
+        if [ -n "$GATE_CHECKS" ]; then
+          FAILED_CHECKS="${FAILED_CHECKS}${FAILED_CHECKS:+; }Production gate: $GATE_CHECKS"
         fi
         if [ -n "$PRODUCTION_CHECKS" ]; then
           FAILED_CHECKS="${FAILED_CHECKS}${FAILED_CHECKS:+; }Production: $PRODUCTION_CHECKS"
@@ -349,7 +387,7 @@ jobs:
           The PolyBot pipeline failed.
 
           Failed job(s): ${{ steps.summary.outputs.failed_jobs || 'unknown — check the run directly' }}
-          Failed meta-harness check(s): ${{ steps.summary.outputs.failed_checks || 'none reported' }}
+          Failed check(s): ${{ steps.summary.outputs.failed_checks || 'none reported' }}
 
           Commit: ${{ github.sha }} on ${{ github.ref_name }} (${{ github.event_name }})
           ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}

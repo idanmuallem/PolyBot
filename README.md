@@ -461,11 +461,17 @@ runtime code then goes through these jobs, each waiting for the one before:
 2. `deploy-staging`: starts the EC2 instance if stopped and replaces the
    Staging container (see below)
 3. `verify-staging`: runs the meta-harness against Staging
-4. `deploy-production`: replaces the Production container via AWS SSM
+4. `deploy-production`: waits in the `production` environment (see
+   [Production gate](#production-gate)), checks Staging's trade history did not
+   shrink, then replaces the Production container via AWS SSM
 5. `meta-harness`: runs the meta-harness against Production
 
 If any of them fails, the jobs after it are skipped (so a failing Staging check
 stops Production) and the owner gets a failure email.
+
+A newer push to `main` cancels the older run, whether it is still deploying or
+waiting for Production approval, so the 24 hours restart with the new commit.
+Branch and PR runs never cancel `main`'s run, nor it theirs.
 
 The image is tagged with the commit SHA and the container runs that SHA-tagged
 image, so `docker ps` on the instance shows which commit is live.
@@ -512,6 +518,28 @@ the instance itself, since port 8502 is closed to GitHub's runners.
    echo 'TRADING_MODE=dry_run' >> /home/ec2-user/.env.staging
    chmod 600 /home/ec2-user/.env.staging
    ```
+
+### Production gate
+
+`deploy-production` runs in the GitHub environment `production`, which must be
+set up (Settings > Environments > `production`) with:
+
+- **Required reviewers**: the owner
+- **Wait timer**: 1440 minutes (24 hours)
+- **Allow administrators to bypass configured protection rules**: on
+
+So Production deploys only after Staging passed its meta-harness, 24 hours have
+passed, and the owner clicked Approve. Its first step then fails the job (and
+emails, naming "Staging history did not shrink") if Staging is no longer
+running this commit's image, if no Staging baseline was recorded, or if
+Staging's `hunt_history` row count is below the baseline `verify-staging`
+recorded. Production then runs the same SHA-tagged image Staging ran.
+
+**Emergency path:** merge the fix to `main` as usual and let `build`,
+`deploy-staging` and `verify-staging` pass. Staging is never skipped. When
+`deploy-production` is waiting, open the run and, as repo admin, use the
+bypass option on the pending deployment to start it before the 24 hours are
+up. The Staging history check and the Production meta-harness still run.
 
 Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 
