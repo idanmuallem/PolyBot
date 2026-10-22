@@ -338,7 +338,7 @@ jobs:
   # (Staging, Production gate, ...), add it to `needs` below; the failed-job
   # list is derived from `needs` generically, nothing else to change.
   notify-failure:
-    needs: [test, deploy, meta-harness]
+    needs: [test, changes, deploy, meta-harness]
     # failure() on a job is true when any job in `needs` failed. Skipped jobs
     # (PRs, non-main pushes) and cancelled runs (superseded by a newer push)
     # do not count as failures, so they send nothing.
