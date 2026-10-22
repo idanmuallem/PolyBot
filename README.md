@@ -458,8 +458,11 @@ Pushing to `main` triggers `.github/workflows/deploy.yml`. A push that changes
 runtime code then goes through these jobs, each waiting for the one before:
 
 1. `build`: builds the Docker image and pushes it to Amazon ECR (`eu-north-1`)
-2. `deploy-staging`: starts the EC2 instance if stopped and replaces the
-   Staging container (see below)
+2. `deploy-staging`: replaces the Staging container (see below). If the EC2
+   instance is stopped it deploys nothing and the rest of the run is skipped
+   (green, not failed): the pipeline never starts the instance, since that
+   would also bring Production's container back. Start it by hand, then
+   re-run the workflow to deploy.
 3. `verify-staging`: runs the meta-harness against Staging
 4. `approve-production`: waits in the `production` environment for the 24-hour
    timer and the owner's Approve (see [Production gate](#production-gate))
@@ -468,7 +471,10 @@ runtime code then goes through these jobs, each waiting for the one before:
 6. `meta-harness`: runs the meta-harness against Production
 
 If any of them fails, the jobs after it are skipped (so a failing Staging check
-stops Production) and the owner gets a failure email.
+stops Production) and the owner gets a failure email: GitHub's own "workflow
+failed" notification, plus a Gmail email naming the failed job and check when
+the `GMAIL_USERNAME` / `GMAIL_APP_PASSWORD` repo secrets are set (it is skipped
+without them).
 
 Runs are never cancelled as a whole. A newer runtime push supersedes an older
 one only at the Production gate (see [Production gate](#production-gate)), and

@@ -142,6 +142,10 @@ jobs:
     concurrency:
       group: deploy-staging
       cancel-in-progress: false
+    # `deployed` is false when the instance is stopped: the job stays green,
+    # nothing is deployed, and verify-staging (so everything after it) skips.
+    outputs:
+      deployed: ${{ steps.ec2.outputs.running }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -156,10 +160,13 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Ensure EC2 instance is running
-      run: bash config/ci/ensure_ec2_running.sh
+    # Never starts a stopped instance; see config/ci/check_ec2_running.sh.
+    - name: Check EC2 instance is running
+      id: ec2
+      run: bash config/ci/check_ec2_running.sh
 
     - name: Deploy Staging via AWS SSM
+      if: steps.ec2.outputs.running == 'true'
       env:
         REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
@@ -174,7 +181,7 @@ jobs:
   # the baseline for the Production gate.
   verify-staging:
     needs: deploy-staging
-    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.deploy-staging.outputs.deployed == 'true'
     uses: ./.github/workflows/meta-harness.yml
     with:
       container: polybot-staging
@@ -247,8 +254,10 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Ensure EC2 instance is running
-      run: bash config/ci/ensure_ec2_running.sh
+    # The owner approved, so a stopped instance here is a failure to look at,
+    # not a skip. It is still never started automatically.
+    - name: Check EC2 instance is running
+      run: bash config/ci/check_ec2_running.sh --require
 
     # The Production gate's history check: Staging still runs this commit's
     # image and its hunt_history row count is not below the baseline
@@ -387,6 +396,10 @@ jobs:
     # CI VERIFICATION commit on a branch is reported.
     if: failure() && github.event_name == 'push'
     runs-on: ubuntu-latest
+    # The Gmail email is optional: without the GMAIL_* repo secrets it is
+    # skipped and GitHub's own "workflow failed" notification is the alert.
+    env:
+      GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
     steps:
     - name: Name the failed job(s)
       id: summary
@@ -417,6 +430,7 @@ jobs:
         echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
 
     - name: Email failure
+      if: env.GMAIL_USERNAME != ''
       uses: dawidd6/action-send-mail@v3
       with:
         server_address: smtp.gmail.com
