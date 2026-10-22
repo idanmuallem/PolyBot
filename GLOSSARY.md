@@ -23,3 +23,7 @@ _Avoid_: Prod (when you mean Live run), live
 **Staging**:
 A second deployed copy of the bot that every change reaches before Production; it is always in Dry run, holds no wallet key, and its trade history is thrown away on every deploy.
 _Avoid_: Test environment, sandbox
+
+**Environment marker**:
+The `DEPLOYMENT_ENV` setting (`staging` or `production`) that tells a running bot whether it is Staging or Production; unset means Production, and a Staging marker refuses to start in Live run.
+_Avoid_: Stage, env flag

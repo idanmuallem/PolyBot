@@ -12,13 +12,17 @@ file, and .github/workflows/deploy.yml.
 """
 from dataclasses import asdict
 
-from core.trading_config import TradingConfig
+from core.trading_config import TradingConfig, deployment_environment
 
 REDACT_FIELDS = {"private_key", "openweather_api_key", "fred_api_key"}
 
 
 def main() -> None:
     cfg = asdict(TradingConfig.from_env())
+    # The environment marker is a deployment setting, not a TradingConfig
+    # field, but drift checks need to see which environment the container
+    # believes it is (an unset DEPLOYMENT_ENV reads as production).
+    cfg["deployment_env"] = deployment_environment()
     for key in sorted(cfg):
         value = "<redacted>" if key in REDACT_FIELDS else cfg[key]
         print(f"{key}={value}")
