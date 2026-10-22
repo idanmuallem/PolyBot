@@ -15,9 +15,13 @@ import os
 from dotenv import load_dotenv
 
 from core.bridge import DataBridge
-from core.trading_config import TradingConfig
+from core.trading_config import TradingConfig, deployment_environment
 from core.wallet_context import WalletContext
 from ui import data_manager
+
+
+class StagingLockError(ValueError):
+    """Raised at startup when Staging is configured for Live run."""
 
 
 def get_env(*names: str) -> str:
@@ -48,17 +52,32 @@ def validate_runtime_env(bridge: DataBridge) -> WalletContext:
     if wallet_config_path:
         config = TradingConfig.from_file(wallet_config_path)
     else:
-        private_key = get_env("POLYMARKET_PRIVATE_KEY", "POLYGON_PRIVATE_KEY")
-        proxy_address = get_env("POLYMARKET_PROXY_ADDRESS", "POLY_ADDRESS")
-        if not private_key or not proxy_address:
-            raise ValueError(
-                "Missing required environment variables: "
-                "POLYMARKET_PRIVATE_KEY/POLYGON_PRIVATE_KEY and "
-                "POLYMARKET_PROXY_ADDRESS/POLY_ADDRESS. "
-                "Pass them at runtime with --env-file, or set WALLET_CONFIG_PATH "
-                "to a wallet config.json."
-            )
         config = TradingConfig.from_env()
+
+    # Staging never places a real order, whatever its env file or wallet
+    # config says: a copy-paste of Production's TRADING_MODE must not start.
+    # Checked before the wallet key so this error, not a missing-key one,
+    # names the real problem on a keyless Staging.
+    if deployment_environment() == "staging" and config.is_live_run:
+        raise StagingLockError(
+            "Staging is locked to Dry run: TRADING_MODE=live_run is refused "
+            "when DEPLOYMENT_ENV=staging. Set TRADING_MODE=dry_run in the "
+            "Staging env file."
+        )
+
+    # A Dry run never signs an order, so it may start keyless (Staging holds
+    # no wallet key). Downstream tolerates that: the live venue reports itself
+    # unavailable and the dashboard logs a balance error.
+    if not wallet_config_path and config.is_live_run and (
+        not config.private_key or not config.proxy_address
+    ):
+        raise ValueError(
+            "Missing required environment variables: "
+            "POLYMARKET_PRIVATE_KEY/POLYGON_PRIVATE_KEY and "
+            "POLYMARKET_PROXY_ADDRESS/POLY_ADDRESS. "
+            "Pass them at runtime with --env-file, or set WALLET_CONFIG_PATH "
+            "to a wallet config.json."
+        )
 
     db_path = os.getenv("TRADES_DB_PATH", "/app/trades.db")
     return WalletContext(wallet_id="default", config=config, bridge=bridge, db_path=db_path)
