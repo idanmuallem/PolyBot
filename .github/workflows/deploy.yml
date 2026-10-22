@@ -31,20 +31,63 @@ jobs:
         python-version: '3.12'
 
     - name: Install dependencies
-      run: pip install --no-cache-dir -r config/requirements.txt
+      run: pip install --no-cache-dir -r config/requirements-dev.txt
 
     - name: Run test suite
       run: pytest
+
+  # Path filter: decides whether a push to main touched runtime code.
+  # Docs, Markdown, scripts/ and tests/-only pushes run `test` above and
+  # stop there (deploy and meta-harness show as skipped, so no failure
+  # email); anything else deploys. Plain git diff, no third-party action.
+  changes:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      runtime: ${{ steps.filter.outputs.runtime }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Detect runtime changes
+      id: filter
+      env:
+        BEFORE: ${{ github.event.before }}
+        AFTER: ${{ github.sha }}
+      run: |
+        # No usable "before" commit (new branch, force-push to an unknown
+        # commit): we can't tell what changed, so deploy to be safe.
+        if [ -z "$BEFORE" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+          echo "No usable before-commit ($BEFORE) - treating as a runtime change"
+          echo "runtime=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        CHANGED=$(git diff --name-only "$BEFORE" "$AFTER")
+        echo "Changed files:"
+        echo "$CHANGED"
+        RUNTIME=$(echo "$CHANGED" | grep -vE '^(docs/|scripts/|tests/)|\.md$' | grep -v '^$' || true)
+        if [ -n "$RUNTIME" ]; then
+          echo "Runtime files changed:"
+          echo "$RUNTIME"
+          echo "runtime=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "Only docs/Markdown/scripts/tests changed - skipping deploy"
+          echo "runtime=false" >> "$GITHUB_OUTPUT"
+        fi
 
   # Build/push/deploy only for an actual push to main — a PR or a push to
   # any other branch runs the `test` job above (via the on.push/pull_request
   # triggers) and stops there, same as before this workflow grew a test job.
   deploy:
-    needs: test
+    needs: [test, changes]
     # A custom `if:` on a job with `needs:` REPLACES the implicit success()
     # check GitHub would otherwise add — so `success()` has to be spelled
     # out here, or a failing `test` job would not actually block this one.
-    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # A skipped deploy also skips meta-harness (it needs deploy), so a
+    # docs-only push shows both as skipped and sends no failure email.
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-latest
     outputs:
       hunt_history_before: ${{ steps.pre_snapshot.outputs.count }}
@@ -111,6 +154,12 @@ jobs:
     # otherwise be destroyed, unflushed, by `docker rm`. Discovered via the
     # meta-harness's "Trade history not wiped" check catching a real
     # hunt_history row-count drop on an ordinary deploy.
+    #
+    # The container runs the image tagged with this commit's SHA, not
+    # `:latest`, so `docker ps` shows exactly which build is live. The prune
+    # is `docker image prune -a`, not `docker system prune -a`: it removes
+    # only images no container uses, so it never deletes the image another
+    # running container (e.g. Staging) is on.
     - name: Deploy to EC2 via AWS SSM
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -124,13 +173,13 @@ jobs:
             "docker exec polybot python3 config/ci/wal_checkpoint.py || true",
             "docker stop polybot || true",
             "docker rm polybot || true",
-            "docker system prune -a -f",
-            "docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest",
+            "docker image prune -a -f",
+            "docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}",
             "touch /home/ec2-user/trades.db",
             "chmod 666 /home/ec2-user/trades.db",
             "mkdir -p /home/ec2-user/paper_trading",
             "chmod 777 /home/ec2-user/paper_trading",
-            "docker run -d --name polybot --restart always --log-opt max-size=20m --log-opt max-file=3 -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db -v /home/ec2-user/paper_trading:/app/paper_trading --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+            "docker run -d --name polybot --restart always --log-opt max-size=20m --log-opt max-file=3 -p 80:8501 -v /home/ec2-user/trades.db:/app/trades.db -v /home/ec2-user/paper_trading:/app/paper_trading --env-file /home/ec2-user/.env ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
           ]' \
           --query 'Command.CommandId' --output text)
         echo "SSM command ID: $COMMAND_ID"
@@ -178,6 +227,9 @@ jobs:
     # Same `success()` note as the deploy job above — required here too.
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      # Read by notify-failure to name the failed check(s) in the email.
+      failed_checks: ${{ steps.evaluate.outputs.failed_checks }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -279,27 +331,56 @@ jobs:
           exit 1
         fi
 
-    # Backup to GitHub's own "failed workflow" email — see repo owner's
-    # Settings → Notifications → Actions for that one. This fires even if
-    # that per-user setting is muted, and names the specific check(s) that
-    # failed rather than just "workflow failed".
-    - name: Email on meta-harness failure
-      if: failure()
+  # One email for any failed job in the run. Backup to GitHub's own "failed
+  # workflow" email (repo owner's Settings → Notifications → Actions), which
+  # is per-user and can be muted — the 2026-09-30 run of five failed deploys
+  # went unnoticed because only the meta-harness emailed. To cover a new job
+  # (Staging, Production gate, ...), add it to `needs` below; the failed-job
+  # list is derived from `needs` generically, nothing else to change.
+  notify-failure:
+    needs: [test, changes, deploy, meta-harness]
+    # failure() on a job is true when any job in `needs` failed. Skipped jobs
+    # (PRs, non-main pushes) and cancelled runs (superseded by a newer push)
+    # do not count as failures, so they send nothing.
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Name the failed job(s)
+      id: summary
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+        FAILED_CHECKS: ${{ needs.meta-harness.outputs.failed_checks }}
+      run: |
+        FAILED_JOBS=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")')
+        SUBJECT="PolyBot CI FAILED: ${FAILED_JOBS:-unknown job}"
+        if [ -n "$FAILED_CHECKS" ]; then
+          SUBJECT="$SUBJECT ($FAILED_CHECKS)"
+        fi
+        echo "Failed job(s): $FAILED_JOBS" | tee -a "$GITHUB_STEP_SUMMARY"
+        echo "failed_jobs=$FAILED_JOBS" >> "$GITHUB_OUTPUT"
+        echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
+
+    - name: Email failure
       uses: dawidd6/action-send-mail@v3
       with:
         server_address: smtp.gmail.com
         server_port: 465
         username: ${{ secrets.GMAIL_USERNAME }}
         password: ${{ secrets.GMAIL_APP_PASSWORD }}
-        subject: "PolyBot meta-harness FAILED: ${{ steps.evaluate.outputs.failed_checks || 'see run for details' }}"
+        subject: ${{ steps.summary.outputs.subject }}
         to: idanmu17@gmail.com
         from: PolyBot CI <${{ secrets.GMAIL_USERNAME }}>
         body: |
-          The post-deploy meta-harness found a problem after deploying commit ${{ github.sha }}.
+          The PolyBot pipeline failed.
 
-          Failed check(s): ${{ steps.evaluate.outputs.failed_checks || 'harness itself errored before finishing — check the run directly' }}
+          Failed job(s): ${{ steps.summary.outputs.failed_jobs || 'unknown — check the run directly' }}
+          Failed meta-harness check(s): ${{ needs.meta-harness.outputs.failed_checks || 'none reported' }}
 
-          The deploy already completed — this is a live-system validation failure,
-          not a blocked deploy. Nothing was rolled back automatically.
+          Commit: ${{ github.sha }} on ${{ github.ref_name }} (${{ github.event_name }})
+          ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
 
-          Run details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Nothing is rolled back automatically. If a deploy job failed, the
+          deploy may be partial; if the meta-harness failed, the deploy already
+          completed and the live system failed validation.
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
