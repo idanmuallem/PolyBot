@@ -461,17 +461,20 @@ runtime code then goes through these jobs, each waiting for the one before:
 2. `deploy-staging`: starts the EC2 instance if stopped and replaces the
    Staging container (see below)
 3. `verify-staging`: runs the meta-harness against Staging
-4. `deploy-production`: waits in the `production` environment (see
-   [Production gate](#production-gate)), checks Staging's trade history did not
-   shrink, then replaces the Production container via AWS SSM
-5. `meta-harness`: runs the meta-harness against Production
+4. `approve-production`: waits in the `production` environment for the 24-hour
+   timer and the owner's Approve (see [Production gate](#production-gate))
+5. `deploy-production`: checks Staging's trade history did not shrink, then
+   replaces the Production container via AWS SSM
+6. `meta-harness`: runs the meta-harness against Production
 
 If any of them fails, the jobs after it are skipped (so a failing Staging check
 stops Production) and the owner gets a failure email.
 
-A newer push to `main` cancels the older run, whether it is still deploying or
-waiting for Production approval, so the 24 hours restart with the new commit.
-Branch and PR runs never cancel `main`'s run, nor it theirs.
+Runs are never cancelled as a whole. A newer runtime push supersedes an older
+one only at the Production gate (see [Production gate](#production-gate)), and
+a deploy that is already running is never cancelled: two Staging deploys, or
+two Production deploys, run one after the other. A docs-only push cancels
+nothing.
 
 The image is tagged with the commit SHA and the container runs that SHA-tagged
 image, so `docker ps` on the instance shows which commit is running.
@@ -521,7 +524,7 @@ the instance itself, since port 8502 is closed to GitHub's runners.
 
 ### Production gate
 
-`deploy-production` runs in the GitHub environment `production`, which must be
+`approve-production` runs in the GitHub environment `production`, which must be
 set up (Settings > Environments > `production`) with:
 
 - **Required reviewers**: the owner
@@ -529,15 +532,32 @@ set up (Settings > Environments > `production`) with:
 - **Allow administrators to bypass configured protection rules**: on
 
 So Production deploys only after Staging passed its meta-harness, 24 hours have
-passed, and the owner clicked Approve. Its first step then fails the job (and
-emails, naming "Staging history did not shrink") if Staging is no longer
-running this commit's image, if no Staging baseline was recorded, or if
-Staging's `hunt_history` row count is below the baseline `verify-staging`
-recorded. Production then runs the same SHA-tagged image Staging ran.
+passed, and the owner clicked Approve. `approve-production` is only the gate:
+it runs no steps that touch AWS. `deploy-production` follows it, and its first
+step fails the job (and emails, naming "Staging history did not shrink") if
+Staging is no longer running this commit's image, if no Staging baseline was
+recorded, or if Staging's `hunt_history` row count is below the baseline
+`verify-staging` recorded. Production then runs the same SHA-tagged image
+Staging ran.
+
+**Superseding:** when a newer runtime push to `main` passes Staging and reaches
+`approve-production`, it cancels the older run's pending approval (no email),
+and the 24 hours restart with the newer commit. An approval already granted,
+and a Production deploy already running, are not cancelled. If an older
+approval is granted after the newer push replaced Staging but before it reached
+the gate, `deploy-production`'s history check fails closed, because Staging no
+longer runs the older commit.
+
+**AWS OIDC:** the environment is on `approve-production`, not on the job that
+assumes the AWS role, by design. A job with `environment: production` presents
+the OIDC subject `repo:idanmuallem/PolyBot:environment:production` instead of
+`repo:idanmuallem/PolyBot:ref:refs/heads/main`, so `deploy-production` keeps
+the same subject as every other deploy job and the IAM role's trust policy
+needs no change.
 
 **Emergency path:** merge the fix to `main` as usual and let `build`,
 `deploy-staging` and `verify-staging` pass. Staging is never skipped. When
-`deploy-production` is waiting, open the run and, as repo admin, use the
+`approve-production` is waiting, open the run and, as repo admin, use the
 bypass option on the pending deployment to start it before the 24 hours are
 up. The Staging history check and the Production meta-harness still run.
 
