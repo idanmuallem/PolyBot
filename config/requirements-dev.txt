@@ -1,0 +1,8 @@
+# Development and CI dependencies: the runtime set plus test-only packages.
+# The Production image installs config/requirements.txt only.
+-r requirements.txt
+
+pytest==8.3.5
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0
+freezegun==1.5.1

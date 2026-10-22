@@ -189,7 +189,8 @@ PolyBot/
 │
 ├── config/
 │   ├── .env                    # Deployment credentials and runtime settings
-│   ├── requirements.txt        # Python dependencies
+│   ├── requirements.txt        # Runtime dependencies (installed in the image)
+│   ├── requirements-dev.txt    # Runtime + test dependencies (local dev and CI)
 │   └── Docker/
 │       ├── Dockerfile
 │       └── docker-compose.yml
@@ -312,7 +313,7 @@ python -m venv .venv
 # source .venv/bin/activate   # macOS/Linux
 
 # 3. Install dependencies
-pip install -r config/requirements.txt
+pip install -r config/requirements-dev.txt
 
 # 4. Configure credentials
 cp config/.env config/.env.local   # or edit config/.env directly
