@@ -339,9 +339,13 @@ jobs:
   notify-failure:
     needs: [test, changes, build, deploy-staging, verify-staging, deploy-production, meta-harness]
     # failure() on a job is true when any job in `needs` failed. Skipped jobs
-    # (PRs, non-main pushes) and cancelled runs (superseded by a newer push)
-    # do not count as failures, so they send nothing.
-    if: failure()
+    # (docs-only pushes, deploy jobs on non-main pushes) and cancelled runs
+    # (superseded by a newer push) do not count as failures, so they send
+    # nothing. Push events only, on any branch: a PR runs the same commit
+    # its branch push already ran, so emailing on both would send two emails
+    # for one bad commit. Branch pushes still email, so a deliberate-failure
+    # CI VERIFICATION commit on a branch is reported.
+    if: failure() && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
     - name: Name the failed job(s)
