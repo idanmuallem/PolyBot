@@ -70,9 +70,8 @@ def deployment_environment() -> str:
     """
     value = str(os.getenv("DEPLOYMENT_ENV", "")).strip().lower() or "production"
     if value not in DEPLOYMENT_ENVIRONMENTS:
-        raise ValueError(
-            f"DEPLOYMENT_ENV must be 'staging' or 'production', got '{value}'"
-        )
+        allowed = " or ".join(f"'{name}'" for name in DEPLOYMENT_ENVIRONMENTS)
+        raise ValueError(f"DEPLOYMENT_ENV must be {allowed}, got '{value}'")
     return value
 
 
