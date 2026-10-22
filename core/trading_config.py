@@ -57,6 +57,25 @@ def _env_first(*names: str, default: str = "") -> str:
     return default
 
 
+DEPLOYMENT_ENVIRONMENTS = ("production", "staging")
+
+
+def deployment_environment() -> str:
+    """Which deployment this process runs as: "staging" or "production".
+
+    Read from DEPLOYMENT_ENV; unset means Production, so the existing
+    Production container (whose env file predates this setting) needs no
+    change. This is a property of the deployment, not of a wallet, so it is
+    read from the process env even when the wallet config comes from a file.
+    """
+    value = str(os.getenv("DEPLOYMENT_ENV", "")).strip().lower() or "production"
+    if value not in DEPLOYMENT_ENVIRONMENTS:
+        raise ValueError(
+            f"DEPLOYMENT_ENV must be 'staging' or 'production', got '{value}'"
+        )
+    return value
+
+
 @dataclass
 class TradingConfig:
     min_ev: float = DEFAULT_MIN_EV
