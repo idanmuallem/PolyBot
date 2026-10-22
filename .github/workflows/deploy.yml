@@ -38,7 +38,7 @@ jobs:
 
   # Path filter: decides whether a push to main touched runtime code.
   # Docs, Markdown, scripts/ and tests/-only pushes run `test` above and
-  # stop there (deploy and meta-harness show as skipped, so no failure
+  # stop there (build and every deploy job show as skipped, so no failure
   # email); anything else deploys. Plain git diff, no third-party action.
   changes:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -80,17 +80,19 @@ jobs:
   # Build/push/deploy only for an actual push to main — a PR or a push to
   # any other branch runs the `test` job above (via the on.push/pull_request
   # triggers) and stops there, same as before this workflow grew a test job.
-  deploy:
+  #
+  # Runtime pushes to main then go: build -> deploy-staging -> verify-staging
+  # -> deploy-production -> meta-harness. Each job needs the one before, so a
+  # failure anywhere (including a failed Staging check) stops Production.
+  build:
     needs: [test, changes]
     # A custom `if:` on a job with `needs:` REPLACES the implicit success()
     # check GitHub would otherwise add — so `success()` has to be spelled
     # out here, or a failing `test` job would not actually block this one.
-    # A skipped deploy also skips meta-harness (it needs deploy), so a
-    # docs-only push shows both as skipped and sends no failure email.
+    # A skipped build also skips every job after it (they need it), so a
+    # docs-only push shows them all as skipped and sends no failure email.
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-latest
-    outputs:
-      hunt_history_before: ${{ steps.pre_snapshot.outputs.count }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -115,21 +117,81 @@ jobs:
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
+  # Staging: a second container (`polybot-staging`, port 8502) on the same
+  # instance, in Dry run with no wallet key and a fresh trade history every
+  # deploy. Production's container is untouched. See config/ci/deploy_staging.sh.
+  deploy-staging:
+    needs: build
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::979667333506:role/GitHub-Action-Role
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
     - name: Ensure EC2 instance is running
+      run: bash config/ci/ensure_ec2_running.sh
+
+    - name: Deploy Staging via AWS SSM
+      env:
+        REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
       run: |
-        STATE=$(aws ec2 describe-instances \
-          --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
-          --query 'Reservations[0].Instances[0].State.Name' \
-          --output text)
-        if [ "$STATE" != "running" ]; then
-          echo "Instance is $STATE — starting it"
-          aws ec2 start-instances --instance-ids "${{ env.EC2_INSTANCE_ID }}"
-          aws ec2 wait instance-running --instance-ids "${{ env.EC2_INSTANCE_ID }}"
-          echo "Waiting 30s for SSM agent to come online..."
-          sleep 30
-        else
-          echo "Instance already running"
-        fi
+        bash config/ci/ssm_run.sh "REGISTRY='$REGISTRY' IMAGE='$IMAGE' AWS_REGION='$AWS_REGION'
+        $(cat config/ci/deploy_staging.sh)"
+
+  # The meta-harness against Staging, without "Trade history not wiped"
+  # (Staging's history is wiped on purpose). Its dashboard check runs on the
+  # instance itself, since port 8502 is open only to the owner's IP. Also
+  # records Staging's hunt_history row count (output hunt_history_count) as
+  # the baseline for the Production gate.
+  verify-staging:
+    needs: deploy-staging
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/meta-harness.yml
+    with:
+      environment: Staging
+      container: polybot-staging
+      env_file: /home/ec2-user/.env.staging
+      deployment_env: staging
+      dashboard_url: http://localhost:8502
+      dashboard_from_host: true
+      check_history: false
+
+  # Production deploys only after Staging passed, and runs the same
+  # SHA-tagged image Staging ran.
+  deploy-production:
+    needs: verify-staging
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      hunt_history_before: ${{ steps.pre_snapshot.outputs.count }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::979667333506:role/GitHub-Action-Role
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Ensure EC2 instance is running
+      run: bash config/ci/ensure_ec2_running.sh
+
 
     # Baseline for the post-deploy meta-harness's "trade history not wiped"
     # check (see the meta-harness job below). Best-effort: the container
@@ -217,119 +279,19 @@ jobs:
         fi
         echo "Deploy command completed successfully."
 
-  # Validates the live, running system after deploy — not the code, the
-  # actual deployed thing. Reports pass/fail clearly; does NOT roll
-  # anything back (the deploy already happened by the time this runs) and
-  # does not gate anything retroactively. This is what replaces manually
-  # SSH/SSM-ing in to eyeball the container, the config, and the logs.
+  # Production meta-harness: every check, as before Staging existed.
   meta-harness:
-    needs: deploy
-    # Same `success()` note as the deploy job above — required here too.
+    needs: deploy-production
+    # Same `success()` note as the build job above — required here too.
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    outputs:
-      # Read by notify-failure to name the failed check(s) in the email.
-      failed_checks: ${{ steps.evaluate.outputs.failed_checks }}
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        role-to-assume: arn:aws:iam::979667333506:role/GitHub-Action-Role
-        aws-region: ${{ env.AWS_REGION }}
-
-    # 1. Dashboard reachable.
-    - name: Check dashboard is reachable
-      id: dashboard
-      continue-on-error: true
-      run: |
-        CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$DASHBOARD_URL/")
-        echo "HTTP $CODE from $DASHBOARD_URL"
-        [ "$CODE" = "200" ]
-
-    # 2. Config readback matches intent — catches "docker start didn't
-    # reload .env" style drift between the host's env file and what the
-    # live container actually resolved at startup.
-    - name: Check config readback vs. live container
-      id: config_drift
-      continue-on-error: true
-      run: bash config/ci/ssm_run.sh "$(cat config/ci/check_config_drift.sh)"
-
-    # 3. Engine actually running — not just the container "Up".
-    - name: Check engine is actually running (engine_status freshness)
-      id: engine_freshness
-      continue-on-error: true
-      run: bash config/ci/ssm_run.sh "docker exec polybot python3 config/ci/engine_freshness_check.py"
-
-    # 4. No errors in fresh logs.
-    - name: Check for errors in recent container logs
-      id: logs
-      continue-on-error: true
-      run: |
-        bash config/ci/ssm_run.sh "
-          if docker logs polybot --tail 500 2>&1 | grep -iE 'error|exception|traceback|modulenotfound'; then
-            echo 'Suspicious lines found in the last 500 log lines (see above)'
-            exit 1
-          fi
-          echo 'No error/exception/traceback/ModuleNotFound lines in the last 500 log lines'
-        "
-
-    # 5. Trade history not accidentally wiped.
-    - name: Check hunt_history row count did not drop
-      id: hunt_history
-      continue-on-error: true
-      env:
-        BEFORE: ${{ needs.deploy.outputs.hunt_history_before }}
-      run: |
-        if [ -z "$BEFORE" ] || [ "$BEFORE" = "unknown" ]; then
-          echo "No pre-deploy baseline available (first run after adding this check, or the baseline snapshot itself failed) — skipping comparison this time."
-          exit 0
-        fi
-        AFTER=$(bash config/ci/ssm_run.sh "docker exec polybot python3 config/ci/count_hunt_history.py")
-        AFTER=$(echo "$AFTER" | tr -d '[:space:]')
-        echo "hunt_history rows: before=$BEFORE after=$AFTER"
-        if [ "$AFTER" -lt "$BEFORE" ]; then
-          echo "::error::hunt_history row count DROPPED ($BEFORE -> $AFTER) — trade history may have been wiped"
-          exit 1
-        fi
-        echo "OK: hunt_history row count did not drop ($BEFORE -> $AFTER)"
-
-    # Summarize which specific check(s) failed — both for the Actions UI
-    # (job summary) and to feed a specific, non-generic failure email
-    # below, per the "must actually reach the person" requirement.
-    - name: Evaluate meta-harness results
-      id: evaluate
-      env:
-        R_DASHBOARD: ${{ steps.dashboard.outcome }}
-        R_CONFIG: ${{ steps.config_drift.outcome }}
-        R_ENGINE: ${{ steps.engine_freshness.outcome }}
-        R_LOGS: ${{ steps.logs.outcome }}
-        R_HISTORY: ${{ steps.hunt_history.outcome }}
-      run: |
-        FAILED=""
-        check() {
-          label="$1"; outcome="$2"
-          if [ "$outcome" = "success" ]; then
-            echo "PASS: $label" | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            echo "FAIL: $label" | tee -a "$GITHUB_STEP_SUMMARY"
-            FAILED="${FAILED}${FAILED:+, }${label}"
-          fi
-        }
-
-        check "Dashboard reachable" "$R_DASHBOARD"
-        check "Config readback matches intent" "$R_CONFIG"
-        check "Engine actually running" "$R_ENGINE"
-        check "No errors in fresh logs" "$R_LOGS"
-        check "Trade history not wiped" "$R_HISTORY"
-
-        echo "failed_checks=$FAILED" >> "$GITHUB_OUTPUT"
-        if [ -n "$FAILED" ]; then
-          echo "::error::Meta-harness checks failed: $FAILED"
-          exit 1
-        fi
+    uses: ./.github/workflows/meta-harness.yml
+    with:
+      environment: Production
+      container: polybot
+      env_file: /home/ec2-user/.env
+      deployment_env: production
+      dashboard_url: http://16.171.179.213 # Elastic IP on the EC2 instance
+      hunt_history_before: ${{ needs.deploy-production.outputs.hunt_history_before }}
 
   # One email for any failed job in the run. Backup to GitHub's own "failed
   # workflow" email (repo owner's Settings → Notifications → Actions), which
@@ -338,7 +300,7 @@ jobs:
   # (Staging, Production gate, ...), add it to `needs` below; the failed-job
   # list is derived from `needs` generically, nothing else to change.
   notify-failure:
-    needs: [test, changes, deploy, meta-harness]
+    needs: [test, changes, build, deploy-staging, verify-staging, deploy-production, meta-harness]
     # failure() on a job is true when any job in `needs` failed. Skipped jobs
     # (PRs, non-main pushes) and cancelled runs (superseded by a newer push)
     # do not count as failures, so they send nothing.
@@ -349,15 +311,24 @@ jobs:
       id: summary
       env:
         NEEDS: ${{ toJSON(needs) }}
-        FAILED_CHECKS: ${{ needs.meta-harness.outputs.failed_checks }}
+        STAGING_CHECKS: ${{ needs.verify-staging.outputs.failed_checks }}
+        PRODUCTION_CHECKS: ${{ needs.meta-harness.outputs.failed_checks }}
       run: |
         FAILED_JOBS=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")')
+        FAILED_CHECKS=""
+        if [ -n "$STAGING_CHECKS" ]; then
+          FAILED_CHECKS="Staging: $STAGING_CHECKS"
+        fi
+        if [ -n "$PRODUCTION_CHECKS" ]; then
+          FAILED_CHECKS="${FAILED_CHECKS}${FAILED_CHECKS:+; }Production: $PRODUCTION_CHECKS"
+        fi
         SUBJECT="PolyBot CI FAILED: ${FAILED_JOBS:-unknown job}"
         if [ -n "$FAILED_CHECKS" ]; then
           SUBJECT="$SUBJECT ($FAILED_CHECKS)"
         fi
         echo "Failed job(s): $FAILED_JOBS" | tee -a "$GITHUB_STEP_SUMMARY"
         echo "failed_jobs=$FAILED_JOBS" >> "$GITHUB_OUTPUT"
+        echo "failed_checks=$FAILED_CHECKS" >> "$GITHUB_OUTPUT"
         echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
 
     - name: Email failure
@@ -374,7 +345,7 @@ jobs:
           The PolyBot pipeline failed.
 
           Failed job(s): ${{ steps.summary.outputs.failed_jobs || 'unknown — check the run directly' }}
-          Failed meta-harness check(s): ${{ needs.meta-harness.outputs.failed_checks || 'none reported' }}
+          Failed meta-harness check(s): ${{ steps.summary.outputs.failed_checks || 'none reported' }}
 
           Commit: ${{ github.sha }} on ${{ github.ref_name }} (${{ github.event_name }})
           ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}

@@ -10,12 +10,31 @@
 # Runs on the EC2 host itself (shipped via config/ci/ssm_run.sh from
 # .github/workflows/deploy.yml) so it can read both sides: the host's env
 # file and, via `docker exec`, the container's actual resolved config.
+#
+# Checks Production by default. To check Staging, put overrides in front of
+# the script body (see .github/workflows/meta-harness.yml), e.g.
+#   CONTAINER=polybot-staging ENV_FILE=/home/ec2-user/.env.staging
+#   EXPECTED_DEPLOYMENT_ENV=staging
 set -euo pipefail
 
-ENV_FILE="/home/ec2-user/.env"
+CONTAINER="${CONTAINER:-polybot}"
+ENV_FILE="${ENV_FILE:-/home/ec2-user/.env}"
+EXPECTED_DEPLOYMENT_ENV="${EXPECTED_DEPLOYMENT_ENV:-production}"
 FAIL=0
 
-LIVE=$(docker exec polybot python3 config/ci/config_readback.py)
+LIVE=$(docker exec "$CONTAINER" python3 config/ci/config_readback.py)
+
+# Which environment the container believes it is in. Compared with the
+# deploy's intent, not the env file: Staging gets its marker from
+# `docker run -e DEPLOYMENT_ENV=staging`, and Production leaves it unset,
+# which reads as production.
+live_env=$(printf '%s\n' "$LIVE" | grep -E "^deployment_env=" | cut -d= -f2- || true)
+if [ "$live_env" = "$EXPECTED_DEPLOYMENT_ENV" ]; then
+  echo "OK deployment_env=${live_env}"
+else
+  echo "MISMATCH deployment_env: expected '${EXPECTED_DEPLOYMENT_ENV}' but the running container resolved '${live_env}'"
+  FAIL=1
+fi
 
 # Non-secret knobs worth checking. Deliberately a short, curated list —
 # meant to catch drift at a glance, not replicate every TradingConfig
