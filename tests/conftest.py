@@ -22,12 +22,12 @@ _eth_mock = MagicMock()
 _eth_mock.to_checksum_address = lambda addr: str(addr)
 sys.modules["eth_utils"] = _eth_mock
 
-import pytest
+import pytest  # noqa: E402
 
-from core.bridge import DataBridge
-from core.models import MarketData
-from core.trading_config import TradingConfig
-from core.wallet_context import WalletContext
+from core.bridge import DataBridge  # noqa: E402
+from core.models import MarketData  # noqa: E402
+from core.trading_config import TradingConfig  # noqa: E402
+from core.wallet_context import WalletContext  # noqa: E402
 
 
 @pytest.fixture
