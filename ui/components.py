@@ -173,51 +173,41 @@ def render_activity_chart(level_counts: dict):
     }, height=260)
 
 
-def _readable_market_name(pos: dict, opportunity_map: dict) -> str:
+def _readable_market_name(pos: dict, market_names: dict) -> str:
     """Human-readable market name for one position. A position row only
-    carries market_id (the slug in paper mode) and token_id — the readable
-    name/question lives in the EV opportunity map (populated by
-    ui/data_manager.log_event for any EV-bearing log row, same source
-    render_ev_chart() already reads market_name from), keyed by token_id.
-    Falls back to reformatting the slug/id when no name is on record.
+    carries market_id (the slug in paper mode) and token_id; the readable
+    name is the one the Ledger recorded at entry, keyed by token_id. Falls
+    back to reformatting the slug/id when no name is on record.
     """
     token_id = str(pos.get("token_id", "") or "")
     market_id = str(pos.get("market_id", "") or "")
-    for key in (token_id, market_id):
-        if not key:
-            continue
-        snapshot = opportunity_map.get(key)
-        name = snapshot.get("market_name") if isinstance(snapshot, dict) else None
-        if name:
-            return str(name)
+    name = market_names.get(token_id) if token_id else None
+    if name:
+        return str(name)
 
     slug = market_id or token_id
     return slug.replace("-", " ").replace("_", " ").title() if slug else "Unknown Market"
 
 
-def render_positions(positions: list[dict], opportunity_map: dict | None = None):
+def render_positions(positions: list[dict], market_names: dict | None = None,
+                     unrealized_pnl: float = 0.0):
     """`positions` is data_manager.read_open_positions()'s result;
-    `opportunity_map` is data_manager.get_recent_opportunity_map()'s result
-    — both DB-derived now that the engine runs as a separate process (see
-    run_engine.py), replacing the old in-memory bridge.current_portfolio/
-    bridge.opportunity_map reads."""
+    `market_names` is data_manager.get_position_market_names()'s result
+    (token_id -> name, from the Ledger); `unrealized_pnl` is the engine's
+    published figure (engine_status, computed by Ledger.unrealized_pnl),
+    shown as-is so the dashboard and risk logic agree."""
     if not positions:
         st.info("No open positions currently.")
         return
 
-    opportunity_map = opportunity_map or {}
+    market_names = market_names or {}
 
     total_value = sum(float(p.get("value", 0.0) or 0.0) for p in positions)
-    total_pnl = sum(
-        (float(p.get("current_price", 0.0) or 0.0) - float(p.get("initial_price", 0.0) or 0.0))
-        * float(p.get("shares", 0.0) or 0.0)
-        for p in positions
-    )
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Open Positions", len(positions))
     c2.metric("Total Value", fmt_dollars(total_value))
-    c3.metric("Unrealized PnL", fmt_dollars(total_pnl))
+    c3.metric("Unrealized PnL", fmt_dollars(float(unrealized_pnl or 0.0)))
 
     rows = []
     for pos in positions:
@@ -225,7 +215,7 @@ def render_positions(positions: list[dict], opportunity_map: dict | None = None)
         initial_price = float(pos.get("initial_price", 0.0) or 0.0)
         current_price = float(pos.get("current_price", 0.0) or 0.0)
         rows.append({
-            "Market": _readable_market_name(pos, opportunity_map),
+            "Market": _readable_market_name(pos, market_names),
             "Side": str(pos.get("side", "") or "").upper(),
             "Invested": shares * initial_price,
             "Entry Price": initial_price,
@@ -302,7 +292,7 @@ def render_correlation_matrix(bridge, config):
 
     The dashboard runs in a separate thread/process from the live pipeline,
     so this reads bridge.position_analytics (stashed every management cycle
-    by PortfolioManager, same pattern as bridge.opportunity_map/current_portfolio)
+    by PortfolioManager, same pattern as bridge.current_portfolio)
     rather than holding a reference to a live PortfolioManager.
 
     Uses trading/correlation.py's CorrelationTracker — a static category/symbol

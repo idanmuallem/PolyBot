@@ -17,34 +17,21 @@ from core.wallet_context import WalletContext
 from hunters.crypto import CryptoHunter
 from core.polymarket_client import PolymarketClient
 from polymarket import PolymarketScannerHunter
-from trading.budget_manager import BudgetManager
-from trading.decision_pipeline import sync_live_account_state
+from tests.venue_harness import open_book_venue
 from trading.executor import TradeExecutor
 from trading.risk_manager import PortfolioManager
 
 
 def _wire_ctx(ctx: WalletContext, log_func) -> None:
-    """Build and attach the four runtime components to ctx, in dependency
+    """Build and attach the runtime components to ctx, in dependency
     order, matching how ui/dashboard.py and core/wallet_manager.py wire a
     real WalletContext. Must run with any TradeExecutor patches already
     active, since it constructs a real TradeExecutor."""
-    ctx.executor = TradeExecutor(config=ctx.config)
-    # These tests exercise full-loop pipeline mechanics with MarketData
-    # fixtures that don't carry a slug/condition_id — not real paper-engine
-    # fidelity. A real PaperAdapter (constructed unconditionally by
-    # TradeExecutor.__init__ whenever pm_trader is importable) would now
-    # honestly report those buys as failed (see trading/executor.py's
-    # dry-run branches), which isn't what these tests are about. See
-    # tests/unit/test_executor.py's _make_executor() for the same rationale.
-    ctx.executor.paper = None
+    ctx.executor = TradeExecutor(config=ctx.config, venue=open_book_venue())
     ctx.scanner = PolymarketScannerHunter(bridge=ctx.bridge, executor=ctx.executor, config=ctx.config)
     ctx.portfolio_manager = PortfolioManager(
         bridge=ctx.bridge, executor=ctx.executor, config=ctx.config,
         hunter=ctx.scanner, db_path=ctx.db_path,
-    )
-    sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, log_func)
-    ctx.budget_manager = BudgetManager(
-        bridge=ctx.bridge, config=ctx.config, initial_balance=float(ctx.bridge.current_balance),
     )
 
 
@@ -84,7 +71,6 @@ async def test_single_pipeline_loop_dry_run(tmp_path):
     bridge.current_balance = 100.0
     bridge.current_portfolio = []
     bridge.open_position_value = 0.0
-    bridge.open_positions_value = 0.0
     bridge.live_trading = False
 
     # 29 days from now: standard_bs model; price=0.35 gives EV > 0.30
@@ -146,7 +132,7 @@ async def test_single_pipeline_loop_dry_run(tmp_path):
     )
 
     # 3. Budget was spent
-    assert pipeline.budget_manager.total_spent_today > 0, "total_spent_today should be > 0"
+    assert pipeline.account.snapshot().spent_today > 0, "total_spent_today should be > 0"
 
     # 4. Market was cached as seen
     assert "tok_btc" in pipeline.hunter.seen_markets
@@ -202,7 +188,6 @@ async def test_full_pipeline_loop_dry_run_wang_mode(tmp_path):
     bridge.current_balance = 100.0
     bridge.current_portfolio = []
     bridge.open_position_value = 0.0
-    bridge.open_positions_value = 0.0
     bridge.live_trading = False
 
     # Real (unmocked) brain: spot=93,000 well below strike=95,000 -> a low

@@ -176,9 +176,8 @@ def _render_global_kpis() -> None:
 
     # Total PnL = Balance - Total Deposits: the true all-in figure (realized
     # + unrealized + fees + slippage), not just the open-positions-only
-    # unrealized P&L (still computed engine-side by
-    # PortfolioManager._refresh_portfolio() for anything that wants the
-    # narrower figure). Shares _compute_balance_snapshot() with the Balance
+    # unrealized P&L (computed once, engine-side, by Ledger.unrealized_pnl
+    # and shown in the Portfolio view via engine_status). Shares _compute_balance_snapshot() with the Balance
     # view's own stats row so this KPI is numerically guaranteed to equal
     # "Current Balance - Total Deposits".
     c2.metric("Total PnL", fmt_dollars(balance - total_deposits))
@@ -256,12 +255,18 @@ def _render_hunter_view() -> None:
 def _render_portfolio_view() -> None:
     st.markdown("### Portfolio")
     positions = data_manager.read_open_positions(wallet_ctx.db_path)
-    opportunity_map = data_manager.get_recent_opportunity_map(wallet_ctx.db_path)
-    render_positions(positions, opportunity_map)
+    status = data_manager.read_engine_status(wallet_ctx.db_path) or {}
+    render_positions(
+        positions,
+        market_names=data_manager.get_position_market_names(wallet_ctx.db_path),
+        unrealized_pnl=float(status.get("unrealized_pnl") or 0.0),
+    )
     st.markdown("#### EV by Market")
     render_ev_chart(data_manager.get_latest_ev_by_token(wallet_ctx.db_path, limit=15))
     st.markdown("#### Transactions")
-    render_transactions_table(data_manager.fetch_transactions(wallet_ctx.db_path, limit=100))
+    render_transactions_table(data_manager.fetch_transactions(
+        wallet_ctx.db_path, limit=100, venue=data_manager.trading_venue(wallet_ctx.db_path),
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +288,7 @@ def _compute_balance_snapshot() -> tuple[float, float, float, float]:
     shared in-process; that's no longer possible post-split, and reading the
     real engine (rather than a live wallet API call) here also sidesteps the
     paper engine's thread-affine sqlite3 connection (see
-    trading/paper_adapter.py) the same way the in-process version did.
+    trading/paper_venue.py) the same way the in-process version did.
 
     Shared by both the top-level "Total PnL" KPI and the Balance view's own
     stats row so the two stay numerically consistent by construction
@@ -321,8 +326,11 @@ def _render_balance_stats_row() -> None:
     # just duplicate that number under a second label.
     cash, holdings, _, total_deposits = _compute_balance_snapshot()
 
-    stats = data_manager.get_trade_stats(wallet_ctx.db_path)
-    closed_deltas = data_manager.get_closed_trade_deltas(wallet_ctx.db_path)
+    # Trade history of the engine's current trading mode only: Dry run and
+    # Live run results never mix.
+    venue = data_manager.trading_venue(wallet_ctx.db_path)
+    stats = data_manager.get_trade_stats(wallet_ctx.db_path, venue=venue)
+    closed_deltas = data_manager.get_closed_trade_deltas(wallet_ctx.db_path, venue=venue)
     open_deltas = [
         float(p.get("current_price", 0.0) or 0.0) - float(p.get("initial_price", 0.0) or 0.0)
         for p in data_manager.read_open_positions(wallet_ctx.db_path)
@@ -354,7 +362,7 @@ def _render_equity_chart() -> None:
 # white/grey flash. Riding the same 2s live_fragment as the rest of the
 # dashboard meant that flash fired every 2s. Its underlying data can't
 # change that fast anyway — paper snapshots are only written every ~3
-# minutes (see PortfolioManager._refresh_portfolio()'s 180s throttle) — so
+# minutes (see PortfolioManager.refresh_positions()'s 180s throttle) — so
 # it gets its own slower-refreshing fragment instead. Nested fragments
 # rerun independently of their parent in Streamlit >= 1.37, so this cuts
 # the flicker rate ~30x without restructuring the rest of the live loop.
@@ -400,8 +408,8 @@ def _render_dashboard_snapshot(view_name: str):
                 bridge.current_balance = float(live_balance)
                 bridge.balance_connection_error = not live_balance_ok
         # else: dry-run/paper mode. Don't touch bridge.current_balance here —
-        # the paper pipeline keeps it in sync with the paper engine's actual
-        # cash via _set_cash() in decision_pipeline.py. Overwriting it with
+        # the engine's Account (trading/account.py) publishes the paper
+        # engine's actual cash via engine_status. Overwriting it with
         # the real wallet balance was causing the Cash figure to flicker
         # between the two. Also skip the live-balance fetch entirely: it's
         # never used while in dry-run, so there's no reason to keep hitting

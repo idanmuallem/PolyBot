@@ -77,7 +77,7 @@ class TradingConfig:
     # runs, full stop.
     enable_arbitrage: bool = True
 
-    # Per-strategy budget isolation (see trading/budget_manager.py): the
+    # Per-strategy budget isolation (see trading/account.py, Account.reserve()): the
     # arbitrage and crypto-brain paths draw from the same wallet cash pool
     # but track spend/trade-count independently, so one can't starve the
     # other. daily_limit_usd/max_daily_trades above remain the global
@@ -135,7 +135,7 @@ class TradingConfig:
     entry_k: float = DEFAULT_ENTRY_K
     model_weight: float = DEFAULT_MODEL_WEIGHT  # deprecated, unused
 
-    # Risk management (see trading/budget_manager.py, trading/risk_manager.py).
+    # Risk management (see trading/account.py, trading/kelly.py, trading/risk_manager.py).
     kelly_fraction: float = 0.25  # quarter-Kelly — full Kelly is optimal in expectation but has extreme variance
     max_drawdown_pct: float = 0.20  # equity drop from peak that pauses new entries (position exits still allowed)
 

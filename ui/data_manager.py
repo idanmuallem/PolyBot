@@ -1,29 +1,12 @@
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 
-
-# ---------------------------------------------------------------------------
-# Payload parsing
-# ---------------------------------------------------------------------------
-
-def _parse_payload_value(payload_value) -> dict:
-    if isinstance(payload_value, dict):
-        return payload_value
-    text = str(payload_value or "").strip()
-    if not text:
-        return {}
-    try:
-        return json.loads(text)
-    except Exception:
-        try:
-            import ast
-            return ast.literal_eval(text)
-        except Exception:
-            return {}
+from trading.ledger import Ledger, init_schema as init_ledger_schema
+from trading.ledger_backfill import backfill_hunt_history, parse_payload
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +68,14 @@ def init_db(db_path: str):
                 starting_balance    REAL,
                 open_position_value REAL,
                 unrealized_pnl      REAL,
-                watch_only          INTEGER
+                watch_only          INTEGER,
+                venue               TEXT
             )
             """
         )
+        # Added after engine_status first shipped.
+        if "venue" not in {row[1] for row in conn.execute("PRAGMA table_info(engine_status)")}:
+            conn.execute("ALTER TABLE engine_status ADD COLUMN venue TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS engine_control (
@@ -122,7 +109,18 @@ def init_db(db_path: str):
         # file's header, so this only needs to be set once — but init_db()
         # is called by both processes at startup, so issuing it here is
         # cheap and idempotent rather than a real per-connection cost.
+        # Ledger tables (trades / positions) — see trading/ledger.py.
+        init_ledger_schema(conn)
+
         conn.execute("PRAGMA journal_mode=WAL")
+
+    # One-time copy of pre-Ledger trade history into the Ledger. Atomic and
+    # marker-guarded, so a failed or interrupted run commits nothing and is
+    # retried on the next init; it must never stop either process starting.
+    try:
+        backfill_hunt_history(db_path)
+    except Exception as e:
+        print(f"[LEDGER] hunt_history backfill failed (will retry on next start): {e}")
 
 
 def insert_paper_snapshot(db_path: str, cash: float, positions_value: float):
@@ -148,16 +146,19 @@ def insert_paper_snapshot(db_path: str, cash: float, positions_value: float):
 def write_engine_status(
     db_path: str, balance: float, starting_balance: float,
     position_value: float, unrealized_pnl: float, watch_only: bool,
+    venue: str | None = None,
 ) -> None:
+    """*venue* is the name of the Venue the engine trades on ("paper" for
+    Dry run, "live" for Live run)."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         with _open_db(db_path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO engine_status "
                 "(id, updated_at, current_balance, starting_balance, open_position_value, "
-                " unrealized_pnl, watch_only) VALUES (1, ?, ?, ?, ?, ?, ?)",
+                " unrealized_pnl, watch_only, venue) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
                 (ts, float(balance), float(starting_balance), float(position_value),
-                 float(unrealized_pnl), int(bool(watch_only))),
+                 float(unrealized_pnl), int(bool(watch_only)), venue),
             )
     except Exception as e:
         print(f"[ENGINE-STATUS] DB error writing status: {e}")
@@ -178,6 +179,21 @@ def read_engine_status(db_path: str) -> dict | None:
     d = dict(row)
     d["watch_only"] = bool(d["watch_only"])
     return d
+
+
+def trading_venue(db_path: str) -> str:
+    """The venue of the engine's current trading mode ("paper" for Dry run,
+    "live" for Live run): the one the engine last published, or the
+    requested mode before the engine has published one. The dashboard's
+    trade history is filtered to it, so Dry run and Live run never mix."""
+    try:
+        with _open_db(db_path) as conn:
+            row = conn.execute("SELECT venue FROM engine_status WHERE id = 1").fetchone()
+        if row is not None and row[0]:
+            return str(row[0])
+    except Exception:
+        pass
+    return "live" if read_live_trading_requested(db_path) else "paper"
 
 
 def write_live_trading_requested(db_path: str, value: bool) -> None:
@@ -299,18 +315,12 @@ def get_level_counts(db_path: str) -> dict:
 
 def get_recent_opportunity_map(db_path: str, scan_limit: int = 500) -> dict:
     """token_id -> most-recent EV-carrying hunt_history payload (market_name,
-    ev, post_prob, asset_type). Replaces the old in-memory
-    bridge.opportunity_map, which was itself built from exactly these same
-    payloads (see the old log_event()) — so this is a direct re-derivation
-    from hunt_history, not a new source of truth. Used both for the
-    EV-by-market chart (get_latest_ev_by_token) and to label open positions
-    with a readable market name (render_positions — Position itself only
-    carries token_id/market_id, not a question/name).
+    ev, post_prob, asset_type), for the EV-by-market chart
+    (get_latest_ev_by_token). Diagnostics only: position fields (names,
+    entry details) come from the Ledger, never from here.
 
-    `market_name` is left as-is from the payload (possibly missing/None) —
-    callers that need a guaranteed display string apply their own fallback
-    (get_latest_ev_by_token falls back to the token_id itself; ui/components.py's
-    _readable_market_name falls back to a reformatted market_id/token_id slug).
+    `market_name` is left as-is from the payload (possibly missing/None);
+    get_latest_ev_by_token falls back to the token_id itself.
     """
     try:
         with _open_db(db_path) as conn:
@@ -326,7 +336,7 @@ def get_recent_opportunity_map(db_path: str, scan_limit: int = 500) -> dict:
         token_id = str(token_id)
         if token_id in seen:
             continue
-        payload = _parse_payload_value(payload_raw)
+        payload = parse_payload(payload_raw)
         if not isinstance(payload, dict) or "ev" not in payload:
             continue
         try:
@@ -372,7 +382,7 @@ def get_terminal_feed(db_path: str, limit: int = 20) -> list[str]:
 
     lines = []
     for level, asset_type, payload_raw in rows:
-        payload = _parse_payload_value(payload_raw)
+        payload = parse_payload(payload_raw)
         reason = str(payload.get("reason", "")).strip() if isinstance(payload, dict) else ""
         market_name = str(payload.get("market_name", "")).strip() if isinstance(payload, dict) else ""
         ev_value = payload.get("ev") if isinstance(payload, dict) else None
@@ -385,19 +395,6 @@ def get_terminal_feed(db_path: str, limit: int = 20) -> list[str]:
 # ---------------------------------------------------------------------------
 # Event logging
 # ---------------------------------------------------------------------------
-
-# bridge.opportunity_map keeps one entry per token_id ever seen with an "ev"
-# in its payload (REJECTED/TRACK/AUTO-TRADE/...), and — unlike the hunter's
-# own cooldown cache (PolymarketScannerHunter.seen_markets, pruned by age
-# every scan) — nothing ever removed an entry. Over a long-running engine
-# process that's an unbounded, ever-growing dict: the confirmed cause of the
-# Aug 29 2026 OOM (run_engine.py's RSS reached ~416MB on a 916MB host after
-# ~29h). Cap it the same way ev_samples below is capped, evicting the
-# least-recently-touched token first. risk_manager's opportunity_map lookups
-# already fall back to a DB query on a miss, so evicting a still-open
-# position's entry only costs a slower lookup, not correctness.
-OPPORTUNITY_MAP_CAP = 500
-
 
 def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -424,39 +421,6 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
     except Exception as e:
         print(f"[DASHBOARD] Log DB error: {e}")
 
-    if isinstance(payload, dict) and "ev" in payload:
-        try:
-            entry = {
-                "token_id": str(token_id),
-                "asset_type": str(asset_type),
-                "ev": float(payload.get("ev", 0.0)),
-                "post_prob": float(payload.get("post_prob", 0.0)),
-                "market_name": str(
-                    payload.get("market_name")
-                    or bridge.market_name_by_token.get(str(token_id), bridge.market_question)
-                ),
-            }
-            # Phase 7: carry the Wang/strategy/risk analytics fields through
-            # too, so PortfolioManager's in-memory lookups (pre_prob,
-            # wang_edge, asset_type for correlation) hit this fast path
-            # instead of always falling back to a DB query.
-            for key in (
-                "pre_prob", "wang_lambda", "wang_fair_value", "wang_edge",
-                "strategy_type", "kelly_fraction_used", "correlation_exposure",
-            ):
-                if payload.get(key) is not None:
-                    entry[key] = payload[key]
-            token_key = str(token_id)
-            # Pop-then-set moves this key to the end of the dict's insertion
-            # order (Python dicts preserve it) so eviction below always drops
-            # the least-recently-touched token, not an arbitrary one.
-            bridge.opportunity_map.pop(token_key, None)
-            bridge.opportunity_map[token_key] = entry
-            if len(bridge.opportunity_map) > OPPORTUNITY_MAP_CAP:
-                del bridge.opportunity_map[next(iter(bridge.opportunity_map))]
-        except Exception:
-            pass
-
     if bridge.event_count - bridge.last_summary_at >= 10:
         bridge.last_summary_at = bridge.event_count
         live = bridge.level_counts.get("LIVE-TRADE", 0)
@@ -465,12 +429,12 @@ def log_event(bridge, level, asset_type, token_id, payload, db_path: str):
         avg_ev = sum(bridge.ev_samples) / len(bridge.ev_samples) if bridge.ev_samples else 0.0
         max_ev = max(bridge.ev_samples) if bridge.ev_samples else 0.0
         # TODO(log-noise): this periodic stdout dump (with its own "=" * 90
-        # separators) duplicates data already in bridge/opportunity_map and
+        # separators) duplicates data already in bridge and
         # isn't part of the DB-backed structured log flow — worth deciding
         # whether it earns its keep or should move behind a log-level flag.
         print("=" * 90)
         print(f"[PERF] events={bridge.event_count} | live={live} | dry={dry} | paper={paper}")
-        print(f"[PERF] avg_ev={avg_ev:.4f} | max_ev={max_ev:.4f} | daily_spend=${bridge.daily_spend:.2f} | balance=${bridge.current_balance:.2f}")
+        print(f"[PERF] avg_ev={avg_ev:.4f} | max_ev={max_ev:.4f} | spent_today=${bridge.spent_today:.2f} | balance=${bridge.current_balance:.2f}")
         print(f"[PERF] level_mix={dict(bridge.level_counts)}")
         print("=" * 90)
 
@@ -538,7 +502,7 @@ def process_logs_for_display(df: pd.DataFrame) -> pd.DataFrame:
         if "token_id" in out.columns else "-"
     )
 
-    parsed = out["payload"].apply(_parse_payload_value) if "payload" in out.columns else pd.Series([{}] * len(out))
+    parsed = out["payload"].apply(parse_payload) if "payload" in out.columns else pd.Series([{}] * len(out))
     for col, series in _extract_payload_columns(parsed).items():
         out[col] = series
 
@@ -582,180 +546,35 @@ def fetch_latest_history(db_path: str, limit: int = 50) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def get_trade_stats(db_path: str) -> dict:
-    _empty = {
-        "win_rate": 0.0, "total_trades": 0, "avg_win": 0.0, "avg_loss": 0.0,
-        "total_yes_trades": 0, "yes_win_rate": 0.0, "total_no_trades": 0, "no_win_rate": 0.0,
-    }
-    # EXEC_LEVELS (entries) and CLOSE_LEVELS (exits) together are every level
-    # a real trade action can be logged under — CLOSE_LEVELS matches every
-    # exit reason PortfolioManager._exit_position() can produce, plus
-    # EXPIRED (market resolution — see PaperAdapter.resolve_closed_markets()
-    # for paper mode and PortfolioManager._exit_position()'s gave-up branch
-    # for live mode; see get_closed_trade_deltas()'s docstring for the same
-    # list).
-    EXEC_LEVELS = {"LIVE-TRADE", "DRY-RUN", "PAPER-TRADE"}
-    CLOSE_LEVELS = {"TAKE-PROFIT", "STOP-LOSS", "WANG-EDGE-DECAY", "EV-CONVERGENCE", "EXPIRED"}
+def get_trade_stats(db_path: str, venue: str | None = None) -> dict:
+    """Dashboard trade stats, read from the Ledger (trading/ledger.py) —
+    hunt_history is a diagnostics log, not a trade record. *venue*
+    ("paper" / "live") limits them to one venue; None is all venues."""
+    return Ledger(db_path).trade_stats(venue=venue)
 
+
+def get_position_market_names(db_path: str) -> dict:
+    """token_id -> market name recorded at entry, for every open Ledger
+    holding. Labels the Portfolio view's positions."""
     try:
-        with _open_db(db_path) as conn:
-            df = pd.read_sql_query(
-                "SELECT level, payload FROM hunt_history WHERE level IN "
-                "('LIVE-TRADE','DRY-RUN','PAPER-TRADE','TAKE-PROFIT','STOP-LOSS','WANG-EDGE-DECAY','EV-CONVERGENCE','EXPIRED')",
-                conn,
-            )
+        holdings = Ledger(db_path).open_positions()
     except Exception:
-        return _empty
-
-    if df.empty:
-        return _empty
-
-    total_trades = yes_trades = no_trades = 0
-    yes_wins = no_wins = yes_losses = no_losses = 0
-    realized_win: list = []
-    realized_loss: list = []
-
-    for level, payload_raw in zip(df["level"], df["payload"]):
-        payload = _parse_payload_value(payload_raw)
-        if not isinstance(payload, dict):
-            continue
-
-        side = str(payload.get("side", "")).upper()
-        gross = float(payload.get("price", 0.0) or 0.0) * float(payload.get("shares", 0.0) or 0.0)
-
-        # One row per genuine entry execution. AUTO-TRADE is deliberately
-        # excluded: evaluate_and_execute() logs AUTO-TRADE immediately before
-        # calling execute_trade(), which logs exactly one of these three for
-        # the same trade — counting both double-counted every real trade
-        # (see trading/executor.py: evaluate_and_execute() then
-        # execute_trade()).
-        if level in EXEC_LEVELS:
-            total_trades += 1
-            if side == "YES":
-                yes_trades += 1
-            elif side == "NO":
-                no_trades += 1
-            continue
-
-        # sell_position() now honestly reports failure (see
-        # trading/executor.py) rather than the old hardcoded True, so a
-        # position that can't actually be sold gets retried on every loop
-        # tick indefinitely, logging a fresh sold: false row each time.
-        # Those aren't real closed trades — price and shares are still
-        # present on a failed attempt (they describe the position being
-        # evaluated, not the sale's outcome).
-        if level not in CLOSE_LEVELS or not payload.get("sold"):
-            continue
-
-        if level == "TAKE-PROFIT":
-            # Win/loss is implied by the level itself — TAKE-PROFIT only
-            # logs once pnl_ratio has already cleared the profit threshold.
-            is_win = True
-        elif level == "STOP-LOSS":
-            is_win = False
-        else:
-            # WANG-EDGE-DECAY/EV-CONVERGENCE trigger off estimated edge/EV
-            # collapsing, not a P&L threshold, so the close isn't inherently
-            # a win or a loss — derive it from the realized price move on
-            # the held side, the same way get_closed_trade_deltas() does.
-            price = payload.get("price")
-            initial_price = payload.get("initial_price")
-            if price is None or initial_price is None:
-                continue
-            try:
-                delta = float(price) - float(initial_price)
-            except (TypeError, ValueError):
-                continue
-            if delta == 0:
-                continue
-            is_win = delta > 0
-
-        if gross <= 0:
-            continue
-
-        total_trades += 1
-        if is_win:
-            realized_win.append(gross)
-            if side == "YES":
-                yes_wins += 1
-            elif side == "NO":
-                no_wins += 1
-        else:
-            realized_loss.append(gross)
-            if side == "YES":
-                yes_losses += 1
-            elif side == "NO":
-                no_losses += 1
-
-    denom = len(realized_win) + len(realized_loss)
-    yes_denom = yes_wins + yes_losses
-    no_denom = no_wins + no_losses
-
-    return {
-        "win_rate":        round(len(realized_win) / denom * 100.0, 2) if denom > 0 else 0.0,
-        "total_trades":    total_trades,
-        "avg_win":         round(sum(realized_win) / len(realized_win), 2) if realized_win else 0.0,
-        "avg_loss":        round(sum(realized_loss) / len(realized_loss), 2) if realized_loss else 0.0,
-        "total_yes_trades": yes_trades,
-        "yes_win_rate":    round(yes_wins / yes_denom * 100.0, 2) if yes_denom > 0 else 0.0,
-        "total_no_trades": no_trades,
-        "no_win_rate":     round(no_wins / no_denom * 100.0, 2) if no_denom > 0 else 0.0,
-    }
+        return {}
+    return {h.token_id: h.market_name for h in holdings if h.market_name}
 
 
-def get_closed_trade_deltas(db_path: str) -> list:
-    """Per-share $ P&L (exit price - entry price) for every closed position,
-    across every exit reason PortfolioManager._exit_position() logs
-    (TAKE-PROFIT, STOP-LOSS, WANG-EDGE-DECAY, EV-CONVERGENCE) plus EXPIRED
-    (market resolution) — not just the take-profit/stop-loss subset
-    get_trade_stats() uses for win/loss counts.
-
-    Needs both "price" (exit) and "initial_price" (entry) in the payload;
-    rows logged before initial_price was added to that payload won't have
-    it and are silently skipped, same as any other missing/malformed field.
-
-    Requires payload["sold"] to be truthy. _exit_position() logs one of
-    these levels on every exit ATTEMPT, whether or not the sell actually
-    succeeded (sell_position()'s return value is now honest — see
-    trading/executor.py — rather than the old hardcoded True). A position
-    that can't actually be sold (e.g. a missing paper-adapter token
-    mapping) gets retried on every loop tick indefinitely, logging a fresh
-    sold: false row each time; without this filter those repeated failed
-    attempts against one still-open position would swamp this average,
-    since they're not real closed trades at all.
-    """
-    try:
-        with _open_db(db_path) as conn:
-            rows = conn.execute(
-                "SELECT payload FROM hunt_history WHERE level IN "
-                "('TAKE-PROFIT','STOP-LOSS','WANG-EDGE-DECAY','EV-CONVERGENCE','EXPIRED')"
-            ).fetchall()
-    except Exception:
-        return []
-
-    deltas = []
-    for (payload_raw,) in rows:
-        payload = _parse_payload_value(payload_raw)
-        if not isinstance(payload, dict):
-            continue
-        if not payload.get("sold"):
-            continue
-        price = payload.get("price")
-        initial_price = payload.get("initial_price")
-        if price is None or initial_price is None:
-            continue
-        try:
-            deltas.append(float(price) - float(initial_price))
-        except (TypeError, ValueError):
-            continue
-    return deltas
+def get_closed_trade_deltas(db_path: str, venue: str | None = None) -> list:
+    """Per-share $ P&L (exit price - entry price) for every confirmed
+    close (sale or paid-out resolution) in the Ledger, optionally on one
+    venue."""
+    return Ledger(db_path).closed_trade_deltas(venue=venue)
 
 
-_TRANSACTION_TYPE_LABELS = {
-    "LIVE-TRADE": "BUY", "DRY-RUN": "BUY", "PAPER-TRADE": "BUY",
+_SELL_REASON_LABELS = {
     "TAKE-PROFIT": "SELL (Take-Profit)", "STOP-LOSS": "SELL (Stop-Loss)",
     "WANG-EDGE-DECAY": "SELL (Edge Decay)", "EV-CONVERGENCE": "SELL (EV Converged)",
-    "EXPIRED": "EXPIRED",
+    "PORTFOLIO-CULL": "SELL (Cull)", "OPPORTUNITY-SWAP": "SELL (Swap)",
+    "ARBITRAGE-TRIM": "SELL (Arb Trim)", "ARBITRAGE-UNWIND": "SELL (Arb Unwind)",
 }
 
 _TRANSACTIONS_COLUMNS = [
@@ -764,74 +583,40 @@ _TRANSACTIONS_COLUMNS = [
 ]
 
 
-def fetch_transactions(db_path: str, limit: int = 100) -> pd.DataFrame:
-    """Every buy (entry) and sell/expiry (exit) row as one ledger, newest
-    first — backs the "Transactions" table folded into the Portfolio view.
+def _transaction_type_label(trade: dict) -> str:
+    if trade["kind"] == "BUY":
+        return "BUY"
+    if trade["kind"] == "SELL":
+        return _SELL_REASON_LABELS.get(trade.get("reason") or "", "SELL")
+    if trade["kind"] == "UNFILLED":
+        return "UNFILLED"  # a live entry order that never filled
+    return "EXPIRED"  # RESOLVED (paid out) or EXPIRED (unconfirmed)
 
-    Buys are EXEC_LEVELS (LIVE-TRADE/DRY-RUN/PAPER-TRADE); exits are
-    CLOSE_LEVELS (see get_trade_stats()) plus EXPIRED market resolutions
-    (PaperAdapter.resolve_closed_markets() in paper mode,
-    PortfolioManager._exit_position()'s gave-up branch in live mode).
 
-    A non-EXPIRED exit row without payload["sold"] is a failed sell retry,
-    not a real closed trade — dropped, same filter get_closed_trade_deltas()
-    applies. EXPIRED rows are always kept even when sold is False: that's
-    the live-mode "gave up, likely resolved, no confirmed payout" flag,
-    which is a one-time event (not a retry loop) worth surfacing even
-    without a known P&L (see _exit_position()'s EXPIRED branch).
-    """
-    levels_sql = "'" + "','".join(_TRANSACTION_TYPE_LABELS.keys()) + "'"
+def fetch_transactions(db_path: str, limit: int = 100, venue: str | None = None) -> pd.DataFrame:
+    """Every buy, sale, resolution and expiry in the Ledger (optionally on
+    one venue), newest first — backs the "Transactions" table folded into
+    the Portfolio view."""
     try:
-        with _open_db(db_path) as conn:
-            rows = conn.execute(
-                f"SELECT timestamp, level, token_id, payload FROM hunt_history "
-                f"WHERE level IN ({levels_sql}) ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+        trades = Ledger(db_path).transactions(limit=limit, venue=venue)
     except Exception:
         return pd.DataFrame(columns=_TRANSACTIONS_COLUMNS)
 
     records = []
-    for timestamp, level, token_id, payload_raw in rows:
-        payload = _parse_payload_value(payload_raw)
-        if not isinstance(payload, dict):
-            continue
-
-        is_buy = level in ("LIVE-TRADE", "DRY-RUN", "PAPER-TRADE")
-        if not is_buy and level != "EXPIRED" and not payload.get("sold"):
-            continue
-
-        shares = payload.get("shares")
-        price = payload.get("price")
-        initial_price = payload.get("initial_price")
-        amount = payload.get("bet_amount_usd", payload.get("bet_usd"))
-        if amount is None and price is not None and shares is not None:
-            try:
-                amount = float(price) * float(shares)
-            except (TypeError, ValueError):
-                amount = None
-
-        pnl_per_share = None
-        if not is_buy and price is not None and initial_price is not None:
-            try:
-                pnl_per_share = float(price) - float(initial_price)
-            except (TypeError, ValueError):
-                pnl_per_share = None
-
-        if is_buy:
+    for t in trades:
+        if t["kind"] == "BUY":
             status = "Confirmed"
         else:
-            status = "Sold" if payload.get("sold") else "Unconfirmed"
-
+            status = "Sold" if t["confirmed"] else "Unconfirmed"
         records.append({
-            "Time": timestamp,
-            "Type": _TRANSACTION_TYPE_LABELS.get(level, level),
-            "Side": str(payload.get("side", "-") or "-").upper(),
-            "Market Name": payload.get("market_name") or str(token_id),
-            "Price": price,
-            "Shares": shares,
-            "Amount ($)": amount,
-            "P&L ($/share)": pnl_per_share,
+            "Time": t["time"],
+            "Type": _transaction_type_label(t),
+            "Side": str(t.get("side") or "-").upper(),
+            "Market Name": t.get("market_name") or str(t["token_id"]),
+            "Price": t["price"],
+            "Shares": t["shares"],
+            "Amount ($)": t["amount_usd"],
+            "P&L ($/share)": t["pnl_per_share"],
             "Status": status,
         })
 
@@ -856,7 +641,7 @@ def get_equity_curve(db_path: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["timestamp", "total_equity"])
 
-    payloads = df["payload"].apply(_parse_payload_value)
+    payloads = df["payload"].apply(parse_payload)
     df["total_equity"] = payloads.apply(
         lambda p: float(p["total_equity"]) if isinstance(p, dict) and p.get("total_equity") is not None else None
     )
@@ -865,7 +650,16 @@ def get_equity_curve(db_path: str) -> pd.DataFrame:
     return df.dropna(subset=["timestamp"])[["timestamp", "total_equity"]]
 
 
-def restore_runtime_state(db_path: str, fallback_starting_balance: float) -> dict:
+def restore_runtime_state(db_path: str, fallback_starting_balance: float, now: datetime | None = None) -> dict:
+    """Engine state to resume from after a restart or redeploy.
+
+    spent_today comes from the Ledger (today's entry fills, UTC day, as the
+    Account counts them; a diagnostic here, the Account seeds its own budget
+    from the Ledger). Balances resume
+    from the last engine_status the engine published before it stopped;
+    they are refreshed from the Venue on the first sync after startup.
+    hunt_history is not consulted: it is a diagnostics log, not state.
+    """
     state = {
         "starting_balance": float(fallback_starting_balance),
         "current_balance": float(fallback_starting_balance),
@@ -874,43 +668,23 @@ def restore_runtime_state(db_path: str, fallback_starting_balance: float) -> dic
         "source": "default",
     }
 
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
     try:
-        with _open_db(db_path) as conn:
-            rows = conn.execute(
-                "SELECT level, payload FROM hunt_history WHERE level IN ('LOOP-SUMMARY','TRACK') ORDER BY id DESC LIMIT 250"
-            ).fetchall()
-    except Exception:
-        return state
+        state["spent_today"] = Ledger(db_path).spent_on(today)
+    except Exception as e:
+        print(f"[RESTORE] Could not read today's spend from the Ledger: {e}")
 
-    for level, payload_raw in rows:
-        payload = _parse_payload_value(payload_raw)
-        if not isinstance(payload, dict):
-            continue
-
-        if state["source"] == "default":
-            for key in ("cash", "current_balance", "available_cash", "total_equity"):
-                val = payload.get(key)
-                if val is not None:
-                    try:
-                        fval = float(val)
-                        if fval > 0:
-                            state["current_balance"] = fval
-                            state["starting_balance"] = fval
-                            state["source"] = f"db:{level}:{key}"
-                            break
-                    except Exception:
-                        continue
-
-        for key in ("start_of_day_equity", "spent_today"):
-            val = payload.get(key)
-            if val is not None:
-                try:
-                    state[key] = float(val)
-                except Exception:
-                    pass
-
-        if state["source"] != "default" and state["start_of_day_equity"] > 0:
-            break
+    status = read_engine_status(db_path)
+    if status:
+        balance = float(status.get("current_balance") or 0.0)
+        starting = float(status.get("starting_balance") or 0.0)
+        if balance > 0 or starting > 0:
+            state["current_balance"] = balance
+            state["starting_balance"] = starting if starting > 0 else balance
+            state["source"] = "engine_status"
 
     return state
 

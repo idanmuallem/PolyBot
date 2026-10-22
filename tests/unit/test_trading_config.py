@@ -7,6 +7,16 @@ import pytest
 from core.trading_config import TradingConfig, DEFAULT_ENTRY_K
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_env(monkeypatch):
+    # from_env() calls load_dotenv("config/.env"), which would re-inject a
+    # developer's leftover WANG_LAMBDA / MODEL_WEIGHT and flip the warning
+    # assertions below. Each test sets exactly the env it needs.
+    monkeypatch.setattr("core.trading_config.load_dotenv", lambda *a, **k: None)
+    for key in ("WANG_LAMBDA", "ENTRY_K", "MODEL_WEIGHT"):
+        monkeypatch.delenv(key, raising=False)
+
+
 # ── entry_k range validation (__post_init__) ────────────────────────────────
 
 def test_entry_k_in_range_is_preserved():

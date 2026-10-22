@@ -8,10 +8,9 @@ Pipeline order per loop:
 """
 
 import asyncio
-import math
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from brains import get_brain_for_asset_type
@@ -19,7 +18,11 @@ from brains.base import calculate_tte
 from core.models import PRICE_FLOOR, PRICE_CEILING, MarketData
 from core.wallet_context import WalletContext
 from core.polymarket_client import PolymarketClient
+from trading.account import Account, Refused
+from trading.gate import Skip
+from trading.kelly import kelly_bet_size
 from trading.strategies import EventSumStrategy, Strategy
+from trading.venue import LimitOrder, MarketRef, PositionsUnavailable, whole_cent_shares
 from ui import data_manager
 
 
@@ -36,27 +39,6 @@ from ui import data_manager
 _MIN_ARBITRAGE_MARGIN = 0.02
 
 
-def sync_live_account_state(bridge, executor, portfolio_manager, log_func):
-    """Refresh live positions and collateral balance into bridge state.
-
-    Free function (not a pipeline method) so it can run before a
-    SequentialTradingPipeline exists — e.g. by a caller wiring up
-    WalletContext components, which needs a live balance to construct
-    BudgetManager with an accurate initial_balance.
-    """
-    try:
-        portfolio_manager._refresh_portfolio()
-    except Exception as exc:
-        log_func("SYNC-WARN", "Pipeline", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
-
-    try:
-        balance = float(executor.get_balance())
-        bridge.current_balance = balance
-        bridge.cash = balance
-    except Exception as exc:
-        log_func("SYNC-WARN", "Pipeline", "balance", {"reason": "balance_fetch_failed", "error": str(exc)})
-
-
 @dataclass
 class CandidateTrade:
     market: MarketData
@@ -66,7 +48,7 @@ class CandidateTrade:
     post_prob: float
     pre_prob: float
     kelly_size: float       # raw Kelly criterion fraction (edge/odds), before confidence/kelly_fraction scaling
-    kelly_bet_usd: float    # final dollar bet size — confidence- and kelly_fraction-scaled, clamped to max_bet_size_usd
+    kelly_bet_usd: float    # Kelly dollar bet size — confidence- and kelly_fraction-scaled, before the Account's caps
     model_used: str
     price_yes: float
     side: str
@@ -92,13 +74,12 @@ class CandidateTrade:
 
 
 class SequentialTradingPipeline:
-    def __init__(self, ctx: WalletContext, log_func, delay: float | None = None):
-        if not all([ctx.executor, ctx.scanner, ctx.portfolio_manager, ctx.budget_manager]):
+    def __init__(self, ctx: WalletContext, log_func, delay: float | None = None, clock=None):
+        if not all([ctx.executor, ctx.scanner, ctx.portfolio_manager]):
             missing = [name for name, val in [
                 ("executor", ctx.executor),
                 ("scanner", ctx.scanner),
                 ("portfolio_manager", ctx.portfolio_manager),
-                ("budget_manager", ctx.budget_manager),
             ] if val is None]
             raise ValueError(f"WalletContext missing required components: {missing}")
 
@@ -108,6 +89,8 @@ class SequentialTradingPipeline:
         self.db_path = ctx.db_path
         self.log_func = log_func
         self.loop_delay = float(delay) if delay is not None else float(self.config.loop_delay_seconds)
+        # UTC "now" for the Account's daily budget reset.
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.min_ev_threshold = float(self.config.min_ev)
         self.max_bet_size_usd = float(self.config.max_bet_size_usd)
         self.safe_minimum = 1.0
@@ -122,6 +105,25 @@ class SequentialTradingPipeline:
         self.executor = ctx.executor
         self.hunter = ctx.scanner
 
+        # The pipeline owns the active Venue: every Venue this wallet can
+        # trade on, by name, and the one traded on now. A mode change from
+        # the dashboard swaps it at a tick boundary (see
+        # _apply_mode_request()), so no tick runs half Dry run, half Live
+        # run. self.venue is the only reference: the executor, the Account
+        # and (through the executor) the Gate and PortfolioManager all read
+        # it, and its `name` is the venue tag on every Ledger row.
+        self.venue = self.executor.venue
+        self.executor.trade_on(lambda: self.venue)
+        self.venues = dict(getattr(ctx, "venues", None) or {})
+        self.venues.setdefault(self.venue.name, self.venue)
+        self._refused_mode: str | None = None
+        self._last_resolve_check_at = 0.0
+        self._last_drift = None  # last logged Venue/Ledger drift (see _reconcile())
+        self._positions_unavailable = False  # outage logged (see _reconcile())
+        # Typed trade record (trading/ledger.py). The engine is its only
+        # writer; None (e.g. a bare test context) means not recording.
+        self.ledger = getattr(ctx, "ledger", None)
+
         # Constraint-based strategies (arbitrage) — model-free, run independently
         # of the brain/PricingEngine path above. See _stage_strategy_scan().
         self.polymarket_client = PolymarketClient()
@@ -133,103 +135,49 @@ class SequentialTradingPipeline:
         # tte_exceeds_max, or daily_trade_limit_would_be_exceeded — none of
         # these conditions change between scans (the per-strategy budget and
         # trade count only reset daily; a leg's expiry date is fixed), so
-        # re-evaluating the same groups every 30s was pure waste. Cleared in
-        # _reset_daily_if_needed().
+        # re-evaluating the same groups every 30s was pure waste. Cleared
+        # when the Account starts a new budget day (see tick()).
         self._exhausted_arb_groups: set[str] = set()
-
-        # token_ids "held" this "day" via a dry-run/paper-trade fill. Neither
-        # mode submits a real order, so TradeExecutor.get_open_positions()
-        # (which always queries the live Polymarket Data API - see
-        # _stage_evaluate_ev's "already_owned_in_portfolio" check) never sees
-        # them, and without this the same EV-positive market gets re-bought
-        # every hunt cycle. Live mode's real on-chain position already
-        # covers this once the order settles; this is purely a simulated-
-        # mode backstop. Cleared in _reset_daily_if_needed().
-        self._simulated_positions: set[str] = set()
-
-        # group_ids successfully filled this "day" - this applies in EVERY
-        # mode, not just simulated ones (unlike _simulated_positions above):
-        # the arbitrage path has no "already hold this" check of its own at
-        # all, so a group gets rediscovered and re-filled every scan for as
-        # long as it stays profitable in the live Gamma API snapshot.
-        # Cleared in _reset_daily_if_needed().
-        self._filled_arb_groups: set[str] = set()
 
         self.portfolio_manager = ctx.portfolio_manager
 
-        sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
-        if float(getattr(self.bridge, "starting_balance", 0.0) or 0.0) <= 0.0:
-            self.bridge.starting_balance = float(self.bridge.current_balance)
+        # Entry and exit eligibility (already held on either side, post-exit
+        # cooldown, exit attempt cap) for model entries, arbitrage baskets
+        # and every exit path. One Gate, shared with the PortfolioManager
+        # that makes the exits, so an exit's cooldown blocks re-entry here.
+        # Holdings come from the Ledger, so the answer survives restarts.
+        self.gate = self.portfolio_manager.gate
 
-        self.budget_manager = ctx.budget_manager
-
-        self.spent_today = float(getattr(self.bridge, "spent_today", 0.0) or 0.0)
-        self.spend_day = datetime.now(timezone.utc).date()
-        self.start_of_day_equity = float(getattr(self.bridge, "start_of_day_equity", 0.0) or 0.0)
-
-        # Drawdown circuit breaker — pauses new trade entry (not exits) once
-        # equity has fallen more than max_drawdown_pct from its peak.
-        self.max_drawdown_pct = float(getattr(self.config, "max_drawdown_pct", 0.20))
-        self.peak_equity = self._total_equity()
-        self._update_drawdown_guard()
-
-    # ------------------------------------------------------------------
-    # Bridge helpers — keep related fields in sync
-    # ------------------------------------------------------------------
-
-    def _set_cash(self, amount: float):
-        self.bridge.current_balance = float(amount)
-        self.bridge.cash = float(amount)
-
-    def _set_spend(self, amount: float):
-        self.bridge.spent_today = float(amount)
-        self.bridge.daily_spend = float(amount)
-
-    def _total_equity(self) -> float:
-        return float(self.bridge.current_balance) + float(self.bridge.open_position_value)
-
-    def _update_drawdown_guard(self):
-        """Drawdown circuit breaker: pause new trade entry (not position
-        management/exits) once equity has fallen more than max_drawdown_pct
-        from its peak. Call every loop tick, after balances/positions are synced.
-
-        The peak-tracking/threshold pattern mirrors oracle3's
-        StandardRiskManager._check_drawdown() (oracle3/risk/risk_manager.py) -
-        https://github.com/YichengYang-Ethan/oracle3, licensed under the
-        Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
-        """
-        current_equity = self._total_equity()
-        if current_equity > self.peak_equity:
-            self.peak_equity = current_equity
-
-        drawdown_pct = (
-            (self.peak_equity - current_equity) / self.peak_equity
-            if self.peak_equity > 0 else 0.0
+        # The single writer of cash, equity, the drawdown breaker and the
+        # daily budget (spend limits, trade counts, max-bet ceiling) for
+        # model and arbitrage entries alike. It reads whichever Venue the
+        # pipeline has active, so a mode swap at the tick boundary moves
+        # cash with it. Exits that need fresh cash (free_up_capital) read it
+        # through the same Account.
+        self.account = Account(
+            active_venue=lambda: self.venue,
+            bridge=self.bridge,
+            ledger=self.ledger,
+            max_drawdown_pct=float(getattr(self.config, "max_drawdown_pct", 0.20)),
+            log_func=log_func,
+            config=self.config,
         )
-        should_pause = drawdown_pct >= self.max_drawdown_pct
+        self.account.daily_reset(self.clock())
+        ctx.account = self.account
+        self.portfolio_manager.account = self.account
 
-        was_paused = bool(getattr(self.ctx, "drawdown_paused", False))
-        self.ctx.drawdown_paused = should_pause
-        self.bridge.drawdown_paused = should_pause
-        self.bridge.peak_equity = self.peak_equity
-        self.bridge.current_drawdown_pct = drawdown_pct
+        self._sync_account()
+        if float(getattr(self.bridge, "starting_balance", 0.0) or 0.0) <= 0.0:
+            self.bridge.starting_balance = self.account.cash
 
-        if should_pause and not was_paused:
-            self.log_func("CIRCUIT-BREAKER", "Pipeline", "drawdown", {
-                "reason": "max_drawdown_pct breached — new trade entry paused; "
-                          "position management/exits still run",
-                "peak_equity": round(self.peak_equity, 4),
-                "current_equity": round(current_equity, 4),
-                "drawdown_pct": round(drawdown_pct, 4),
-                "max_drawdown_pct": self.max_drawdown_pct,
-            })
-        elif was_paused and not should_pause:
-            self.log_func("CIRCUIT-BREAKER-CLEAR", "Pipeline", "drawdown", {
-                "reason": "equity recovered above max_drawdown_pct — new trade entry resumed",
-                "peak_equity": round(self.peak_equity, 4),
-                "current_equity": round(current_equity, 4),
-                "drawdown_pct": round(drawdown_pct, 4),
-            })
+    def _sync_account(self):
+        """Refresh the positions list risk works from, then the Account
+        (cash, equity, drawdown breaker) from the active Venue."""
+        try:
+            self.portfolio_manager.refresh_positions()
+        except Exception as exc:
+            self.log_func("SYNC-WARN", "Pipeline", "portfolio", {"reason": "positions_fetch_failed", "error": str(exc)})
+        self.account.refresh()
 
     def _reject(self, level: str, candidate: CandidateTrade, payload: dict):
         """Log a rejection, cool down the market, and signal the pipeline to skip."""
@@ -255,22 +203,6 @@ class SequentialTradingPipeline:
         }
 
     # ------------------------------------------------------------------
-
-    def _reset_daily_if_needed(self):
-        current_day = datetime.now(timezone.utc).date()
-        if current_day != self.spend_day:
-            self.spent_today = 0.0
-            self.spend_day = current_day
-            self.start_of_day_equity = 0.0
-            self._set_spend(0.0)
-            self.bridge.start_of_day_equity = 0.0
-            self.budget_manager.total_spent_today = 0.0
-            self.budget_manager.spent_by_strategy = {}
-            self.budget_manager.trades_by_strategy = {}
-            self.executor.reset_daily_count()
-            self._exhausted_arb_groups.clear()
-            self._simulated_positions.clear()
-            self._filled_arb_groups.clear()
 
     # ------------------------------------------------------------------
     # Strategy scan — constraint-based arbitrage, independent of the
@@ -346,8 +278,6 @@ class SequentialTradingPipeline:
                 continue
 
             for group_id, group_signals in self._group_signals(signals).items():
-                if group_id in self._filled_arb_groups:
-                    continue  # already hold this position, skip silently
                 if group_id in self._exhausted_arb_groups:
                     continue
                 await self._execute_strategy_group(strategy, group_id, group_signals)
@@ -377,58 +307,7 @@ class SequentialTradingPipeline:
 
     @staticmethod
     def _leg_token_id(signal) -> str:
-        return (
-            signal.market.market_id if signal.side == "YES"
-            else str(getattr(signal.market, "no_market_id", None) or signal.market.market_id)
-        )
-
-    def _held_token_map(self) -> dict:
-        """token_id -> live Position for every currently open real position,
-        keyed the same way _leg_token_id() results are looked up elsewhere
-        in this class (asset_id, falling back to token_id)."""
-        return {
-            str(getattr(position, "asset_id", getattr(position, "token_id", ""))): position
-            for position in (getattr(self.bridge, "current_portfolio", None) or [])
-        }
-
-    def _group_already_held(self, signals: list) -> bool:
-        """True only if EVERY currently-valid leg of this group is already
-        an open position — i.e. the basket is genuinely complete.
-
-        Used to be an ANY-leg check ("is at least one leg of this event
-        held?"), which permanently marked the WHOLE event "done" the
-        instant a single leg was bought — including legs that didn't exist
-        yet at buy time and were added to the event later (confirmed via
-        real data: the Nobel Peace Prize event has 20 currently-valid legs
-        per EventSumStrategy._extract_legs(), only 12 held; the other 8
-        aren't filtered out by _extract_legs() at all, they simply weren't
-        part of the event yet when it was first bought — the ANY-check saw
-        the 12 held tokens among today's 20 signals and called the whole
-        group done, forever). An ALL-legs check instead only treats the
-        group as complete when every leg currently valid is actually held,
-        so _execute_strategy_group can keep topping up a partial basket as
-        new legs appear, while a genuinely complete basket still gets
-        skipped so it isn't re-evaluated every scan.
-
-        _filled_arb_groups (the primary re-buy guard) is in-memory and
-        resets to empty on every process restart, while the positions it's
-        meant to prevent re-buying persist across restarts (paper positions
-        on disk, live positions on-chain). Without this check, a redeploy
-        wipes the guard but not the holdings, and the very next strategy
-        scan re-discovers and re-buys every still-profitable arbitrage group
-        it already holds — this is the confirmed root cause of a rapid-fire
-        trade/holdings burst observed after redeploys. Checking the actual
-        current portfolio (refreshed every loop tick, before this runs) is
-        restart-proof because it reflects real holdings, not session state.
-        """
-        if not signals:
-            return False
-        held_tokens = self._held_token_map()
-        return all(
-            self._leg_token_id(signal) in held_tokens
-            or self._leg_token_id(signal) in self._simulated_positions
-            for signal in signals
-        )
+        return MarketRef.from_market(signal.market).token_for(signal.side)
 
     async def _execute_strategy_group(self, strategy: Strategy, group_id: str, signals: list):
         """Execute every leg of one strategy opportunity (e.g. every outcome
@@ -471,39 +350,28 @@ class SequentialTradingPipeline:
         tagged_log = self._tag_log_func(strategy.strategy_type)
         asset_type = signals[0].market.asset_type
 
-        if self._group_already_held(signals):
-            tagged_log("SCAN-SKIP", asset_type, group_id, {"reason": "already_owned_in_portfolio"})
-            self._filled_arb_groups.add(group_id)
+        # The Gate refuses a basket that is fully held (or can't be
+        # completed: a leg held on its other side, or cooling down after an
+        # exit) and otherwise names the legs still missing. Only those are
+        # bought, and only new capital goes through the TTE/budget/trade-count
+        # gates below. `signals` (the full basket) and `held_legs` are kept
+        # for the group-level profitability re-verification further down,
+        # which judges completing the basket against its real total cost:
+        # the sunk cost of what's already held plus what's newly bought.
+        decision = self.gate.can_enter(signals)
+        if isinstance(decision, Skip):
+            tagged_log("SCAN-SKIP", asset_type, group_id, {"reason": decision.reason, **decision.detail})
             return
-
-        # Some (not all) legs are already held — _group_already_held above
-        # only returned False because at least one currently-valid leg is
-        # missing. Only attempt to buy the missing legs: re-buying a leg
-        # already held would just double the position for no reason.
-        # `missing_signals` drives what actually gets bought (and the TTE/
-        # budget/trade-count gates below, since only new capital is at
-        # stake there); `signals` (the FULL current basket) and
-        # `held_signals` are kept for the group-level profitability
-        # re-verification further down, which judges completing the
-        # basket against its real total cost — sunk cost of what's already
-        # held plus the cost of what's newly bought — not just the cost of
-        # this one attempt in isolation. See that section for why.
-        held_tokens = self._held_token_map()
-
-        def _is_held(s):
-            tid = self._leg_token_id(s)
-            return tid in held_tokens or tid in self._simulated_positions
-
-        missing_signals = [s for s in signals if not _is_held(s)]
-        held_signals = [s for s in signals if _is_held(s)]
+        missing_signals = list(decision.legs)
+        held_legs = list(decision.held)  # (signal, Ledger Holding)
+        held_signals = [signal for signal, _holding in held_legs]
 
         if self._group_has_leg_beyond_max_tte(missing_signals, group_id, asset_type, tagged_log):
             self._exhausted_arb_groups.add(group_id)
             return
 
         total_cost = sum(float(s.bet_amount_usd) for s in missing_signals)
-        cash_balance = float(self.bridge.current_balance)
-        remaining_budget = float(self.budget_manager.get_remaining_budget("arbitrage"))
+        cash_balance = self.account.cash
 
         # Distinct reject reasons (Point 5): "can't afford it" (wallet cash)
         # vs "budget exhausted" (this strategy's own daily allocation) are
@@ -519,54 +387,30 @@ class SequentialTradingPipeline:
             })
             return
 
-        if total_cost > remaining_budget:
+        # Every leg is one trade: the basket is reserved whole against the
+        # same daily spend limits, trade counts and max-bet ceiling as a
+        # model entry (Account.reserve()). It is all-or-nothing, so a
+        # partial approval is a rejection too.
+        budget = self.account.reserve("arbitrage", total_cost, trades=len(missing_signals))
+        if isinstance(budget, Refused) or budget.usd < total_cost:
+            reason, detail = (
+                (budget.reason, budget.detail) if isinstance(budget, Refused)
+                else ("insufficient_budget", {"approved_usd": round(budget.usd, 4)})
+            )
             tagged_log("REJECTED", asset_type, group_id, {
-                "reason": "insufficient_budget",
+                "reason": reason,
                 "group_id": group_id,
                 "n_legs": len(missing_signals),
                 "total_cost": round(total_cost, 4),
-                "remaining_budget": round(remaining_budget, 4),
-            })
-            self._exhausted_arb_groups.add(group_id)
-            return
-
-        arbitrage_max_daily_trades = self.executor._strategy_max_daily_trades("arbitrage")
-        arbitrage_trades_today = self.executor.trades_by_strategy.get("arbitrage", 0)
-        if arbitrage_trades_today + len(missing_signals) > arbitrage_max_daily_trades:
-            tagged_log("REJECTED", asset_type, group_id, {
-                "reason": "daily_trade_limit_would_be_exceeded",
-                "group_id": group_id,
-                "n_legs": len(missing_signals),
-            })
-            self._exhausted_arb_groups.add(group_id)
-            return
-
-        # Belt-and-suspenders hard ceiling (Point: runaway-trade-rate fix):
-        # the check above only compares against this strategy's own
-        # allocation (arbitrage_max_daily_trades, e.g. 200) — it says
-        # nothing about the account-wide MAX_DAILY_TRADES ceiling a human
-        # actually configured. TradingConfig only *warns* if per-strategy
-        # caps are set to sum higher than the global one; it never clamps
-        # them. This check makes the global cap a real ceiling regardless
-        # of how per-strategy limits are configured, so no single strategy
-        # (or misconfiguration) can spend the whole account's daily
-        # allowance through its own generous per-strategy bucket.
-        global_max_daily_trades = int(self.executor.config.max_daily_trades)
-        if self.executor.trade_count_today + len(missing_signals) > global_max_daily_trades:
-            tagged_log("REJECTED", asset_type, group_id, {
-                "reason": "global_daily_trade_limit_would_be_exceeded",
-                "group_id": group_id,
-                "n_legs": len(missing_signals),
-                "trade_count_today": self.executor.trade_count_today,
-                "global_max_daily_trades": global_max_daily_trades,
+                **detail,
             })
             self._exhausted_arb_groups.add(group_id)
             return
 
         legs = []
         for signal in missing_signals:
-            shares = math.floor((signal.bet_amount_usd / signal.price) * 100.0) / 100.0
-            if shares <= 0:
+            shares = whole_cent_shares(signal.bet_amount_usd, signal.price)
+            if not shares or shares <= 0:
                 continue
             legs.append({
                 "token_id": self._leg_token_id(signal),
@@ -585,11 +429,26 @@ class SequentialTradingPipeline:
             legs=legs,
             timeout_seconds=float(getattr(self.config, "arbitrage_order_timeout_seconds", 60.0)),
             log_func=tagged_log,
-            strategy_tag="arbitrage",
         )
 
         fills: dict = dict(result.get("fills") or {})
         arb_sets = float(result.get("arb_sets", 0.0) or 0.0)
+
+        # Every share that filled is a real entry, whatever happens to the
+        # basket below (kept, trimmed or unwound): record each leg's fill
+        # in the Ledger now, and each sale back as it happens.
+        # Each filled leg is also one trade and its leg's dollars of spend
+        # in the Account, and cash is re-read from the Venue.
+        for signal in missing_signals:
+            filled = float(fills.get(self._leg_token_id(signal), 0.0))
+            self._record_arbitrage_entry(signal, group_id, filled)
+            if filled > 0:
+                self.account.record_fill("arbitrage", float(signal.bet_amount_usd))
+        self.account.refresh()
+
+        def _sell_back(signal, tid, shares, reason):
+            if self.executor.sell_position(tid, shares, signal.price, tagged_log):
+                self._record_arbitrage_sale(signal, tid, shares, reason)
 
         # Cap the guaranteed-set size by the ALREADY-HELD legs' real share
         # counts too, not just this attempt's fills. A top-up buy is sized
@@ -599,21 +458,9 @@ class SequentialTradingPipeline:
         # at $0.02 buys ~50 shares/$1; legs bought earlier around $0.25
         # might only hold ~4 shares each) — the true guaranteed structure
         # is bounded by the SCARCEST leg across the WHOLE basket, held or
-        # new, not just what got bought in this one attempt. Legs held only
-        # via _simulated_positions (a same-tick dry-run backstop with no
-        # share-count data of its own — see its definition in __init__)
-        # can't be capped this way; treating them as unconstrained here is
-        # the conservative choice, since in practice _execute_strategy_group
-        # never adds to _simulated_positions itself (only the model-driven
-        # path does), so this case doesn't arise for arbitrage legs today.
-        if arb_sets > 0 and held_signals:
-            held_share_counts = [
-                float(getattr(held_tokens[self._leg_token_id(s)], "shares", 0.0))
-                for s in held_signals
-                if self._leg_token_id(s) in held_tokens
-            ]
-            if held_share_counts:
-                arb_sets = min(arb_sets, min(held_share_counts))
+        # new, not just what got bought in this one attempt.
+        if arb_sets > 0 and held_legs:
+            arb_sets = min(arb_sets, min(float(holding.shares) for _s, holding in held_legs))
 
         # Group-level guaranteed-profit re-verification against REAL fills.
         # EventSumStrategy's own scan-time edge check (sum of lastTradePrice
@@ -644,11 +491,7 @@ class SequentialTradingPipeline:
                 if filled > 0:
                     per_leg_unit_cost[tid] = float(signal.bet_amount_usd) / filled
 
-            held_unit_costs = [
-                float(getattr(held_tokens[self._leg_token_id(s)], "initial_price", 0.0))
-                for s in held_signals
-                if self._leg_token_id(s) in held_tokens
-            ]
+            held_unit_costs = [float(holding.entry_price) for _s, holding in held_legs]
 
             guaranteed_payout = arb_sets * 1.0
             guaranteed_cost = (
@@ -670,10 +513,7 @@ class SequentialTradingPipeline:
                     tid = self._leg_token_id(signal)
                     filled = fills.get(tid, 0.0)
                     if filled > 0:
-                        self.executor.sell_position(tid, filled, signal.price, tagged_log)
-                        self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
-                self.spent_today = float(self.budget_manager.total_spent_today)
-                self._set_spend(self.spent_today)
+                        _sell_back(signal, tid, filled, "ARBITRAGE-UNWIND")
 
                 tagged_log("REJECTED", asset_type, group_id, {
                     "reason": "not_profitable_after_real_fills",
@@ -710,15 +550,12 @@ class SequentialTradingPipeline:
             filled = fills.get(tid, 0.0)
             excess = round(filled - arb_sets, 4)
             if excess > 0:
-                self.executor.sell_position(tid, excess, signal.price, tagged_log)
+                _sell_back(signal, tid, excess, "ARBITRAGE-UNWIND" if arb_sets <= 0 else "ARBITRAGE-TRIM")
                 if arb_sets <= 0:
                     unwound_incomplete_group = True
-                    self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
                 fills[tid] = arb_sets
 
         if unwound_incomplete_group:
-            self.spent_today = float(self.budget_manager.total_spent_today)
-            self._set_spend(self.spent_today)
             tagged_log("REJECTED", asset_type, group_id, {
                 "reason": "group_incomplete_unwound_partial_fills",
                 "group_id": group_id,
@@ -748,9 +585,6 @@ class SequentialTradingPipeline:
 
             if executed:
                 executed_legs += 1
-                self.budget_manager.record_trade(float(signal.bet_amount_usd), strategy_tag="arbitrage")
-                self.spent_today = float(self.budget_manager.total_spent_today)
-                self._set_spend(self.spent_today)
 
         tagged_log("STRATEGY-GROUP", asset_type, group_id, {
             "group_id": group_id,
@@ -765,14 +599,6 @@ class SequentialTradingPipeline:
             "edge": round(signals[0].edge, 4),
             "total_cost": round(total_cost, 4),
         })
-
-        # We now hold at least part of this group's position - don't
-        # rediscover and re-buy it on a future scan (see
-        # _filled_arb_groups' definition in __init__). Gated on at least
-        # one real fill: a group where every leg got zero fills holds
-        # nothing and should stay eligible for a genuine future attempt.
-        if executed_legs > 0:
-            self._filled_arb_groups.add(group_id)
 
     async def _stage_hunt(self):
         """Run market discovery off the event loop.
@@ -805,48 +631,11 @@ class SequentialTradingPipeline:
         # unconditionally, before any evaluation begins, replaces all of them.
         self.hunter.add_to_cooldown(token_id)
 
-        # Dry-run/paper-trade equivalent of the real-portfolio check below -
-        # see _simulated_positions' definition in __init__. Neither mode
-        # submits a real order, so the real-portfolio check has nothing to
-        # catch; this is the session-level backstop for those modes.
-        if token_id in self._simulated_positions:
-            self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_held_simulated"})
-            return None
-
-        # Prevent buying a market already in the portfolio. A NO-side paper
-        # fill is recorded under the NO token's own id, not this market's
-        # YES-canonical token_id used above for hunting/evaluation -- see
-        # PaperAdapter.execute_buy()'s `outcome == "no"` branch in
-        # trading/paper_adapter.py, which maps the fill to no_token_id.
-        # Matching only token_id here meant this check silently never fired
-        # for any NO-side holding (confirmed in production: every held
-        # position was a NO-side paper fill, so the restart-proof check
-        # never caught any of them -- only the in-memory
-        # _simulated_positions backstop above did, which resets to empty on
-        # every process restart while the real paper positions persist to
-        # disk, so a restart let every held position get re-bought). Also
-        # matching no_market_id closes that gap.
-        no_token_id = str(getattr(market, "no_market_id", "") or "")
-        if hasattr(self.bridge, "current_portfolio") and self.bridge.current_portfolio:
-            for position in self.bridge.current_portfolio:
-                pos_token = str(getattr(position, "asset_id", getattr(position, "token_id", "")))
-                if pos_token == token_id or (no_token_id and pos_token == no_token_id):
-                    self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": "already_owned_in_portfolio"})
-                    return None
-
-        # Post-exit cooldown (see PortfolioManager.__init__/_exit_position):
-        # a loss-type exit (EV-CONVERGENCE, WANG-EDGE-DECAY, STOP-LOSS) blocks
-        # re-entry on that token for a while, to stop the buy/exit/re-buy
-        # churn an oscillating EV estimate can otherwise cause. A closed
-        # NO-side position is recorded under no_market_id, not this market's
-        # YES-canonical token_id -- same dual check as already_owned above.
-        cooldown_until = self.portfolio_manager.exit_cooldown_until(token_id)
-        if cooldown_until is None and no_token_id:
-            cooldown_until = self.portfolio_manager.exit_cooldown_until(no_token_id)
-        if cooldown_until is not None:
-            self.log_func("SCAN-SKIP", asset_type, token_id, {
-                "reason": "exit_cooldown", "until": str(cooldown_until),
-            })
+        # Already held (YES or NO side, per the Ledger) or inside the
+        # post-exit cooldown: see trading/gate.py.
+        decision = self.gate.can_enter(market)
+        if isinstance(decision, Skip):
+            self.log_func("SCAN-SKIP", asset_type, token_id, {"reason": decision.reason, **decision.detail})
             return None
 
         self.bridge.status = f"Scanning {asset_type}: {question[:60]}..."
@@ -939,11 +728,11 @@ class SequentialTradingPipeline:
         final_ev = signal.expected_value
         entry_price = float(signal.entry_price)
 
-        # Kelly sizing (BudgetManager.compute_kelly_bet_size): kelly_optimal =
-        # edge/odds for whichever side was actually picked — YES odds are
-        # (1 - price), NO odds are the complementary YES price — scaled by
-        # model confidence and kelly_fraction (quarter-Kelly by default),
-        # then clamped to max_bet_size_usd as a hard ceiling.
+        # Kelly sizing (trading/kelly.py): kelly_optimal = edge/odds for
+        # whichever side was actually picked — YES odds are (1 - price), NO
+        # odds are the complementary YES price — scaled by model confidence
+        # and kelly_fraction (quarter-Kelly by default). The max-bet ceiling
+        # and daily budget are applied by Account.reserve() at the risk stage.
         if side == "YES":
             kelly_edge = float(post_prob) - price_yes
             kelly_odds = 1.0 - price_yes
@@ -952,7 +741,11 @@ class SequentialTradingPipeline:
             kelly_odds = price_yes  # == 1 - price_no
 
         kelly_raw_fraction = signal.kelly_size
-        kelly_bet_usd = self.budget_manager.compute_kelly_bet_size(kelly_edge, kelly_odds, confidence)
+        kelly_bet_usd = kelly_bet_size(
+            kelly_edge, kelly_odds, confidence,
+            kelly_fraction=float(self.config.kelly_fraction),
+            bankroll_usd=float(self.config.bankroll_usd),
+        )
 
         # Correlation exposure (see trading/correlation.py): how correlated
         # this candidate is with the currently open book, on average — logged
@@ -990,7 +783,7 @@ class SequentialTradingPipeline:
             wang_fair_value=wang_fair_value,
             wang_edge=wang_edge,
             strategy_type="model",
-            kelly_fraction_used=self.budget_manager.kelly_fraction,
+            kelly_fraction_used=float(self.config.kelly_fraction),
             correlation_exposure=float(correlation_exposure),
             spot=(
                 float(live_truth.get("spot_price") or 0.0)
@@ -1000,14 +793,14 @@ class SequentialTradingPipeline:
         )
 
     def _stage_risk_and_budget(self, candidate: CandidateTrade):
-        cash_balance = float(self.bridge.current_balance)
+        cash_balance = self.account.cash
 
         if cash_balance < self.safe_minimum:
             self.bridge.status = "Portfolio Management Mode (cash below $1.00)"
             self.log_func("PORTFOLIO-MODE", "Pipeline", "cash_guard", {
                 "reason": "insufficient_cash_for_new_entries",
                 "cash": round(cash_balance, 4),
-                "open_positions_value": round(float(self.bridge.open_position_value), 4),
+                "open_positions_value": round(self.account.snapshot().open_position_value, 4),
                 "minimum_required_cash": round(self.safe_minimum, 4),
             })
             return 0.0, None
@@ -1036,25 +829,20 @@ class SequentialTradingPipeline:
                 "price_no": round(1.0 - candidate.price_yes, 4),
             })
 
-        # candidate.kelly_bet_usd is already confidence/kelly_fraction-scaled
-        # and clamped to max_bet_size_usd by BudgetManager.compute_kelly_bet_size();
-        # re-apply the ceiling explicitly here too, since it must hold as a
-        # hard cap regardless of how the bet size was derived upstream.
+        # The Account caps the Kelly size at the max-bet ceiling and what is
+        # left of today's budget, or refuses it (budget spent, daily trade
+        # count reached): the same rules arbitrage baskets go through.
         target_bet = candidate.kelly_bet_usd
-        desired_bet = min(target_bet, self.max_bet_size_usd)
-
-        budget_bet, budget_ok = self.budget_manager.cap_to_remaining_budget(desired_bet, strategy_tag="crypto")
-        if not budget_ok:
+        budget = self.account.reserve("crypto", target_bet)
+        if isinstance(budget, Refused):
             return self._reject("REJECTED", candidate, {
                 "market_name": candidate.question,
-                "reason": "daily_limit_reached",
+                "reason": budget.reason,
                 "kelly_size": round(candidate.kelly_size, 4),
                 "kelly_bet_usd": round(candidate.kelly_bet_usd, 4),
-                "strategy_daily_limit_usd": round(float(self.budget_manager._strategy_limit("crypto")), 4),
-                "strategy_spent_today": round(float(self.budget_manager.spent_by_strategy.get("crypto", 0.0)), 4),
-                "daily_limit_usd": round(float(self.budget_manager.daily_limit_usd), 4),
-                "spent_today": round(float(self.budget_manager.total_spent_today), 4),
+                **budget.detail,
             })
+        desired_bet = budget.usd
 
         available_cash = cash_balance
         freed_cash = 0.0
@@ -1072,13 +860,13 @@ class SequentialTradingPipeline:
             if available_cash < desired_bet:
                 try:
                     self.portfolio_manager.free_up_capital(desired_bet, self.log_func)
-                    available_cash = float(self.bridge.current_balance)
                 except Exception as exc:
                     print(f"[PIPELINE] free_up_capital failed: {exc}")
 
-            self._set_cash(available_cash)
+            # What the sales actually freed, as the Venue reports it.
+            available_cash = self.account.refresh().cash
 
-        approved_bet = min(desired_bet, budget_bet, available_cash)
+        approved_bet = min(desired_bet, available_cash)
         if approved_bet < self.safe_minimum:
             return self._reject("REJECTED", candidate, {
                 "market_name": candidate.question,
@@ -1096,7 +884,6 @@ class SequentialTradingPipeline:
                 "desired_bet": round(desired_bet, 4),
                 "actual_bet": round(approved_bet, 4),
                 "available_cash": round(available_cash, 4),
-                "budget_bet": round(budget_bet, 4),
             })
 
         return approved_bet, {
@@ -1105,8 +892,257 @@ class SequentialTradingPipeline:
             "desired_bet": desired_bet,
         }
 
+    def _record_model_entry(self, candidate: CandidateTrade, entry) -> None:
+        """Record one model entry in the Ledger, with its entry details.
+        Token, side, price and shares are what the executor placed
+        (TradeExecutor.evaluate_and_execute()'s PlacedEntry)."""
+        if self.ledger is None:
+            return
+        self.ledger.record_entry(
+            token_id=entry.token_id,
+            condition_id=getattr(candidate.market, "condition_id", None),
+            side=entry.side,
+            shares=entry.shares,
+            price=entry.price,
+            venue=self.venue.name,
+            strategy="crypto",
+            asset_type=candidate.asset_type,
+            market_name=candidate.question,
+            pre_prob=float(candidate.pre_prob),
+            post_prob=float(candidate.post_prob),
+            wang_edge=candidate.wang_edge,
+            order_id=getattr(entry, "order_id", None),
+        )
+
+    def _apply_mode_request(self) -> None:
+        """Tick boundary: trade on the Venue the dashboard asked for.
+
+        Polled from engine_control (DB) rather than read off self.bridge:
+        the dashboard runs as a separate OS process (see run_engine.py).
+        Defaults to paper when no control row exists yet (see
+        data_manager.read_live_trading_requested()). A mode with no Venue
+        (live without a usable CLOB client) is refused, logged once per
+        request.
+        """
+        wanted = "live" if data_manager.read_live_trading_requested(self.db_path) else "paper"
+        current = self.venue.name
+        if wanted == current:
+            self._refused_mode = None
+            return
+        venue = self.venues.get(wanted)
+        if venue is None:
+            if self._refused_mode != wanted:
+                self._refused_mode = wanted
+                self.log_func("MODE-SWITCH-REFUSED", "Engine", wanted, {
+                    "requested": wanted, "active": current, "reason": f"no_{wanted}_venue",
+                })
+            return
+        self._refused_mode = None
+        self.venue = venue
+        self.log_func("MODE-SWITCH", "Engine", wanted, {"from": current, "to": wanted})
+
+    def _record_arbitrage_entry(self, signal, group_id: str, filled_shares: float) -> None:
+        """Record one arbitrage leg fill in the Ledger, tagged with its
+        basket's group_id. Entry price is the leg's limit price."""
+        if self.ledger is None or filled_shares <= 0:
+            return
+        self.ledger.record_entry(
+            token_id=self._leg_token_id(signal),
+            condition_id=getattr(signal.market, "condition_id", None),
+            side=signal.side,
+            shares=filled_shares,
+            price=float(signal.price),
+            venue=self.venue.name,
+            strategy="arbitrage",
+            asset_type=signal.market.asset_type,
+            market_name=signal.market.market_name,
+            group_id=group_id,
+        )
+
+    def _record_arbitrage_sale(self, signal, token_id: str, shares: float, reason: str) -> None:
+        """Record a confirmed trim / unwind sale of an arbitrage leg."""
+        if self.ledger is None:
+            return
+        self.ledger.record_exit(
+            token_id=token_id, shares=float(shares), price=float(signal.price), reason=reason,
+            venue=self.venue.name, strategy="arbitrage", side=signal.side,
+            market_name=signal.market.market_name,
+        )
+
+    def _resolve_closed_markets(self) -> None:
+        """Every 15 minutes, settle closed markets on every Venue this wallet
+        holds (paper positions keep resolving while trading live), recording
+        each settlement in the Ledger under that Venue's name.
+
+        NOT asyncio.to_thread: PaperVenue's pm_trader sqlite3 connection is
+        bound to the thread that first used it -- this loop's thread (see
+        trading/paper_venue.py). to_thread hands the call to a worker thread,
+        which sqlite3 refuses, failing every resolution (28c7637). The
+        blocking network calls this makes are accepted the same way other
+        blocking calls are in this sequential loop.
+
+        resolve_arbitrage=config.enable_arbitrage: the ENABLE_ARBITRAGE kill
+        switch also covers this cleanup path, not just new-trade entry.
+        """
+        now = time.time()
+        if now - self._last_resolve_check_at < 900.0:
+            return
+        self._last_resolve_check_at = now
+        for venue in self.venues.values():
+            try:
+                venue.resolve_closed_markets(
+                    resolve_arbitrage=self.config.enable_arbitrage,
+                    log_func=self.log_func,
+                    on_resolved=lambda resolved, name=venue.name: self._record_resolution(resolved, name),
+                )
+            except Exception as e:
+                self.log_func("RESOLVE-ERROR", "Engine", venue.name, {"venue": venue.name, "error": str(e)})
+
+    # Share counts within this of each other agree: venues floor or round
+    # fills to cents, the Ledger records the requested size.
+    _RECONCILE_SHARE_TOLERANCE = 0.02
+
+    def _reconcile(self) -> None:
+        """Compare the active Venue's holdings (authoritative for share
+        quantities) with the Ledger's open positions on that venue, and log
+        drift: tokens only one side holds, and share-count mismatches.
+
+        Detection only; nothing is corrected. A drift is logged
+        (RECONCILE-DRIFT) when it first appears or changes, and its
+        clearing is logged (RECONCILE-OK), so an unchanged drift doesn't
+        flood the event log every tick.
+
+        While the Venue can't read its positions (PositionsUnavailable)
+        the tick's reconcile is skipped, unfilled entries included: an
+        outage is not absence. It is logged once per outage
+        (RECONCILE-UNAVAILABLE).
+        """
+        if self.ledger is None or self.venue is None:
+            return
+        try:
+            venue_shares: dict = {}
+            for p in self.venue.open_positions():
+                token = str(getattr(p, "token_id", "") or "")
+                venue_shares[token] = venue_shares.get(token, 0.0) + float(getattr(p, "shares", 0.0) or 0.0)
+            ledger_shares = {h.token_id: float(h.shares) for h in self.ledger.open_positions(venue=self.venue.name)}
+        except PositionsUnavailable as exc:
+            if not self._positions_unavailable:
+                self.log_func("RECONCILE-UNAVAILABLE", "Pipeline", self.venue.name, {
+                    "venue": self.venue.name, "reason": "positions_unavailable", "error": str(exc),
+                })
+            self._positions_unavailable = True
+            return
+        except Exception as exc:
+            self.log_func("SYNC-WARN", "Pipeline", "reconcile", {"reason": "reconcile_failed", "error": str(exc)})
+            return
+        self._positions_unavailable = False
+
+        if self._settle_resting_entries():
+            ledger_shares = {h.token_id: float(h.shares) for h in self.ledger.open_positions(venue=self.venue.name)}
+
+        venue_only = {t: n for t, n in venue_shares.items() if t not in ledger_shares and n > 0}
+        ledger_only = {t: n for t, n in ledger_shares.items() if t not in venue_shares}
+        mismatch = {
+            t: {"venue": venue_shares[t], "ledger": n}
+            for t, n in ledger_shares.items()
+            if t in venue_shares and abs(venue_shares[t] - n) > self._RECONCILE_SHARE_TOLERANCE
+        }
+        drift = {"venue_only": venue_only, "ledger_only": ledger_only, "share_mismatch": mismatch}
+        signature = (self.venue.name, repr(sorted((k, repr(sorted(v.items()))) for k, v in drift.items())))
+        previous = self._last_drift
+        if any(drift.values()):
+            if signature != previous:
+                self.log_func("RECONCILE-DRIFT", "Pipeline", self.venue.name, {"venue": self.venue.name, **drift})
+            self._last_drift = signature
+        elif previous is not None:
+            self.log_func("RECONCILE-OK", "Pipeline", self.venue.name, {"venue": self.venue.name})
+            self._last_drift = None
+
+    # How long a resting entry order may rest before the engine cancels it
+    # and keeps whatever filled.
+    _UNFILLED_GRACE = timedelta(minutes=5)
+
+    def _settle_resting_entries(self) -> bool:
+        """Settle the active Venue's entries whose order rests on the book
+        (Ledger holdings with an order id: a live buy is a GTC limit order,
+        accepted but not known to be filled) once the grace period is over.
+
+        The order is cancelled first, then polled for what filled:
+          nothing -> closed as unfilled (RECONCILE-UNFILLED, no P&L)
+          part    -> kept at the filled shares (RECONCILE-PARTIAL)
+          all     -> kept as recorded
+        A cancel that fails, or a fill that can't be read, keeps the entry
+        as it is; it is tried again next tick. The order id is in the
+        Ledger, so entries opened before a restart are settled too. Only
+        holdings on the active Venue are looked at, so a holding of the same
+        token on another Venue is never touched. True if any holding changed.
+        """
+        now = self.clock()
+        venue = self.venue
+        changed = False
+        for h in self.ledger.open_positions(venue=venue.name):
+            if not h.order_id:
+                continue
+            opened = _parse_utc(h.opened_at)
+            if opened is None or now - opened < self._UNFILLED_GRACE:
+                continue
+            try:
+                outcome = self._settle_resting_entry(venue, h)
+            except Exception as exc:
+                self.log_func("SYNC-WARN", "Pipeline", h.token_id, {
+                    "reason": "resting_entry_settle_failed", "order_id": h.order_id, "error": str(exc),
+                })
+                continue
+            changed = changed or outcome in ("unfilled", "partial")
+        return changed
+
+    def _settle_resting_entry(self, venue, h) -> Optional[str]:
+        order = LimitOrder(id=h.order_id, token_id=h.token_id)
+        cancel_rows = lambda level, asset_type, token_id, payload: self.log_func(  # noqa: E731
+            level, asset_type, token_id, {"reason": "resting_entry_timeout", **payload},
+        )
+        cancelled = venue.cancel_limit_order(order, log_func=cancel_rows)
+        filled = venue.poll_limit_orders([order]).get(order.id)
+        if filled is None:
+            return None  # fill unknown: keep, try again next tick
+        filled = float(filled)
+        fully = filled >= h.shares - self._RECONCILE_SHARE_TOLERANCE
+        if not fully and not cancelled:
+            return None  # still resting, may fill more: keep, try again next tick
+        outcome = self.ledger.settle_entry_order(
+            token_id=h.token_id, venue=venue.name, filled_shares=h.shares if fully else filled,
+        )
+        if outcome == "unfilled":
+            self.log_func("RECONCILE-UNFILLED", "Pipeline", h.token_id, {
+                "venue": venue.name, "order_id": h.order_id, "shares": h.shares,
+                "entry_price": h.entry_price, "opened_at": h.opened_at,
+                "reason": "entry order cancelled with nothing filled",
+            })
+        elif outcome == "partial":
+            self.log_func("RECONCILE-PARTIAL", "Pipeline", h.token_id, {
+                "venue": venue.name, "order_id": h.order_id, "ordered_shares": h.shares,
+                "filled_shares": filled, "entry_price": h.entry_price,
+                "reason": "entry order cancelled part filled",
+            })
+        return outcome
+
+    def _record_resolution(self, resolved: dict, venue: str) -> None:
+        """Record one market resolution reported by *venue* (see
+        Venue.resolve_closed_markets(on_resolved=...)) in the Ledger."""
+        if self.ledger is None:
+            return
+        self.ledger.record_resolution(
+            token_id=resolved["token_id"],
+            shares=float(resolved["shares"]),
+            payout_price=float(resolved["payout_price"]),
+            venue=venue,
+            entry_price=resolved.get("entry_price"),
+            side=resolved.get("side"),
+            market_name=resolved.get("market_name"),
+        )
+
     def _stage_execute(self, candidate: CandidateTrade, approved_bet: float, risk_context: dict):
-        executed = self.executor.evaluate_and_execute(
+        entry = self.executor.evaluate_and_execute(
             market=candidate.market,
             fair_value=float(candidate.post_prob),
             ev=float(candidate.final_ev),
@@ -1114,29 +1150,14 @@ class SequentialTradingPipeline:
             bet_amount_usd=float(approved_bet),
             side=candidate.side,
             log_func=self.log_func,
-            strategy_tag="crypto",
         )
+        executed = entry is not None
 
         if executed:
-            self.budget_manager.record_trade(float(approved_bet), strategy_tag="crypto")
-            self.spent_today = float(self.budget_manager.total_spent_today)
-            self._set_spend(self.spent_today)
-            if not self.executor.dry_run:
-                self._set_cash(max(0.0, float(self.bridge.current_balance) - float(approved_bet)))
-
-            # Record the simulated fill so _stage_evaluate_ev's
-            # already_held_simulated check can catch it next cycle - see
-            # _simulated_positions' definition in __init__. token_id (the
-            # market's canonical YES id, which is what _stage_evaluate_ev
-            # always keys its lookup on) is always added; the NO token is
-            # added too on a NO-side trade, in case anything else keys off it.
-            self._simulated_positions.add(candidate.token_id)
-            if candidate.side == "NO" and hasattr(candidate.market, "no_market_id"):
-                no_token = str(candidate.market.no_market_id or "")
-                if no_token:
-                    self._simulated_positions.add(no_token)
-
-            total_equity = self._total_equity()
+            self._record_model_entry(candidate, entry)
+            self.account.record_fill("crypto", float(approved_bet))
+            account = self.account.refresh()
+            total_equity = account.equity
 
             self.log_func("TRACK", candidate.asset_type, candidate.token_id, {
                 "market_name": candidate.question,
@@ -1155,7 +1176,7 @@ class SequentialTradingPipeline:
                 "target_bet_unclamped": round(float(risk_context.get("target_bet", 0.0)), 2),
                 "target_bet_usd": round(float(approved_bet), 2),
                 "available_cash": round(float(risk_context.get("available_cash", 0.0)), 2),
-                "spent_today": round(float(self.spent_today), 2),
+                "spent_today": round(float(account.spent_today), 2),
                 "strike_price": float(getattr(candidate.market, "strike_price", 0.0) or 0.0),
                 "expiry_date": str(getattr(candidate.market, "expiry_date", "") or ""),
                 # Entry-snapshot fields for forward calibration (joined to the
@@ -1176,98 +1197,72 @@ class SequentialTradingPipeline:
     async def run_forever(self):
         while True:
             await asyncio.sleep(self.loop_delay)
-            self._reset_daily_if_needed()
+            await self.tick()
 
-            # Periodic Market Resolution Check (Phase 3)
-            if getattr(self.executor, "dry_run", True):
-                now = time.time()
-                if now - getattr(self, "_last_resolve_check_at", 0.0) >= 900.0:  # 15 minutes
-                    self._last_resolve_check_at = now
-                    paper = getattr(self.executor, "paper", None)
-                    if paper is not None:
-                        try:
-                            # NOT asyncio.to_thread: pm_trader.Engine opens its
-                            # sqlite3 connection (check_same_thread defaults to
-                            # True, and the installed package exposes no way to
-                            # override it) in whatever thread first constructs
-                            # PaperAdapter — the polybot-engine thread that also
-                            # runs this loop. to_thread hands the call to a
-                            # ThreadPoolExecutor worker thread instead, which
-                            # sqlite3 then refuses ("SQLite objects created in a
-                            # thread can only be used in that same thread"),
-                            # failing resolve_all() on every call. Calling it
-                            # directly keeps it on the connection's owning
-                            # thread; the resulting blocking network calls
-                            # (resolve_all() checks each open position's market
-                            # via the Gamma API) are accepted here the same way
-                            # _get_order_filled_shares()/_cancel_order() accept
-                            # blocking calls elsewhere in this sequential loop —
-                            # this only runs once per 15 minutes.
-                            #
-                            # resolve_arbitrage=config.enable_arbitrage: the
-                            # ENABLE_ARBITRAGE kill switch also covers this
-                            # cleanup path, not just new-trade entry — see
-                            # PaperAdapter.resolve_closed_markets().
-                            paper.resolve_closed_markets(
-                                resolve_arbitrage=self.config.enable_arbitrage,
-                                log_func=self.log_func,
-                            )
-                        except Exception as e:
-                            self.log_func("PAPER-ERROR", "Engine", "resolve_all", {"error": str(e)})
+    async def tick(self):
+        """One engine loop iteration: mode switch, resolution, sync, exits,
+        Venue/Ledger reconcile, status flush, then new entries (unless
+        paused)."""
+        if self.account.daily_reset(self.clock()):
+            self._exhausted_arb_groups.clear()
 
-            # Polled from engine_control (DB) rather than read off self.bridge
-            # directly: the dashboard that sets this now runs as a separate
-            # OS process (see run_engine.py) and can no longer write straight
-            # into this process's in-memory bridge. Defaults to False
-            # (dry-run) when no control row exists yet — see
-            # data_manager.read_live_trading_requested()'s docstring.
-            requested_live = data_manager.read_live_trading_requested(self.db_path)
-            self.executor.dry_run = not requested_live
+        self._apply_mode_request()
+        self._resolve_closed_markets()
 
-            sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
-            self.portfolio_manager.manage_portfolio(self.log_func)  # exits always run, even while paused
-            sync_live_account_state(self.bridge, self.executor, self.portfolio_manager, self.log_func)
-            self._update_drawdown_guard()
+        self._sync_account()
+        self.portfolio_manager.manage_portfolio(self.log_func)  # exits always run, even while paused
+        self._sync_account()
+        account = self.account.snapshot()
+        self._reconcile()
 
-            # Flush this tick's live state to the DB for the dashboard
-            # process to read — every iteration, unconditionally, before any
-            # of the early `continue`s below, so it doesn't skip ticks where
-            # hunting finds nothing or a candidate gets rejected (the common
-            # case). See ui/data_manager.py's engine_status/open_positions
-            # tables and run_engine.py.
-            data_manager.write_engine_status(
-                db_path=self.db_path,
-                balance=float(self.bridge.current_balance),
-                starting_balance=float(self.bridge.starting_balance),
-                position_value=float(self.bridge.open_position_value),
-                unrealized_pnl=float(getattr(self.bridge, "unrealized_pnl", 0.0) or 0.0),
-                watch_only=bool(getattr(self.bridge, "watch_only", False)),
-            )
-            data_manager.write_open_positions(
-                db_path=self.db_path,
-                positions=list(getattr(self.bridge, "current_portfolio", None) or []),
-                position_analytics=dict(getattr(self.bridge, "position_analytics", None) or {}),
-            )
+        # Flush this tick's live state to the DB for the dashboard
+        # process to read — every iteration, unconditionally, before any
+        # of the early returns below, so it doesn't skip ticks where
+        # hunting finds nothing or a candidate gets rejected (the common
+        # case). See ui/data_manager.py's engine_status/open_positions
+        # tables and run_engine.py.
+        data_manager.write_engine_status(
+            db_path=self.db_path,
+            balance=account.cash,
+            starting_balance=float(self.bridge.starting_balance),
+            position_value=account.open_position_value,
+            unrealized_pnl=account.unrealized_pnl,
+            watch_only=account.watch_only,
+            venue=self.venue.name,
+        )
+        data_manager.write_open_positions(
+            db_path=self.db_path,
+            positions=list(getattr(self.bridge, "current_portfolio", None) or []),
+            position_analytics=dict(getattr(self.bridge, "position_analytics", None) or {}),
+        )
 
-            if self.ctx.drawdown_paused:
-                continue  # circuit breaker: skip new-entry scanning/execution below
+        if account.drawdown_paused:
+            return  # circuit breaker: skip new-entry scanning/execution below
 
-            await self._stage_strategy_scan()
+        await self._stage_strategy_scan()
 
-            stage1 = await self._stage_hunt()
-            if not stage1:
-                continue
+        stage1 = await self._stage_hunt()
+        if not stage1:
+            return
 
-            market, hunter = stage1
-            candidate = self._stage_evaluate_ev(market, hunter)
-            if candidate is None:
-                continue
+        market, hunter = stage1
+        candidate = self._stage_evaluate_ev(market, hunter)
+        if candidate is None:
+            return
 
-            approved_bet, risk_context = self._stage_risk_and_budget(candidate)
-            if approved_bet <= 0.0 or risk_context is None:
-                continue
+        approved_bet, risk_context = self._stage_risk_and_budget(candidate)
+        if approved_bet <= 0.0 or risk_context is None:
+            return
 
-            self._stage_execute(candidate, approved_bet, risk_context)
+        self._stage_execute(candidate, approved_bet, risk_context)
+
+
+def _parse_utc(stamp: str) -> Optional[datetime]:
+    """A Ledger time ("YYYY-MM-DD HH:MM:SS", UTC) as an aware datetime."""
+    try:
+        return datetime.strptime(str(stamp), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
 
 
 def _default_log_func(ctx: WalletContext):

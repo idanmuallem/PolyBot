@@ -76,7 +76,7 @@ Illustrative charts built from synthetic data (not a live account) showing the s
 
 ## Architecture
 
-Each wallet runs as a fully isolated unit — its own `TradingConfig`, its own live state (`DataBridge`), its own SQLite trade history — bundled into a `WalletContext`. The trading engine (`run_engine.py`) and the Streamlit dashboard (`ui/dashboard.py`) run as two separate OS processes in the same container, sharing state only through `trades.db` (WAL mode) — the engine writes, the dashboard reads. `core/wallet_manager.py`'s `build_wallet_runtime()` is the shared step that wires one `WalletContext`'s runtime components (executor, scanner, portfolio manager, budget manager); `run_engine.py` is currently its only caller. There is no multi-wallet orchestrator today — an earlier `WalletManager` class that registered and ran several `WalletContext`s concurrently was removed as dead code (zero callers); reintroducing multi-wallet support would mean rebuilding that registry/orchestration layer on top of `build_wallet_runtime()`.
+Each wallet runs as a fully isolated unit — its own `TradingConfig`, its own live state (`DataBridge`), its own SQLite trade history — bundled into a `WalletContext`. The trading engine (`run_engine.py`) and the Streamlit dashboard (`ui/dashboard.py`) run as two separate OS processes in the same container, sharing state only through `trades.db` (WAL mode) — the engine writes, the dashboard reads. `core/wallet_manager.py`'s `build_wallet_runtime()` is the shared step that wires one `WalletContext`'s runtime components (Ledger, Venues, executor, scanner, portfolio manager); the pipeline builds the Account (cash, drawdown breaker and the daily budget: spend limits and trade counts, seeded from the Ledger on start) and shares one Gate (may this market be entered or exited) with the portfolio manager; `run_engine.py` is currently its only caller. There is no multi-wallet orchestrator today — an earlier `WalletManager` class that registered and ran several `WalletContext`s concurrently was removed as dead code (zero callers); reintroducing multi-wallet support would mean rebuilding that registry/orchestration layer on top of `build_wallet_runtime()`.
 
 ```mermaid
 flowchart TD
@@ -168,7 +168,8 @@ PolyBot/
 ├── trading/                    # Execution pipeline and risk management
 │   ├── decision_pipeline.py    # SequentialTradingPipeline + run_market_monitor()
 │   ├── executor.py             # TradeExecutor: dry/paper/live order submission
-│   ├── budget_manager.py       # Daily spend limits, bankroll enforcement, Kelly sizing
+│   ├── account.py              # Account: cash, equity, drawdown breaker, daily spend/trade limits, max-bet cap
+│   ├── kelly.py                # Kelly bet-size formula
 │   ├── risk_manager.py         # PortfolioManager: take-profit, stop-loss, drawdown circuit breaker
 │   ├── correlation.py          # CorrelationTracker: category/symbol correlation between open positions
 │   └── strategies/             # Constraint-based ("arbitrage") strategies — no brain/probability needed
@@ -273,18 +274,18 @@ The dashboard runs the trading engine in a background thread and auto-refreshes 
 
 ## Arbitrage strategy — isolation status and gated entry points
 
-Arbitrage (`EventSumStrategy` and its execution plumbing) is **not** isolated into its own module the way `CryptoHunter`/`WeatherHunter`/`EconomyHunter` live under `hunters/` — it's split across `trading/decision_pipeline.py`, `trading/executor.py`, and `trading/paper_adapter.py`, interleaved with methods those files share with the crypto/model-driven path (`execute_trade`, `sell_position`, `_strategy_max_daily_trades`, `PaperAdapter`'s market-order methods). A full extraction was assessed (~800 lines of genuinely arbitrage-specific code across three classes, none of it copy-paste — each piece calls back into shared state or shared executor/paper-adapter methods) and judged moderate-to-large, not worth the risk while arbitrage is simply parked rather than being actively developed. Instead, `ENABLE_ARBITRAGE` (default `True`) was audited as the single kill switch, confirmed as follows:
+Arbitrage (`EventSumStrategy` and its execution plumbing) is **not** isolated into its own module the way `CryptoHunter`/`WeatherHunter`/`EconomyHunter` live under `hunters/` — it's split across `trading/decision_pipeline.py`, `trading/executor.py`, and `trading/paper_venue.py`, interleaved with methods those files share with the crypto/model-driven path (`execute_trade`, `sell_position`, `_strategy_max_daily_trades`, `PaperVenue`'s market-order methods). A full extraction was assessed (~800 lines of genuinely arbitrage-specific code across three classes, none of it copy-paste — each piece calls back into shared state or shared executor/paper-adapter methods) and judged moderate-to-large, not worth the risk while arbitrage is simply parked rather than being actively developed. Instead, `ENABLE_ARBITRAGE` (default `True`) was audited as the single kill switch, confirmed as follows:
 
 - **`EventSumStrategy(...)` is constructed in exactly one production call site** (`SequentialTradingPipeline.__init__`), and is never invoked unless scanned.
 - **`_stage_strategy_scan()` is arbitrage's only production entry point**, called from exactly one place in the main loop (`run_forever()`). `if not self.config.enable_arbitrage: return` is its first line — before the `self.strategies` check, before the scan-interval throttle, before `PolymarketClient.get_multi_outcome_events()` (the Gamma API call), before any budget/cash reservation. When the flag is `False`: zero API calls, zero `strategy.scan()` calls, zero `STRATEGY-GROUP`/`STRATEGY-LEG`/`ARBITRAGE-FILL` log lines. Confirmed live via a 20-minute post-deploy log window with the flag off: 862 log rows, 0 arbitrage-related.
 - **`_execute_strategy_group()`, `TradeExecutor.execute_arbitrage_group()`, and its three dispatch targets** (`_execute_live_arbitrage_group`, `_execute_paper_limit_arbitrage_group`, `_simulate_full_fill_arbitrage_group`) each have exactly one production caller, all reachable only through the gated path above (verified by a full-repo search for every call site).
-- **`PaperAdapter.place_limit_buy()`** (arbitrage's limit-order path) has exactly one caller, `_execute_paper_limit_arbitrage_group`, itself only reachable through the gate.
+- **`PaperVenue.place_limit_buy()`** (arbitrage's limit-order path) has exactly one caller, `_execute_paper_limit_arbitrage_group`, itself only reachable through the gate.
 - **Background/cleanup tasks no longer touch arbitrage positions at all while the flag is off** — this used to be a "by design" exception (see history below) and no longer is: `paper.resolve_closed_markets()` (every 15 min) and `portfolio_manager.manage_portfolio()` (every loop tick — the source of the `STOP-LOSS`/`TAKE-PROFIT`/`EV-CONVERGENCE` log lines) both still run unconditionally in `run_forever()`, but each now has its own arbitrage-specific branch gated behind the flag:
-  - `resolve_closed_markets(resolve_arbitrage=self.config.enable_arbitrage)` — when `False`, routes to `PaperAdapter._resolve_non_arbitrage_closed_markets()`, which skips every market whose only tracked position came from `place_limit_buy()` (arbitrage's sole paper-fill path, tagged in `PaperAdapter._arbitrage_tokens`) instead of calling `Engine.resolve_all()`. Crypto positions resolve exactly as before.
+  - `resolve_closed_markets(resolve_arbitrage=self.config.enable_arbitrage)` — when `False`, routes to `PaperVenue._resolve_non_arbitrage_closed_markets()`, which skips every market whose only tracked position came from `place_limit_buy()` (arbitrage's sole paper-fill path, tagged in `PaperVenue._arbitrage_tokens`) instead of calling `Engine.resolve_all()`. Crypto positions resolve exactly as before.
   - `manage_portfolio()` — resolves each position's `asset_type` (already-existing lookup, used elsewhere for correlation exposure) and skips the entire per-position exit/analytics block via `PortfolioManager._is_arbitrage_position()` when it starts with `"Arbitrage::"` and `enable_arbitrage` is `False`. Crypto positions in the same loop are handled exactly as before.
   
   Both changes are scoped to the arbitrage-tagged position only — the surrounding function still runs unconditionally for everything else in the book.
-- **Shared state**: `_simulated_positions` (a same-tick "just bought this" set) is written by the crypto path and read by arbitrage's `_group_already_held` — the only cross-path coupling found. Read-only from arbitrage's side; doesn't let arbitrage create anything.
+- **Shared state**: the Gate (`trading/gate.py`) is the one place both paths ask "already held?" (from the Ledger's open holdings, either side of a market) and "cooling down after an exit?"; the Account (`trading/account.py`) holds the one daily budget and trade counter both paths reserve against. Neither lets arbitrage create anything on the crypto path's behalf.
 
 **Bottom line: with `ENABLE_ARBITRAGE=False`, there is no remaining code path — regardless of what positions exist in the account — where arbitrage-specific logic executes at all**, new trade or otherwise. Re-run this same search (`EventSumStrategy(`, `_execute_strategy_group(`, `execute_arbitrage_group(`, `_execute_live_arbitrage_group(`, `_execute_paper_limit_arbitrage_group(`, `_simulate_full_fill_arbitrage_group(`, `place_limit_buy(`, `resolve_closed_markets(`, `_is_arbitrage_position(`, `_arbitrage_tokens`) across the repo before trusting this note again if the code has changed since.
 
@@ -397,9 +398,9 @@ The bot supports two trading modes controlled by a single environment variable:
 | `TRADING_MODE` | Behaviour |
 |---|---|
 | `dry_run` (default) | Simulates trades with virtual balance (`PAPER_BALANCE_USD`), real fee rates, full position tracking — no real orders submitted |
-| `live_run` | Submits real orders to Polymarket CLOB with real funds |
+| `live_run` | Submits real orders to Polymarket CLOB with real funds. The engine refuses to start without a usable CLOB client (private key, proxy address, derivable API credentials) |
 
-The sidebar toggle in the dashboard switches between Dry Run and Live Run at runtime without a restart.
+The sidebar toggle in the dashboard switches between Dry Run and Live Run at runtime without a restart. Switching to Live Run only takes effect if a CLOB client could be built at startup; otherwise the engine stays on paper.
 
 > Start with `TRADING_MODE=dry_run` to observe and validate the engine's decisions before committing real funds.
 
@@ -437,7 +438,7 @@ docker compose -f config/Docker/docker-compose.yml up --build
 
 Mounts `config/.env` for credentials and persists `trades.db` via a volume. Paper
 trading state (the `pm_trader` engine's own SQLite DB plus the token→slug
-mapping — see `trading/paper_adapter.py`) lives in `./paper_trading/` and is
+mapping — see `trading/paper_venue.py`) lives in `./paper_trading/` and is
 persisted the same way, so paper positions/balance survive a container restart.
 
 ### GitHub Actions (CI/CD)

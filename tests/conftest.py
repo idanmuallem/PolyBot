@@ -87,19 +87,18 @@ def wired_wallet_context(tmp_path, dry_run_config, bridge):
     build your own context with the mocks attached directly instead of
     using this fixture.
     """
+    from tests.venue_harness import open_book_venue
     from trading.executor import TradeExecutor
     from polymarket import PolymarketScannerHunter
     from trading.risk_manager import PortfolioManager
-    from trading.budget_manager import BudgetManager
-    from trading.decision_pipeline import sync_live_account_state
-
+    
     ctx = WalletContext(
         wallet_id="test",
         config=dry_run_config,
         bridge=bridge,
         db_path=str(tmp_path / "test.db"),
     )
-    ctx.executor = TradeExecutor(config=ctx.config)
+    ctx.executor = TradeExecutor(config=ctx.config, venue=open_book_venue())
     ctx.scanner = PolymarketScannerHunter(
         bridge=ctx.bridge,
         executor=ctx.executor,
@@ -111,14 +110,5 @@ def wired_wallet_context(tmp_path, dry_run_config, bridge):
         config=ctx.config,
         hunter=ctx.scanner,
         db_path=ctx.db_path,
-    )
-    # Sync live balance before building BudgetManager so its initial_balance
-    # reflects ctx.bridge.current_balance rather than freezing at 0.0 — same
-    # dependency order as ui/dashboard.py and core/wallet_manager.py.
-    sync_live_account_state(ctx.bridge, ctx.executor, ctx.portfolio_manager, lambda *a, **kw: None)
-    ctx.budget_manager = BudgetManager(
-        bridge=ctx.bridge,
-        config=ctx.config,
-        initial_balance=float(ctx.bridge.current_balance),
     )
     return ctx

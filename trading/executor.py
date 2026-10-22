@@ -1,300 +1,85 @@
 """
-Trade execution engine: order submission, position tracking, and balance fetching.
+Trade execution engine: order sizing, gating and logging on top of a Venue.
 
-Wraps the Polymarket CLOB client. Execution is gated by EV threshold, daily
-trade count, and price bounds. Supports dry_run and live_run modes.
+The executor trades on one Venue at a time (trading/venue.py): a PaperVenue
+in Dry run, a ClobVenue in Live run. It never branches on the trading mode
+itself: where the modes differ, the Venue says how (trading/venue.py).
 """
 
 import asyncio
 import logging
-import math
 import time
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, Callable, List
-
-import requests
-from eth_utils import to_checksum_address
 
 from core.models import MarketData, Position, PRICE_FLOOR, PRICE_CEILING
 from core.trading_config import TradingConfig
+from trading.venue import LimitOrder, MarketRef, Venue, normalize_side, side_price, whole_cent_shares
 
-try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, AssetType, BalanceAllowanceParams
-    from py_clob_client.order_builder.constants import BUY, SELL
-    CLOB_IMPORT_OK = True
-except Exception as e:
-    logging.error(f"Import Error: {e}")
-    ClobClient = Any
-    OrderArgs = Any
-    AssetType = Any
-    BalanceAllowanceParams = Any
-    BUY = "BUY"
-    SELL = "SELL"
-    CLOB_IMPORT_OK = False
 
-try:
-    from trading.paper_adapter import PaperAdapter
-    PAPER_ADAPTER_AVAILABLE = True
-except ImportError:
-    PaperAdapter = None
-    PAPER_ADAPTER_AVAILABLE = False
+@dataclass(frozen=True)
+class PlacedEntry:
+    """A model entry the Venue accepted: the token bought (the NO token for
+    a NO entry), at the side's price, for whole-cent shares of the bet.
+    order_id is set when the buy rests on the book instead of filling at
+    once: the engine follows that order until it knows what filled."""
+    token_id: str
+    side: str
+    price: float
+    shares: float
+    order_id: Optional[str] = None  # the resting order, where the venue's buys rest (live)
+
+
+def _with_asset_type(log_func: Callable, asset_type: str) -> Callable:
+    """log_func, with the venue's order rows filed under *asset_type*."""
+    def _log(level, _asset_type, token_id, payload):
+        log_func(level, asset_type, token_id, payload)
+    return _log
+
+
+def _order_rows(log_func: Callable, asset_type: str, **defaults) -> Callable:
+    """log_func for a venue's arbitrage order rows: filed under *asset_type*,
+    with *defaults* (group_id, ...) in every payload unless the row sets them."""
+    def _log(level, _asset_type, token_id, payload):
+        log_func(level, asset_type, token_id, {**defaults, **payload})
+    return _log
 
 
 class TradeExecutor:
-    """Handles trade execution with risk management.
+    """Gates, sizes and places trades on the active Venue.
 
-    Modes: dry_run (simulate with virtual balance), live_run (real CLOB orders).
+    `venue` is the Venue traded on now. The pipeline owns which Venue that
+    is and swaps it at a tick boundary (SequentialTradingPipeline
+    ._apply_mode_request()): it hands the executor its own reference with
+    trade_on(), so the executor holds no copy that could go stale. Until
+    then (a bare executor, as in tests) it trades on the Venue it was built
+    with.
     """
 
-    def __init__(self, config: TradingConfig):
+    def __init__(self, config: TradingConfig, venue: Venue):
         self.config = config
-        self.trade_count_today = 0
-        self.trades_by_strategy: Dict[str, int] = {}
-        self.dry_run = self.config.is_dry_run
-        self.proxy_address = self.config.proxy_address
-        self.client = None
-        self.paper: Optional[object] = None  # set below; stays None outside dry-run
+        self._active_venue: Callable[[], Venue] = lambda: venue
 
-        # Paper trading adapter (active only in dry-run mode) — independent of
-        # the live CLOB client, so it must init before the CLOB_IMPORT_OK gate
-        # below. Otherwise an environment without py-clob-client would leave
-        # dry-run/paper trading dead even though it never needs the live client.
-        if self.dry_run and PAPER_ADAPTER_AVAILABLE:
-            try:
-                self.paper = PaperAdapter()
-                if self.paper.is_ready:
-                    print("[PAPER] Paper trading engine initialized")
-                else:
-                    print("[PAPER] Paper engine not available — DRY-RUN log-only mode")
-                    self.paper = None
-            except Exception as exc:
-                print(f"[PAPER] Paper engine init failed: {exc} — DRY-RUN log-only mode")
-                self.paper = None
+    def trade_on(self, active_venue: Callable[[], Venue]) -> None:
+        """Trade on whatever Venue *active_venue()* returns at each call."""
+        self._active_venue = active_venue
 
-        if not CLOB_IMPORT_OK:
-            print("[FATAL] py-clob-client is not loaded correctly!")
-            return
-
-        if self.config.proxy_address and self.config.private_key:
-            try:
-                print(f"Signing for Proxy: {self.config.proxy_address}")
-                self.client = ClobClient(
-                    host="https://clob.polymarket.com",
-                    chain_id=137,
-                    key=self.config.private_key,
-                    funder=to_checksum_address(self.config.proxy_address),
-                    signature_type=self.config.signature_type,
-                )
-                try:
-                    creds = self.client.create_or_derive_api_creds()
-                    self.client.set_api_creds(creds)
-                    print("[AUTH] Credentials successfully derived and set!")
-                except Exception as e:
-                    print(f"[AUTH-ERROR] Failed to derive: {e}")
-                    self.client = None
-                    return
-                print("[SUCCESS] Live CLOB Client is fully armed and operational!")
-            except Exception as e:
-                print(f"[FATAL ERROR] ClobClient failed to build: {e}")
-                self.client = None
-        else:
-            print("[FATAL] Missing keys in Config! Cannot build Client.")
-
-    def _resolve_positions_user_address(self) -> Optional[str]:
-        explicit = str(self.proxy_address or "").strip()
-        return explicit if explicit else None
-
-    @staticmethod
-    def _pick_float(payload: Dict[str, Any], *keys: str) -> float:
-        for key in keys:
-            raw = payload.get(key)
-            if raw is None:
-                continue
-            try:
-                return float(raw)
-            except Exception:
-                continue
-        return 0.0
-
-    def _submit_order(self, token_id: str, price: float, side: str, size: float):
-        """Submit a live order to the Polymarket CLOB."""
-        try:
-            price = round(float(price), 2)
-            size = round(float(size), 2)
-            print(f"[EXECUTION] Attempting {side} order: {size} shares at ${price}")
-            order = OrderArgs(token_id=token_id, price=price, side=side, size=size)
-            return self.client.create_and_post_order(order)
-        except Exception as e:
-            print(f"[LIVE-TRADE-ERROR] {token_id} - {str(e)}")
-            return None
-
-    @staticmethod
-    def _is_valid_order_response(response: Any) -> bool:
-        if not response:
-            return False
-        if isinstance(response, dict):
-            if response.get("error") or response.get("errors") or response.get("errorMsg"):
-                return False
-            order_id = (
-                response.get("orderID")
-                or response.get("orderId")
-                or response.get("order_id")
-                or response.get("id")
-            )
-            return bool(order_id)
-        return True
-
-    @staticmethod
-    def _format_order_exception(exc: Exception) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "error": str(exc),
-            "exception_type": type(exc).__name__,
-            "exception_repr": repr(exc),
-        }
-        response = getattr(exc, "response", None)
-        if response is not None:
-            if getattr(response, "status_code", None) is not None:
-                payload["status_code"] = response.status_code
-            if getattr(response, "text", None):
-                payload["response_text"] = response.text
-        return payload
+    @property
+    def venue(self) -> Venue:
+        return self._active_venue()
 
     def get_balance(self) -> float:
-        """Fetch available CLOB collateral balance (deployable cash)."""
-        if self.dry_run:
-            if self.paper is not None:
-                return self.paper.get_cash_balance()
-            return float(self.config.paper_balance_usd)
-
-        if self.client is None:
-            return float(self.config.paper_balance_usd)
-
-        try:
-            if hasattr(self.client, "get_collateral_balance"):
-                raw = float(self.client.get_collateral_balance())
-                return raw / 1_000_000.0 if raw > 1_000_000 else raw
-
-            if hasattr(self.client, "get_balance_allowance"):
-                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-                resp = self.client.get_balance_allowance(params=params)
-                if isinstance(resp, dict):
-                    balance_raw = resp.get("balance", resp)
-                    if isinstance(balance_raw, dict):
-                        for key in ("balance", "amount", "available", "usdc", "USDC"):
-                            if balance_raw.get(key) is not None:
-                                raw = float(balance_raw[key])
-                                return raw / 1_000_000.0 if raw > 1_000_000 else raw
-                    raw = float(balance_raw)
-                    return raw / 1_000_000.0 if raw > 1_000_000 else raw
-        except Exception as exc:
-            logging.warning(f"Live collateral balance fetch failed: {exc}")
-
-        return 0.0
+        """Deployable cash on the active venue."""
+        return float(self.venue.cash())
 
     def get_open_positions(self) -> List[Position]:
-        """Fetch open positions from Polymarket Data API with mark-to-mid PnL.
-
-        Uses Data API because py-clob-client does not expose a stable positions
-        listing method across versions.
-        """
-        # Paper trading mode — positions live in paper engine, not on-chain
-        if self.dry_run and self.paper is not None:
-            return self.paper.get_positions()
-
-        wallet_address = self._resolve_positions_user_address()
-        if not wallet_address:
-            return []
-
-        positions: List[Position] = []
-        url = f"https://data-api.polymarket.com/positions?user={wallet_address}"
-
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as exc:
-            status_code = exc.response.status_code if exc.response is not None else None
-            if status_code != 404:
-                logging.debug(f"Gamma positions HTTP error: {exc}")
-            return []
-        except requests.exceptions.RequestException as exc:
-            logging.debug(f"Gamma positions request error: {exc}")
-            return []
-
-        try:
-            raw_positions = response.json()
-            if isinstance(raw_positions, dict):
-                raw_positions = raw_positions.get("positions", [])
-            if not isinstance(raw_positions, list):
-                return []
-
-            for raw in raw_positions:
-                if not isinstance(raw, dict):
-                    continue
-
-                token_id = str(
-                    raw.get("asset") or raw.get("token_id") or raw.get("tokenId") or ""
-                )
-                if not token_id:
-                    continue
-
-                shares = abs(float(self._pick_float(
-                    raw, "size", "shares", "quantity", "balance", "positionSize", "numShares"
-                )))
-                initial_price = self._pick_float(
-                    raw, "avgPrice", "avg_price", "entry_price", "initial_price", "price"
-                )
-                current_price = self._pick_float(
-                    raw, "currentPrice", "current_price", "markPrice", "mark_price"
-                )
-                current_value = abs(self._pick_float(
-                    raw, "currentValue", "current_value", "positionValue",
-                    "position_value", "value", "usdValue",
-                ))
-
-                if current_value <= 0.0 and shares > 0.0 and current_price > 0.0:
-                    current_value = shares * current_price
-                if current_price <= 0.0 and shares > 0.0 and current_value > 0.0:
-                    current_price = current_value / shares
-                if shares <= 0.0 and current_value > 0.0 and initial_price > 0.0:
-                    shares = current_value / initial_price
-                if shares <= 0.0 and current_value <= 0.0:
-                    continue
-
-                value = current_value if current_value > 0.0 else (
-                    shares * (current_price if current_price > 0.0 else initial_price)
-                )
-                if current_price <= 0.0:
-                    current_price = initial_price
-
-                pnl_ratio = (
-                    (current_price - initial_price) / initial_price
-                    if initial_price > 0 else 0.0
-                )
-
-                positions.append(Position(
-                    market_id=str(
-                        raw.get("conditionId") or raw.get("condition_id")
-                        or raw.get("market_id") or token_id
-                    ),
-                    token_id=token_id,
-                    initial_price=initial_price,
-                    current_price=current_price,
-                    shares=shares,
-                    value=value,
-                    pnl_ratio=pnl_ratio,
-                    side=str(raw.get("outcome") or raw.get("side") or "UNKNOWN"),
-                    live_ev=float(pnl_ratio),
-                ))
-        except Exception as exc:
-            logging.warning(f"Could not parse open positions: {exc}")
-
-        return positions
+        """Open positions on the active venue."""
+        return self.venue.open_positions()
 
     def execute_trade(
         self,
         token_id: str,
         current_poly_price: float,
-        shares: float,
         bet_amount: float,
         asset_type: str,
         side: str,
@@ -302,447 +87,93 @@ class TradeExecutor:
         log_func: Callable,
         condition_id: Optional[str] = None,
         slug: Optional[str] = None,
-    ) -> bool:
-        """Execute a live order or simulate it based on configuration."""
-        execution_side = str(side or "YES").upper()
-        execution_token_id = str(token_id)
-        execution_price = float(current_poly_price)
+    ) -> "bool | LimitOrder":
+        """Buy *bet_amount* of *side* on the active venue.
 
-        if execution_side == "NO":
-            if no_token_id:
-                execution_token_id = str(no_token_id)
-            execution_price = max(1e-6, 1.0 - float(current_poly_price))
-
-        if self.dry_run:
-            print(
-                f"[DRY-RUN] Would buy {shares} of {execution_token_id} "
-                f"({execution_side}) for ${bet_amount}."
-            )
-            log_func("DRY-RUN", asset_type, execution_token_id, {
-                "price": execution_price, "shares": shares,
-                "bet_amount_usd": bet_amount, "side": execution_side,
-            })
-
-            # Paper trading fill. A failed fill (e.g. missing slug/condition_id,
-            # so PaperAdapter can't resolve what to buy) must not be reported
-            # as success — the caller (evaluate_and_execute / arbitrage leg
-            # execution) uses this return value to decide whether to count
-            # the trade against budget/daily-trade-count and whether a real
-            # position now exists to manage. Reporting success for a buy that
-            # never landed in the paper engine desyncs the two: budget gets
-            # spent, trade count increments, but there's no position to ever
-            # sell — or worse, a *different*, unrelated position quietly
-            # inherits stale bookkeeping. No paper adapter configured at all
-            # is not a failure in this sense (log-only DRY-RUN mode, working
-            # as designed), so that case still reports success.
-            paper_buy_ok = True
-            if self.paper is not None:
-                try:
-                    paper_buy_ok = self.paper.execute_buy(
-                        slug=slug,
-                        condition_id=condition_id,
-                        token_id=token_id,
-                        side=execution_side,
-                        amount_usd=bet_amount,
-                        no_token_id=no_token_id,
-                    )
-                except Exception as exc:
-                    logging.warning(f"[PAPER] Paper fill failed (non-fatal to pipeline): {exc}")
-                    paper_buy_ok = False
-
-            return bool(paper_buy_ok)
-
-        if self.client is None:
-            log_func("PAPER-TRADE", asset_type, execution_token_id, {
-                "price": execution_price, "shares": shares,
-                "bet_amount_usd": bet_amount, "side": execution_side,
-                "reason": "No live CLOB client configured",
-            })
-            return True
-
+        token_id/current_poly_price are the market's YES token and price;
+        side picks which outcome is bought. Falsy unless the order landed:
+        callers spend budget and trade count, and assume a position exists,
+        when it is truthy. A venue whose buys rest on the book returns the
+        resting LimitOrder (see Venue.buy())."""
+        market = MarketRef(
+            yes_token_id=str(token_id), no_token_id=no_token_id or None,
+            condition_id=condition_id or None, slug=slug or None,
+        )
+        execution_side = normalize_side(side)
         try:
-            order_resp = self._submit_order(
-                token_id=execution_token_id,
-                price=execution_price,
-                side=BUY,
-                size=shares,
+            placed = self.venue.buy(
+                market, execution_side, bet_amount,
+                price=side_price(current_poly_price, execution_side),
+                log_func=_with_asset_type(log_func, asset_type),
             )
-            if not self._is_valid_order_response(order_resp):
-                error_payload = {
-                    "error": "order_rejected_or_unconfirmed",
-                    "response": order_resp, "side": execution_side,
-                    "price": execution_price, "shares": shares,
-                }
-                logging.error(f"LIVE order rejected: {error_payload}")
-                log_func("LIVE-TRADE-ERROR", asset_type, execution_token_id, error_payload)
-                return False
-
-            log_func("LIVE-TRADE", asset_type, execution_token_id, {
-                "success": True, "response": order_resp,
-                "side": execution_side, "price": execution_price,
-            })
-            return True
+            return placed if isinstance(placed, LimitOrder) else bool(placed)
         except Exception as exc:
-            error_payload = self._format_order_exception(exc)
-            logging.error(f"LIVE order rejected: {error_payload}")
-            log_func("LIVE-TRADE-ERROR", asset_type, execution_token_id, error_payload)
+            logging.warning(f"[VENUE] Buy failed (non-fatal to pipeline): {exc}")
             return False
 
     def sell_position(self, token_id: str, shares: float, price: float, log_func: Callable) -> bool:
-        """Sell an existing position (dry-run, paper, or live)."""
-        if self.dry_run:
-            msg = f"[DRY-RUN] Would SELL {shares} of {token_id} at ${price}"
-            print(msg)
-            log_func("DRY-RUN-SELL", "Portfolio", token_id, {
-                "message": msg, "price": price, "shares": shares,
-            })
-
-            # Paper trading sell. Unlike buys, a failed sell must not be
-            # reported as success: PortfolioManager._exit_position() credits
-            # cash to bridge.current_balance based on this return value, and
-            # never actually removes the position from the paper engine's
-            # own book unless the sell genuinely landed there. Swallowing a
-            # failure here (the old unconditional `return True`) meant a
-            # position whose paper sell kept failing (e.g. a missing
-            # _token_map entry) got "sold" — and credited cash — on every
-            # single loop tick, forever, without ever actually closing.
-            # No paper adapter configured at all is not a failure in this
-            # sense (there's nothing to desync from), so that case still
-            # reports success.
-            paper_sell_ok = True
-            if self.paper is not None:
-                try:
-                    paper_sell_ok = self.paper.execute_sell(token_id, shares)
-                except Exception as exc:
-                    logging.warning(f"[PAPER] Paper sell failed (non-fatal to pipeline): {exc}")
-                    paper_sell_ok = False
-
-            return bool(paper_sell_ok)
-
-        if self.client is None:
-            log_func("PAPER-SELL", "Portfolio", token_id, {
-                "price": price, "shares": shares,
-                "reason": "No live CLOB client configured",
-            })
-            return True
-
+        """Sell an existing position on the active venue. True only if the
+        sale landed: PortfolioManager._exit_position() records the sale on True,
+        so a sale that kept failing used to be "sold" every tick (6a06f35)."""
         try:
-            order_resp = self._submit_order(token_id=token_id, price=price, side=SELL, size=shares)
-            if not self._is_valid_order_response(order_resp):
-                error_payload = {
-                    "error": "order_rejected_or_unconfirmed",
-                    "response": order_resp, "price": price, "shares": shares,
-                }
-                logging.error(f"SELL order rejected: {error_payload}")
-                log_func("SELL-ERROR", "Portfolio", token_id, error_payload)
-                return False
-
-            log_func("SELL", "Portfolio", token_id, {
-                "success": True, "response": order_resp, "price": price, "shares": shares,
-            })
-            return True
+            return bool(self.venue.sell(token_id, shares, price=price, log_func=log_func))
         except Exception as exc:
-            error_payload = self._format_order_exception(exc)
-            logging.error(f"SELL order rejected: {error_payload}")
-            log_func("SELL-ERROR", "Portfolio", token_id, error_payload)
+            logging.warning(f"[VENUE] Sell failed (non-fatal to pipeline): {exc}")
             return False
 
     # ------------------------------------------------------------------
     # Arbitrage group execution — limit orders + fill timeout (Phase 3)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_order_id(order_resp: Any) -> Optional[str]:
-        if not isinstance(order_resp, dict):
-            return None
-        for key in ("orderID", "orderId", "order_id", "id"):
-            value = order_resp.get(key)
-            if value:
-                return str(value)
-        return None
-
-    def _get_order_filled_shares(self, order_id: str) -> float:
-        """How many shares of a resting order have filled so far.
-
-        py-clob-client's ClobClient.get_order(order_id) (confirmed present
-        on the installed client — GET /order under the hood) is synchronous,
-        not async: there's no native async order-status polling to hook
-        into. This blocks the event loop for one REST round-trip per poll,
-        which is acceptable here since execute_arbitrage_group's polling
-        loop is the only thing running at that point in the pipeline (see
-        SequentialTradingPipeline.run_forever — one sequential async loop,
-        nothing else concurrent to starve). If that ever changes, wrap this
-        call in asyncio.to_thread()/loop.run_in_executor() instead of
-        calling it directly.
-
-        Tries several field-name candidates (same defensive-pick pattern as
-        _pick_float/get_open_positions) since the exact CLOB order-status
-        response schema (size_matched vs. matched_size, etc.) isn't pinned
-        by py-clob-client's thin wrapper — it just returns the raw REST
-        JSON, whose exact field names aren't documented client-side.
-        """
-        try:
-            order = self.client.get_order(order_id)
-        except Exception as exc:
-            logging.warning(f"get_order failed for {order_id}: {exc}")
-            return 0.0
-        if not isinstance(order, dict):
-            return 0.0
-        return self._pick_float(order, "size_matched", "matched_size", "sizeMatched", "filled_size", "filledSize")
-
-    def _cancel_order(self, order_id: str, log_func: Callable, asset_type: str, group_id: Optional[str]) -> bool:
-        """Cancel one resting order. ClobClient.cancel(order_id) (confirmed
-        present on the installed client — DELETE /order under the hood) is
-        also synchronous; same blocking-call trade-off as
-        _get_order_filled_shares above."""
-        try:
-            resp = self.client.cancel(order_id)
-            log_func("CANCEL", asset_type, order_id, {
-                "reason": "partial_fill_no_arb",
-                "group_id": group_id,
-                "response": resp,
-            })
-            return True
-        except Exception as exc:
-            log_func("CANCEL-ERROR", asset_type, order_id, {
-                "reason": "cancel_failed",
-                "group_id": group_id,
-                "error": str(exc),
-            })
-            return False
-
-    def _record_strategy_trade(self, strategy_tag: str):
-        self.trade_count_today += 1
-        self.trades_by_strategy[strategy_tag] = self.trades_by_strategy.get(strategy_tag, 0) + 1
-
-    def _simulate_full_fill_arbitrage_group(
-        self, legs: List[Dict[str, Any]], log_func: Callable,
-        asset_type: str, group_id: Optional[str], strategy_tag: str,
-    ) -> Dict[str, Any]:
-        """Log-only fallback for when NO real PaperAdapter is available
-        (pm_trader not installed) — execute_arbitrage_group() now routes to
-        _execute_paper_limit_arbitrage_group() instead whenever self.paper
-        is set, so this only runs in the degraded "no paper engine at all"
-        mode. Attempts every leg through execute_trade() and only records a
-        leg as filled if that attempt genuinely succeeded (execute_trade()
-        with no paper adapter returns True unconditionally — the original
-        log-only DRY-RUN behavior, working as designed).
-
-        Previously this recorded every leg's *requested* shares as filled
-        unconditionally, ignoring execute_trade()'s return value entirely —
-        so a leg whose paper buy failed outright (missing slug/condition_id,
-        no liquidity, insufficient cash, ...) was reported as a full fill
-        anyway. That fabricated fill data fed everything downstream
-        (arb_sets, surplus, and the group-level profitability
-        re-verification in decision_pipeline.py's _execute_strategy_group),
-        making it impossible to tell a genuine complementary-set fill from
-        one that never actually happened in the paper engine's own ledger.
-        """
-        fills: Dict[str, float] = {}
-        unfilled: List[str] = []
-        for leg in legs:
-            token_id = str(leg["token_id"])
-            shares = float(leg["shares"])
-            price = float(leg["price"])
-            executed = self.execute_trade(
-                token_id=token_id,
-                current_poly_price=price,
-                shares=shares,
-                bet_amount=float(leg.get("bet_amount_usd", shares * price)),
-                asset_type=str(leg.get("asset_type") or asset_type),
-                side=str(leg.get("side", "YES")),
-                no_token_id=leg.get("no_token_id"),
-                log_func=log_func,
-                condition_id=leg.get("condition_id"),
-                slug=leg.get("slug"),
-            )
-            if executed:
-                fills[token_id] = shares
-                self._record_strategy_trade(strategy_tag)
-            else:
-                unfilled.append(token_id)
-
-        # A genuine complementary-set arbitrage needs every leg — if even
-        # one leg is entirely unfilled, there is no guaranteed structure at
-        # all (mirrors _execute_live_arbitrage_group's identical rule for
-        # the live-order-book path): min() over only the legs present in
-        # `fills` would otherwise treat the legs that DID fill as a
-        # "complete" matched set even though the outcome that never filled
-        # could still be the one that wins, leaving pure directional risk
-        # on whatever did fill.
-        if unfilled:
-            arb_sets = 0.0
-            surplus = {}
-        else:
-            arb_sets = min(fills.values()) if fills else 0.0
-            surplus = {tid: round(s - arb_sets, 4) for tid, s in fills.items() if s > arb_sets}
-
-        log_func("ARBITRAGE-FILL", asset_type, group_id or "group", {
-            "reason": "dry_run_fill_simulated",
-            "group_id": group_id,
-            "n_legs": len(legs),
-            "fills": fills,
-            "unfilled": unfilled,
-            "arb_sets": arb_sets,
-            "surplus": surplus,
-        })
-
-        return {"success": not unfilled, "arb_sets": arb_sets, "fills": fills, "unfilled": unfilled, "surplus": surplus}
-
-    async def _execute_live_arbitrage_group(
+    async def _execute_limit_arbitrage_group(
         self, legs: List[Dict[str, Any]], timeout_seconds: float, log_func: Callable,
-        strategy_tag: str, asset_type: str, group_id: Optional[str],
+        asset_type: str, group_id: Optional[str],
     ) -> Dict[str, Any]:
-        order_ids: Dict[str, Optional[str]] = {}
+        """Arbitrage execution via limit orders on self.venue: submit every
+        leg, poll with a bounded async loop, collect fills as they land,
+        cancel/void whatever's left unfilled at the timeout.
 
-        for leg in legs:
-            token_id = str(leg["token_id"])
-            order_resp = self._submit_order(
-                token_id=token_id, price=float(leg["price"]), side=BUY, size=float(leg["shares"]),
-            )
-            order_id = self._extract_order_id(order_resp)
-            order_ids[token_id] = order_id
-            if order_id is None:
-                log_func("EXECUTION-ERROR", asset_type, token_id, {
-                    "reason": "order_placement_failed",
-                    "group_id": group_id,
-                    "response": order_resp,
-                })
-
-        fills: Dict[str, float] = {tid: 0.0 for tid in order_ids}
-        poll_interval = max(0.01, min(1.0, timeout_seconds / 10.0)) if timeout_seconds > 0 else 0.0
-        deadline = time.monotonic() + timeout_seconds
-
-        while True:
-            for token_id, order_id in order_ids.items():
-                if order_id is not None:
-                    fills[token_id] = self._get_order_filled_shares(order_id)
-            if fills and all(filled > 0 for filled in fills.values()):
-                break
-            if time.monotonic() >= deadline:
-                break
-            await asyncio.sleep(poll_interval)
-
-        unfilled = [tid for tid, filled in fills.items() if filled <= 0]
-
-        if unfilled:
-            for order_id in order_ids.values():
-                if order_id is not None:
-                    self._cancel_order(order_id, log_func, asset_type, group_id)
-
-            for token_id in unfilled:
-                log_func("REJECTED", asset_type, token_id, {
-                    "reason": "insufficient_liquidity",
-                    "group_id": group_id,
-                    "timeout_seconds": timeout_seconds,
-                })
-
-            log_func("REJECTED", asset_type, group_id or "group", {
-                "reason": "partial_fill_no_arb",
-                "group_id": group_id,
-                "unfilled": unfilled,
-                "fills": fills,
-            })
-
-            # Shares that did fill before the group was voided are real,
-            # unretractable trades (cancel() only stops further fills) —
-            # they still count against this strategy's daily trade count.
-            for token_id, filled in fills.items():
-                if filled > 0:
-                    self._record_strategy_trade(strategy_tag)
-
-            return {"success": False, "arb_sets": 0, "fills": fills, "unfilled": unfilled, "surplus": {}}
-
-        arb_sets = min(fills.values())
-        surplus = {tid: round(filled - arb_sets, 4) for tid, filled in fills.items() if filled > arb_sets}
-
-        for _token_id in fills:
-            self._record_strategy_trade(strategy_tag)
-
-        log_func("ARBITRAGE-FILL", asset_type, group_id or "group", {
-            "reason": "all_legs_filled",
-            "group_id": group_id,
-            "fills": fills,
-            "arb_sets": arb_sets,
-            "surplus": surplus,
-        })
-
-        return {"success": True, "arb_sets": arb_sets, "fills": fills, "unfilled": [], "surplus": surplus}
-
-    async def _execute_paper_limit_arbitrage_group(
-        self, legs: List[Dict[str, Any]], timeout_seconds: float, log_func: Callable,
-        strategy_tag: str, asset_type: str, group_id: Optional[str],
-    ) -> Dict[str, Any]:
-        """Paper-mode arbitrage execution via limit orders, replacing
-        _simulate_full_fill_arbitrage_group()'s market-order walk for
-        groups where a real PaperAdapter is available. A market order pays
-        whatever it takes to fill the full requested dollar amount — real
-        arbitrage-leg data showed that walk was where 100% of this
-        strategy's cost overhead came from, concentrated in the thinnest
-        (<$0.05) price tier. A limit order caps the price paid per leg
-        instead, at the cost of possibly not filling (fully, or at all).
         The limit price is the raw scan-time leg["price"], no premium above
-        it — same price _execute_live_arbitrage_group() submits at, so
-        paper's fill rate isn't systematically more lenient than live's
-        would be for the same signal (a buffer here previously let paper
-        fill in cases where live's unbuffered order at the same price would
-        time out unfilled).
+        it, on both venues, so paper's fill rate isn't systematically more
+        lenient than live's for the same signal.
 
-        Structurally mirrors _execute_live_arbitrage_group() above (submit
-        every leg, poll with a bounded async loop, collect fills as they
-        land, cancel/void whatever's left unfilled at the timeout) — see
-        that method for the live-CLOB equivalent this is modeled on.
-        pm_trader.Engine's own limit-order support (place_limit_order/
-        check_orders/cancel_limit_order) plays the same role here that the
-        live CLOB client's order endpoints play there.
-
-        One real difference from the live path worth knowing: pm_trader's
-        check_orders() uses "fak" (fill-and-kill) semantics per check — the
-        first check that finds ANY liquidity within a leg's limit price
-        fills it (fully or partially) and immediately marks that order
-        done; it does not keep resting to pick up more shares on later
-        checks. So polling here mainly gives legs that haven't found ANY
-        liquidity yet a chance for the book to move favorably before the
-        timeout — not a chance for an already-partially-filled leg to grow.
+        The paper engine fills limit orders fill-and-kill per poll -- the
+        first poll that finds ANY liquidity within a leg's limit price fills
+        it (fully or partially) and closes that order -- so there polling
+        mainly gives legs that haven't found ANY liquidity yet a chance for
+        the book to move favorably before the timeout. On the CLOB, polling
+        reads each resting order's matched size.
         """
-        # check_orders() operates on every pending order in the engine, not
-        # just this group's — harmless in practice since arbitrage legs are
-        # the only place this codebase ever places limit orders, and groups
-        # are processed one at a time (_stage_strategy_scan awaits each
-        # _execute_strategy_group call before starting the next).
-        orders: Dict[str, Optional[dict]] = {}
+        # On paper, polling advances every pending order on the venue, not
+        # just this group's -- harmless since arbitrage legs are the only
+        # limit orders placed, and groups are processed one at a time.
+        orders: Dict[str, Optional[LimitOrder]] = {}
+        reasons = self.venue.fill_reasons
+        placement_rows = _order_rows(log_func, asset_type, group_id=group_id)
 
         for leg in legs:
             token_id = str(leg["token_id"])
             price = float(leg["price"])
             shares = float(leg["shares"])
-            order = self.paper.place_limit_buy(
-                slug=leg.get("slug"),
-                condition_id=leg.get("condition_id"),
-                token_id=token_id,
-                side=str(leg.get("side", "YES")),
-                amount_usd=float(leg.get("bet_amount_usd", shares * price)),
+            orders[token_id] = self.venue.place_limit_buy(
+                MarketRef.from_leg(leg),
+                str(leg.get("side", "YES")),
+                float(leg.get("bet_amount_usd", shares * price)),
                 limit_price=price,
-                no_token_id=leg.get("no_token_id"),
+                shares=shares,
+                log_func=placement_rows,
             )
-            orders[token_id] = order
-            if order is None:
-                log_func("EXECUTION-ERROR", asset_type, token_id, {
-                    "reason": "limit_order_placement_failed",
-                    "group_id": group_id,
-                })
 
         fills: Dict[str, float] = {tid: 0.0 for tid in orders}
         poll_interval = max(0.01, min(1.0, timeout_seconds / 10.0)) if timeout_seconds > 0 else 0.0
         deadline = time.monotonic() + timeout_seconds
 
+        placed = [order for order in orders.values() if order is not None]
         while True:
-            self.paper.check_pending_limit_orders()
+            filled_by_order = self.venue.poll_limit_orders(placed)
             for token_id, order in orders.items():
                 if order is not None:
-                    fills[token_id] = self.paper.get_position_shares(
-                        order["market_condition_id"], order["outcome"],
-                    )
+                    fills[token_id] = float(filled_by_order.get(order.id, 0.0))
             if fills and all(filled > 0 for filled in fills.values()):
                 break
             if time.monotonic() >= deadline:
@@ -752,17 +183,15 @@ class TradeExecutor:
         unfilled = [tid for tid, filled in fills.items() if filled <= 0]
 
         if unfilled:
-            # Cancel every order, matching _execute_live_arbitrage_group's
-            # structure — cancelling one that already filled is a harmless
-            # no-op (pm_trader's check_orders() already removed it from
-            # "pending" via mark_filled(); it doesn't retract the fill).
-            for order in orders.values():
-                if order is not None:
-                    self.paper.cancel_limit_order(order["id"])
+            # Cancel every order -- cancelling one that already filled is a
+            # harmless no-op (it doesn't retract the fill).
+            cancel_rows = _order_rows(log_func, asset_type, reason="partial_fill_no_arb", group_id=group_id)
+            for order in placed:
+                self.venue.cancel_limit_order(order, log_func=cancel_rows)
 
             for token_id in unfilled:
                 log_func("REJECTED", asset_type, token_id, {
-                    "reason": "limit_order_not_filled",
+                    "reason": reasons.not_filled,
                     "group_id": group_id,
                     "timeout_seconds": timeout_seconds,
                 })
@@ -774,24 +203,13 @@ class TradeExecutor:
                 "fills": fills,
             })
 
-            # Shares that did fill before the group was voided are real,
-            # unretractable trades (cancel only stops further fills) —
-            # they still count against this strategy's daily trade count,
-            # same as the live path.
-            for token_id, filled in fills.items():
-                if filled > 0:
-                    self._record_strategy_trade(strategy_tag)
-
             return {"success": False, "arb_sets": 0, "fills": fills, "unfilled": unfilled, "surplus": {}}
 
         arb_sets = min(fills.values())
         surplus = {tid: round(filled - arb_sets, 4) for tid, filled in fills.items() if filled > arb_sets}
 
-        for _token_id in fills:
-            self._record_strategy_trade(strategy_tag)
-
         log_func("ARBITRAGE-FILL", asset_type, group_id or "group", {
-            "reason": "all_legs_filled_via_limit_order",
+            "reason": reasons.all_filled,
             "group_id": group_id,
             "fills": fills,
             "arb_sets": arb_sets,
@@ -805,7 +223,6 @@ class TradeExecutor:
         legs: List[Dict[str, Any]],
         timeout_seconds: float,
         log_func: Callable,
-        strategy_tag: str = "arbitrage",
     ) -> Dict[str, Any]:
         """Place limit orders for every leg of an arbitrage group, wait up
         to timeout_seconds for fills, then settle the group:
@@ -821,18 +238,10 @@ class TradeExecutor:
         per-leg keys `bet_amount_usd`, `asset_type`, `no_token_id`, and
         `group_id` (read from the first leg) enrich logging.
 
-        Dry-run/paper with a real PaperAdapter available: legs are executed
-        via _execute_paper_limit_arbitrage_group() — limit orders against
-        pm_trader's simulated order book, capping the price paid per leg
-        instead of walking the book as deep as it takes (see that method's
-        docstring for why: real trade data showed 100% of this strategy's
-        cost overhead was slippage from that walk).
-
-        Dry-run/paper with no PaperAdapter (pm_trader not installed): falls
-        back to _simulate_full_fill_arbitrage_group()'s log-only
-        simulation — there's no real order book to place anything against
-        in this degraded mode, so it just logs the group structure and
-        reuses execute_trade()'s existing "no paper adapter" behavior.
+        Legs are limit orders on the active venue (paper or live), capping
+        the price paid per leg instead of walking the book as deep as it
+        takes (real trade data showed 100% of this strategy's cost overhead
+        was slippage from that walk).
         """
         if not legs:
             return {"success": False, "arb_sets": 0, "fills": {}, "unfilled": [], "surplus": {}}
@@ -840,25 +249,9 @@ class TradeExecutor:
         asset_type = str(legs[0].get("asset_type") or "Arbitrage")
         group_id = legs[0].get("group_id")
 
-        if self.dry_run or self.client is None:
-            if self.paper is not None:
-                return await self._execute_paper_limit_arbitrage_group(
-                    legs, float(timeout_seconds), log_func, strategy_tag, asset_type, group_id,
-                )
-            return self._simulate_full_fill_arbitrage_group(legs, log_func, asset_type, group_id, strategy_tag)
-
-        return await self._execute_live_arbitrage_group(
-            legs, float(timeout_seconds), log_func, strategy_tag, asset_type, group_id,
+        return await self._execute_limit_arbitrage_group(
+            legs, float(timeout_seconds), log_func, asset_type, group_id,
         )
-
-    def _strategy_max_daily_trades(self, strategy_tag: str) -> int:
-        """Per-strategy daily trade cap (see core/trading_config.py).
-        Unrecognized strategy tags fall back to the global max_daily_trades."""
-        if strategy_tag == "arbitrage":
-            return int(getattr(self.config, "arbitrage_max_daily_trades", self.config.max_daily_trades))
-        if strategy_tag == "crypto":
-            return int(getattr(self.config, "crypto_max_daily_trades", self.config.max_daily_trades))
-        return int(self.config.max_daily_trades)
 
     def evaluate_and_execute(
         self,
@@ -869,44 +262,26 @@ class TradeExecutor:
         bet_amount_usd: float,
         side: str,
         log_func: Callable,
-        strategy_tag: str = "crypto",
-    ) -> bool:
-        """Gate on EV + daily limit + price bounds, then fire the order."""
+    ) -> Optional[PlacedEntry]:
+        """Gate on EV + price bounds, then fire the order. The PlacedEntry
+        if the Venue accepted it, else None. Daily spend and trade-count
+        limits are the Account's (Account.reserve()), checked by the caller
+        before sizing."""
         asset_type = market.asset_type
         token_id = market.market_id
-        execution_side = str(side or "YES").upper()
+        execution_side = normalize_side(side)
 
-        execution_token_id = token_id
-        execution_price = float(current_poly_price)
+        execution_token_id = MarketRef.from_market(market).token_for(execution_side)
+        execution_price = side_price(current_poly_price, execution_side)
         execution_fair_value = float(fair_value)
         if execution_side == "NO":
-            execution_token_id = str(getattr(market, "no_market_id", None) or token_id)
-            execution_price = max(1e-6, 1.0 - float(current_poly_price))
             execution_fair_value = 1.0 - float(fair_value)
 
         if ev < self.config.min_ev:
-            return False
-
-        strategy_max_daily_trades = self._strategy_max_daily_trades(strategy_tag)
-        if self.trades_by_strategy.get(strategy_tag, 0) >= strategy_max_daily_trades:
-            log_func("RISK", asset_type, token_id,
-                     f"Daily trade limit ({strategy_max_daily_trades}) reached for {strategy_tag}")
-            return False
-
-        # Belt-and-suspenders hard ceiling: the check above only compares
-        # against this strategy's own allocation. Per-strategy caps
-        # (crypto_max_daily_trades, arbitrage_max_daily_trades) can be
-        # configured to sum higher than the account-wide MAX_DAILY_TRADES —
-        # TradingConfig only warns about that, it never clamps it — so this
-        # makes the global cap an actual ceiling no strategy can bypass via
-        # its own generous per-strategy bucket.
-        if self.trade_count_today >= int(self.config.max_daily_trades):
-            log_func("RISK", asset_type, token_id,
-                     f"Global daily trade limit ({self.config.max_daily_trades}) reached")
-            return False
+            return None
 
         if not self._validate_market(market, log_func):
-            return False
+            return None
 
         if execution_price < PRICE_FLOOR or execution_price > PRICE_CEILING:
             log_func("EXECUTION", asset_type, execution_token_id, {
@@ -916,18 +291,18 @@ class TradeExecutor:
                 "price_floor": PRICE_FLOOR,
                 "price_ceiling": PRICE_CEILING,
             })
-            return False
+            return None
 
         if execution_price <= 0:
             log_func("EXECUTION", asset_type, execution_token_id,
                      f"Invalid market price for execution: {execution_price}")
-            return False
+            return None
 
-        shares = math.floor((bet_amount_usd / execution_price) * 100.0) / 100.0
-        if shares <= 0:
+        shares = whole_cent_shares(bet_amount_usd, execution_price)
+        if not shares or shares <= 0:
             log_func("EXECUTION", asset_type, execution_token_id,
                      f"Calculated zero shares for bet_amount_usd={bet_amount_usd}")
-            return False
+            return None
 
         log_func("AUTO-TRADE", asset_type, execution_token_id, {
             "market_price": execution_price,
@@ -941,7 +316,6 @@ class TradeExecutor:
         executed = self.execute_trade(
             token_id=token_id,
             current_poly_price=float(current_poly_price),
-            shares=shares,
             bet_amount=bet_amount_usd,
             asset_type=asset_type,
             side=execution_side,
@@ -950,10 +324,11 @@ class TradeExecutor:
             condition_id=getattr(market, "condition_id", None),
             slug=getattr(market, "slug", None),
         )
-        if executed:
-            self.trade_count_today += 1
-            self.trades_by_strategy[strategy_tag] = self.trades_by_strategy.get(strategy_tag, 0) + 1
-        return bool(executed)
+        if not executed:
+            return None
+        return PlacedEntry(token_id=execution_token_id, side=execution_side,
+                           price=execution_price, shares=shares,
+                           order_id=str(executed.id) if isinstance(executed, LimitOrder) else None)
 
     def _validate_market(self, market: MarketData, log_func: Callable) -> bool:
         for field_name, field_value in [
@@ -966,7 +341,3 @@ class TradeExecutor:
                 log_func("VALIDATE", "Market", "Unknown", f"Missing {field_name}")
                 return False
         return True
-
-    def reset_daily_count(self):
-        self.trade_count_today = 0
-        self.trades_by_strategy = {}
