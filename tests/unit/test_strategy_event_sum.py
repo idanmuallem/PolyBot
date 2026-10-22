@@ -51,7 +51,7 @@ async def test_underpriced_event_emits_one_signal_per_leg():
     assert all(s.side == "YES" for s in signals)
     assert all(s.strategy_type == "arbitrage" for s in signals)
     assert {s.market.market_id for s in signals} == {"tokA", "tokB", "tokC"}
-    assert {s.price for s in signals} == {0.30, 0.25, 0.30}
+    assert {s.price for s in signals} == {0.30, 0.25}
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -114,7 +114,8 @@ def test_exit_position_stops_retrying_after_max_attempts():
     executor.sell_position.return_value = False
 
     log_calls = []
-    log_func = lambda level, asset_type, token_id, payload: log_calls.append(payload)
+    def log_func(level, asset_type, token_id, payload):
+        return log_calls.append(payload)
 
     for _ in range(MAX_EXIT_ATTEMPTS + 5):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
@@ -128,7 +129,8 @@ def test_exit_position_stops_retrying_after_max_attempts():
 def test_exit_position_retry_count_resets_after_a_successful_sell():
     pm, bridge, executor = _make_pm()
     pos = _pos(pnl_ratio=-1.0, token_id="flaky_tok")
-    log_func = lambda *a, **kw: None
+    def log_func(*a, **kw):
+        return None
 
     executor.sell_position.return_value = False
     for _ in range(MAX_EXIT_ATTEMPTS - 1):
@@ -154,7 +156,8 @@ def test_gave_up_in_live_mode_logs_expired_flag():
     executor.sell_position.return_value = False
 
     log_calls = []
-    log_func = lambda level, asset_type, token_id, payload: log_calls.append((level, payload))
+    def log_func(level, asset_type, token_id, payload):
+        return log_calls.append((level, payload))
 
     for _ in range(MAX_EXIT_ATTEMPTS):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
@@ -177,7 +180,8 @@ def test_gave_up_in_dry_run_mode_does_not_log_expired():
     executor.sell_position.return_value = False
 
     log_levels = []
-    log_func = lambda level, *a, **kw: log_levels.append(level)
+    def log_func(level, *a, **kw):
+        return log_levels.append(level)
 
     for _ in range(MAX_EXIT_ATTEMPTS):
         pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -1.0}, log_func)
@@ -194,7 +198,8 @@ def test_successful_live_exit_never_logs_expired():
     executor.sell_position.return_value = True
 
     log_levels = []
-    log_func = lambda level, *a, **kw: log_levels.append(level)
+    def log_func(level, *a, **kw):
+        return log_levels.append(level)
     pm._exit_position(pos, "STOP-LOSS", -0.5, {"pnl_ratio": -0.60}, log_func)
 
     assert log_levels == ["STOP-LOSS"]
@@ -554,7 +559,8 @@ def test_dead_position_retry_cap_spans_cull_swap_and_rule_exits(ledger):
     _enter(ledger, "dead_tok", post_prob=0.50)
     executor.get_open_positions.return_value = [_pos(pnl_ratio=-1.0, token_id="dead_tok")]
     executor.sell_position.return_value = False
-    noop = lambda *a, **kw: None
+    def noop(*a, **kw):
+        return None
 
     for _ in range(3):
         pm.optimize_for_candidate(new_candidate_ev=1.0, log_func=noop)  # portfolio cull
@@ -603,7 +609,8 @@ def _expired(rows):
 def test_cull_that_gives_up_in_live_run_records_the_expiry(ledger):
     pm, executor, pos = _live_dead_position(ledger)
     rows = []
-    log_func = lambda level, asset_type, token_id, payload: rows.append((level, payload))
+    def log_func(level, asset_type, token_id, payload):
+        return rows.append((level, payload))
 
     for _ in range(MAX_EXIT_ATTEMPTS):
         pm._liquidate_position_value(pos, log_func)
@@ -618,7 +625,8 @@ def test_free_up_capital_that_gives_up_in_live_run_records_the_expiry(ledger):
     pm, executor, pos = _live_dead_position(ledger)
     executor.get_open_positions.return_value = [pos]
     rows = []
-    log_func = lambda level, asset_type, token_id, payload: rows.append((level, payload))
+    def log_func(level, asset_type, token_id, payload):
+        return rows.append((level, payload))
 
     for _ in range(MAX_EXIT_ATTEMPTS):
         pm.free_up_capital(100.0, log_func)

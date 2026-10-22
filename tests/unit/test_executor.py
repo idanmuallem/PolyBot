@@ -186,7 +186,7 @@ def test_no_side_uses_no_token_id():
         side="NO",
         log_func=lambda level, asset, token, *a, **kw: log_calls.append((level, token)),
     )
-    dry_run_entries = [(l, t) for l, t in log_calls if l == "DRY-RUN"]
+    dry_run_entries = [(level, t) for level, t in log_calls if level == "DRY-RUN"]
     assert dry_run_entries, "DRY-RUN log not found"
     assert dry_run_entries[0][1] == "tok1_no"
 

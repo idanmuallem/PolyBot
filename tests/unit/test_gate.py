@@ -1,6 +1,6 @@
 """Gate.can_enter: one entry-eligibility check for model markets and
 arbitrage baskets, backed by Ledger holdings and the post-exit cooldown."""
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
