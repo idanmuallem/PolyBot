@@ -1,6 +1,6 @@
 name: Meta-harness
 
-# Validates the live, running system after a deploy — not the code, the
+# Validates the running system after a deploy — not the code, the
 # actual deployed thing. Reports pass/fail clearly; does NOT roll anything
 # back (the deploy already happened by the time this runs). Called from
 # deploy.yml once per environment:
@@ -14,10 +14,6 @@ name: Meta-harness
 on:
   workflow_call:
     inputs:
-      environment:
-        description: "Name used in the job summary and email (Staging or Production)"
-        required: true
-        type: string
       container:
         description: "Container name on the EC2 host"
         required: true
@@ -27,7 +23,7 @@ on:
         required: true
         type: string
       deployment_env:
-        description: "DEPLOYMENT_ENV the container must report (staging or production)"
+        description: "DEPLOYMENT_ENV the container must report (staging or production); also names the environment in the job summary"
         required: true
         type: string
       dashboard_url:
@@ -39,10 +35,15 @@ on:
         required: false
         default: false
         type: boolean
-      check_history:
-        description: "Run the 'Trade history not wiped' check"
+      check_history_not_wiped:
+        description: "Run the 'Trade history not wiped' check against hunt_history_before"
         required: false
         default: true
+        type: boolean
+      record_baseline:
+        description: "Record the hunt_history row count after the checks as output hunt_history_count"
+        required: false
+        default: false
         type: boolean
       hunt_history_before:
         description: "Pre-deploy hunt_history row count for the 'not wiped' check"
@@ -137,7 +138,7 @@ jobs:
     # history is wiped on purpose every deploy).
     - name: Check hunt_history row count did not drop
       id: hunt_history
-      if: inputs.check_history
+      if: inputs.check_history_not_wiped
       continue-on-error: true
       env:
         BEFORE: ${{ inputs.hunt_history_before }}
@@ -160,7 +161,7 @@ jobs:
     # one of the checks.
     - name: Record hunt_history row count (baseline)
       id: count
-      if: ${{ !inputs.check_history }}
+      if: inputs.record_baseline
       continue-on-error: true
       run: |
         COUNT=$(bash config/ci/ssm_run.sh "docker exec $CONTAINER python3 config/ci/count_hunt_history.py 2>/dev/null || echo unknown")
@@ -173,14 +174,15 @@ jobs:
     - name: Evaluate meta-harness results
       id: evaluate
       env:
-        ENVIRONMENT: ${{ inputs.environment }}
-        CHECK_HISTORY: ${{ inputs.check_history }}
+        DEPLOYMENT_ENV: ${{ inputs.deployment_env }}
+        CHECK_HISTORY: ${{ inputs.check_history_not_wiped }}
         R_DASHBOARD: ${{ steps.dashboard.outcome }}
         R_CONFIG: ${{ steps.config_drift.outcome }}
         R_ENGINE: ${{ steps.engine_freshness.outcome }}
         R_LOGS: ${{ steps.logs.outcome }}
         R_HISTORY: ${{ steps.hunt_history.outcome }}
       run: |
+        ENVIRONMENT="${DEPLOYMENT_ENV^}"   # staging -> Staging, production -> Production
         echo "Meta-harness: $ENVIRONMENT" | tee -a "$GITHUB_STEP_SUMMARY"
         FAILED=""
         check() {

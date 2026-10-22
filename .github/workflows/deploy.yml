@@ -12,15 +12,6 @@ permissions:
   id-token: write   # Required for AWS OIDC authentication
   contents: read    # Required to checkout code
 
-# A newer push to main supersedes an older run: it cancels the older run
-# whether it is still deploying or waiting on the Production approval / 24h
-# timer, so Production only ever gets a version that ran a full day on
-# Staging, and the 24 hours restart. Every other run (branch pushes, PRs)
-# gets a group of its own, so it never cancels main's run or another run.
-concurrency:
-  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'deploy-main' || format('run-{0}', github.run_id) }}
-  cancel-in-progress: true
-
 env:
   AWS_REGION: eu-north-1
   ECR_REPOSITORY: polybot/main
@@ -95,8 +86,16 @@ jobs:
   # triggers) and stops there, same as before this workflow grew a test job.
   #
   # Runtime pushes to main then go: build -> deploy-staging -> verify-staging
-  # -> deploy-production -> meta-harness. Each job needs the one before, so a
-  # failure anywhere (including a failed Staging check) stops Production.
+  # -> approve-production -> deploy-production -> meta-harness. Each job needs
+  # the one before, so a failure anywhere (including a failed Staging check)
+  # stops Production.
+  #
+  # Superseding is per job, not per run (there is no workflow-level
+  # concurrency group): only a newer *runtime* run that reaches
+  # approve-production cancels an older run's pending approval, and nothing
+  # cancels a deploy that is already running. A docs-only push stops after
+  # `changes` and cancels nothing, so it cannot strand a runtime change that
+  # is waiting for Production.
   build:
     needs: [test, changes]
     # A custom `if:` on a job with `needs:` REPLACES the implicit success()
@@ -137,6 +136,12 @@ jobs:
     needs: build
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Two Staging deploys never overlap: a newer one waits for the running one
+    # to finish instead of cancelling it mid-deploy (SSM would keep running on
+    # the host anyway).
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -172,27 +177,59 @@ jobs:
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/meta-harness.yml
     with:
-      environment: Staging
       container: polybot-staging
       env_file: /home/ec2-user/.env.staging
       deployment_env: staging
       dashboard_url: http://localhost:8502
       dashboard_from_host: true
-      check_history: false
+      check_history_not_wiped: false
+      record_baseline: true
 
-  # Production deploys only after Staging passed, and runs the same
-  # SHA-tagged image Staging ran. The `production` GitHub environment holds
-  # the job until the owner approves and a 24-hour wait timer has run out
-  # (repo admins may bypass the timer in an emergency; see README,
-  # Deployment > Production gate). Its first step then checks Staging's
-  # trade history did not shrink during those 24 hours.
-  deploy-production:
+  # The Production gate. The `production` GitHub environment holds this job
+  # until the owner approves and a 24-hour wait timer has run out (repo
+  # admins may bypass the timer in an emergency; see README, Deployment >
+  # Production gate). It does nothing else: no checkout, no AWS.
+  #
+  # The environment sits here and not on deploy-production on purpose: a job
+  # with `environment:` gets the OIDC subject `repo:...:environment:production`
+  # instead of `repo:...:ref:refs/heads/main`, which the AWS role's trust
+  # policy may not accept. deploy-production keeps the ref-based subject.
+  #
+  # Its concurrency group supersedes: when a newer runtime run's Staging
+  # passes and it reaches this job, the older run's pending approval is
+  # cancelled (no failure email), so the 24 hours restart with the newer
+  # commit. An approval already granted is not affected. Between a newer
+  # Staging deploy and the newer run reaching this gate, the older approval
+  # is still pending; if it is approved then, deploy-production's Staging
+  # history check fails closed, since Staging no longer runs the older SHA.
+  approve-production:
     needs: verify-staging
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions: {}
     environment:
       name: production
       url: ${{ env.DASHBOARD_URL }}
+    concurrency:
+      group: approve-production
+      cancel-in-progress: true
+    steps:
+    - name: Production approved
+      run: echo "Production approved for ${{ github.sha }}"
+
+  # Production deploys only after the gate above, and runs the same
+  # SHA-tagged image Staging ran. Its first step checks Staging still runs
+  # this commit and its trade history did not shrink during the 24 hours.
+  deploy-production:
+    needs: [verify-staging, approve-production]
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Two Production deploys never overlap, and a running one is never
+    # cancelled (SSM would keep running on the host, and the Production
+    # meta-harness and failure email would never run).
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
     outputs:
       hunt_history_before: ${{ steps.pre_snapshot.outputs.count }}
       failed_checks: ${{ steps.gate_result.outputs.failed_checks }}
@@ -213,9 +250,12 @@ jobs:
     - name: Ensure EC2 instance is running
       run: bash config/ci/ensure_ec2_running.sh
 
-    # The Production gate: Staging still runs this commit's image and its
-    # hunt_history row count is not below the baseline verify-staging
-    # recorded. See config/ci/check_staging_history.sh.
+    # The Production gate's history check: Staging still runs this commit's
+    # image and its hunt_history row count is not below the baseline
+    # verify-staging recorded. It fails closed if a newer run has since
+    # replaced Staging, which is what makes an older approval granted before
+    # the newer run reached approve-production harmless. See
+    # config/ci/check_staging_history.sh.
     - name: Check Staging history did not shrink
       id: staging_history
       env:
@@ -256,7 +296,7 @@ jobs:
     # hunt_history row-count drop on an ordinary deploy.
     #
     # The container runs the image tagged with this commit's SHA, not
-    # `:latest`, so `docker ps` shows exactly which build is live. The prune
+    # `:latest`, so `docker ps` shows exactly which build is running. The prune
     # is `docker image prune -a`, not `docker system prune -a`: it removes
     # only images no container uses, so it never deletes the image another
     # running container (e.g. Staging) is on.
@@ -324,7 +364,6 @@ jobs:
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/meta-harness.yml
     with:
-      environment: Production
       container: polybot
       env_file: /home/ec2-user/.env
       deployment_env: production
@@ -338,11 +377,15 @@ jobs:
   # (Staging, Production gate, ...), add it to `needs` below; the failed-job
   # list is derived from `needs` generically, nothing else to change.
   notify-failure:
-    needs: [test, changes, build, deploy-staging, verify-staging, deploy-production, meta-harness]
+    needs: [test, changes, build, deploy-staging, verify-staging, approve-production, deploy-production, meta-harness]
     # failure() on a job is true when any job in `needs` failed. Skipped jobs
-    # (PRs, non-main pushes) and cancelled runs (superseded by a newer push)
-    # do not count as failures, so they send nothing.
-    if: failure()
+    # (docs-only pushes, deploy jobs on non-main pushes) and cancelled jobs
+    # (a pending Production approval superseded by a newer run) do not count
+    # as failures, so they send nothing. Push events only, on any branch: a PR runs the same commit
+    # its branch push already ran, so emailing on both would send two emails
+    # for one bad commit. Branch pushes still email, so a deliberate-failure
+    # CI VERIFICATION commit on a branch is reported.
+    if: failure() && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
     - name: Name the failed job(s)
@@ -394,6 +437,6 @@ jobs:
 
           Nothing is rolled back automatically. If a deploy job failed, the
           deploy may be partial; if the meta-harness failed, the deploy already
-          completed and the live system failed validation.
+          completed and the deployed system failed validation.
 
           Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
