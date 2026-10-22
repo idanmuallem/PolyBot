@@ -474,7 +474,7 @@ waiting for Production approval, so the 24 hours restart with the new commit.
 Branch and PR runs never cancel `main`'s run, nor it theirs.
 
 The image is tagged with the commit SHA and the container runs that SHA-tagged
-image, so `docker ps` on the instance shows which commit is live.
+image, so `docker ps` on the instance shows which commit is running.
 
 The deploy step stops/removes the old container and prunes unused Docker images
 (any image a container still uses is kept) before starting the new one, so

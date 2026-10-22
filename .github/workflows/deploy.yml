@@ -256,7 +256,7 @@ jobs:
     # hunt_history row-count drop on an ordinary deploy.
     #
     # The container runs the image tagged with this commit's SHA, not
-    # `:latest`, so `docker ps` shows exactly which build is live. The prune
+    # `:latest`, so `docker ps` shows exactly which build is running. The prune
     # is `docker image prune -a`, not `docker system prune -a`: it removes
     # only images no container uses, so it never deletes the image another
     # running container (e.g. Staging) is on.
@@ -393,6 +393,6 @@ jobs:
 
           Nothing is rolled back automatically. If a deploy job failed, the
           deploy may be partial; if the meta-harness failed, the deploy already
-          completed and the live system failed validation.
+          completed and the deployed system failed validation.
 
           Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

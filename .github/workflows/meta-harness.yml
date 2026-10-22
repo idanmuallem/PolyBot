@@ -1,6 +1,6 @@
 name: Meta-harness
 
-# Validates the live, running system after a deploy — not the code, the
+# Validates the running system after a deploy — not the code, the
 # actual deployed thing. Reports pass/fail clearly; does NOT roll anything
 # back (the deploy already happened by the time this runs). Called from
 # deploy.yml once per environment:
