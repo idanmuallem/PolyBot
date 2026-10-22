@@ -11,7 +11,7 @@ import pytest
 pytest.importorskip("pm_trader")
 
 from core.trading_config import TradingConfig
-from tests.venue_harness import PmTraderMarketStub, make_paper_venue
+from tests.venue_harness import make_paper_venue
 from trading.paper_venue import PaperVenue
 from trading.venue import MarketRef
 

@@ -2,7 +2,7 @@
 model-driven trades, tagged with strategy_type for separate tracking."""
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -66,9 +66,10 @@ def _make_pipeline(balance=100.0, config=None, venue=None, ledger=None):
     ctx = WalletContext(wallet_id="test_wallet", config=config, bridge=bridge, db_path="test_wallet_trades.db")
     ctx.ledger = ledger
     log_calls = []
-    log_func = lambda level, asset_type, token_id, payload: log_calls.append(
-        {"level": level, "asset_type": asset_type, "token_id": token_id, "payload": payload}
-    )
+    def log_func(level, asset_type, token_id, payload):
+        return log_calls.append(
+            {"level": level, "asset_type": asset_type, "token_id": token_id, "payload": payload}
+        )
 
     with patch("trading.executor.TradeExecutor.get_open_positions", return_value=[]), \
          patch("trading.executor.TradeExecutor.get_balance", return_value=balance):

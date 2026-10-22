@@ -42,7 +42,8 @@ def main():
         "SELECT timestamp, level, payload FROM hunt_history "
         "WHERE level IN ('REJECTED','FILTERED','SCAN-SKIP') ORDER BY timestamp").fetchall()
     # normalise "T" separators so string comparison against the cutoff works
-    norm = lambda t: str(t).replace("T", " ")
+    def norm(t):
+        return str(t).replace("T", " ")
 
     for label, sel in (("BEFORE", lambda t: norm(t) < cutoff), ("AFTER", lambda t: norm(t) >= cutoff)):
         part = [(t, lv, parse(p)) for t, lv, p in rows if sel(t)]

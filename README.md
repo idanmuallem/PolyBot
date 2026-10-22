@@ -189,7 +189,8 @@ PolyBot/
 │
 ├── config/
 │   ├── .env                    # Deployment credentials and runtime settings
-│   ├── requirements.txt        # Python dependencies
+│   ├── requirements.txt        # Runtime dependencies (installed in the image)
+│   ├── requirements-dev.txt    # Runtime + test dependencies (local dev and CI)
 │   └── Docker/
 │       ├── Dockerfile
 │       └── docker-compose.yml
@@ -312,12 +313,22 @@ python -m venv .venv
 # source .venv/bin/activate   # macOS/Linux
 
 # 3. Install dependencies
-pip install -r config/requirements.txt
+pip install -r config/requirements-dev.txt
 
 # 4. Configure credentials
 cp config/.env config/.env.local   # or edit config/.env directly
 # Fill in POLYMARKET_PRIVATE_KEY and POLYMARKET_PROXY_ADDRESS
 ```
+
+### Pre-commit Hooks
+
+Install the git hooks once per clone (`pre-commit` comes with `config/requirements-dev.txt`):
+
+```bash
+pre-commit install
+```
+
+Every commit then runs four checks from `.pre-commit-config.yaml` and is rejected if any fails: leftover merge-conflict markers, files over 500 KB (so a local database like `trades.db` is never committed), private keys, and `ruff check` on the changed files. The ruff hook reads the same `ruff.toml` and ruff version as CI. Run them on every file with `pre-commit run --all-files`.
 
 ---
 
@@ -443,20 +454,118 @@ persisted the same way, so paper positions/balance survive a container restart.
 
 ### GitHub Actions (CI/CD)
 
-Pushing to `main` triggers `.github/workflows/deploy.yml`:
+Pushing to `main` triggers `.github/workflows/deploy.yml`. A push that changes
+runtime code then goes through these jobs, each waiting for the one before:
 
-1. Builds the Docker image
-2. Pushes to Amazon ECR (`eu-north-1`)
-3. Starts the EC2 instance if stopped
-4. Deploys via AWS SSM (`docker compose pull && up -d`)
+1. `build`: builds the Docker image and pushes it to Amazon ECR (`eu-north-1`)
+2. `deploy-staging`: replaces the Staging container (see below). If the EC2
+   instance is stopped it deploys nothing and the rest of the run is skipped
+   (green, not failed): the pipeline never starts the instance, since that
+   would also bring Production's container back. Start it by hand, then
+   re-run the workflow to deploy.
+3. `verify-staging`: runs the meta-harness against Staging
+4. `approve-production`: waits in the `production` environment for the 24-hour
+   timer and the owner's Approve (see [Production gate](#production-gate))
+5. `deploy-production`: checks Staging's trade history did not shrink, then
+   replaces the Production container via AWS SSM
+6. `meta-harness`: runs the meta-harness against Production
 
-The deploy step stops/removes the old container and prunes the Docker filesystem
-before starting the new one, so anything not explicitly volume-mounted is wiped
+If any of them fails, the jobs after it are skipped (so a failing Staging check
+stops Production) and the owner gets a failure email: GitHub's own "workflow
+failed" notification, plus a Gmail email naming the failed job and check when
+the `GMAIL_USERNAME` / `GMAIL_APP_PASSWORD` repo secrets are set (it is skipped
+without them).
+
+Runs are never cancelled as a whole. A newer runtime push supersedes an older
+one only at the Production gate (see [Production gate](#production-gate)), and
+a deploy that is already running is never cancelled: two Staging deploys, or
+two Production deploys, run one after the other. A docs-only push cancels
+nothing.
+
+The image is tagged with the commit SHA and the container runs that SHA-tagged
+image, so `docker ps` on the instance shows which commit is running.
+
+The deploy step stops/removes the old container and prunes unused Docker images
+(any image a container still uses is kept) before starting the new one, so
+anything not explicitly volume-mounted is wiped
 on every push. Two host paths are mounted into the container to survive that:
 `/home/ec2-user/trades.db` → `/app/trades.db` and `/home/ec2-user/paper_trading`
 → `/app/paper_trading` (the latter holds the paper engine's positions/balance
 and the token→slug map — losing it silently resets the paper equity curve and
 orphans open paper positions on every deploy).
+
+### Staging
+
+Staging is a second container, `polybot-staging`, on the same EC2 instance as
+Production. It runs the same SHA-tagged image Production will get, with:
+
+- its dashboard on port **8502** (`http://<elastic IP>:8502`), open only to the
+  owner's IP
+- the env file `/home/ec2-user/.env.staging`, plus `DEPLOYMENT_ENV=staging`
+  set by the deploy. With that marker the bot refuses to start in Live run
+- no wallet key. The deploy refuses to run if the Staging env file sets one
+- its own trade database and paper directory under `/home/ec2-user/staging/`,
+  wiped on every Staging deploy. They are bind-mounted, so they survive a
+  container restart within a run
+
+The meta-harness runs against Staging without the "Trade history not wiped"
+check, since Staging's history is wiped on purpose. Its dashboard check runs on
+the instance itself, since port 8502 is closed to GitHub's runners.
+
+**Owner's one-time manual steps** (the pipeline cannot do these):
+
+1. In the EC2 security group, add an inbound rule for TCP port 8502 with your
+   own IP as the source (`<your IP>/32`), not `0.0.0.0/0`.
+2. On the instance, create `/home/ec2-user/.env.staging` with Dry run and no
+   wallet key. Start from a copy of Production's `.env`, then remove
+   `POLYMARKET_PRIVATE_KEY` / `POLYGON_PRIVATE_KEY` and set
+   `TRADING_MODE=dry_run`:
+
+   ```bash
+   grep -vE '^(POLYMARKET_PRIVATE_KEY|POLYGON_PRIVATE_KEY|TRADING_MODE)=' \
+     /home/ec2-user/.env > /home/ec2-user/.env.staging
+   echo 'TRADING_MODE=dry_run' >> /home/ec2-user/.env.staging
+   chmod 600 /home/ec2-user/.env.staging
+   ```
+
+### Production gate
+
+`approve-production` runs in the GitHub environment `production`, which must be
+set up (Settings > Environments > `production`) with:
+
+- **Required reviewers**: the owner
+- **Wait timer**: 1440 minutes (24 hours)
+- **Allow administrators to bypass configured protection rules**: on
+
+So Production deploys only after Staging passed its meta-harness, 24 hours have
+passed, and the owner clicked Approve. `approve-production` is only the gate:
+it runs no steps that touch AWS. `deploy-production` follows it, and its first
+step fails the job (and emails, naming "Staging history did not shrink") if
+Staging is no longer running this commit's image, if no Staging baseline was
+recorded, or if Staging's `hunt_history` row count is below the baseline
+`verify-staging` recorded. Production then runs the same SHA-tagged image
+Staging ran.
+
+**Superseding:** when a newer runtime push to `main` passes Staging and reaches
+`approve-production`, it cancels the older run's pending approval (no email),
+and the 24 hours restart with the newer commit. An approval already granted,
+and a Production deploy already running, are not cancelled. If an older
+approval is granted after the newer push replaced Staging but before it reached
+the gate, `deploy-production`'s history check fails closed, because Staging no
+longer runs the older commit.
+
+**AWS OIDC:** the environment is on `approve-production`, not on the job that
+assumes the AWS role, by design. A job with `environment: production` presents
+the OIDC subject `repo:idanmuallem/PolyBot:environment:production` instead of
+`repo:idanmuallem/PolyBot:ref:refs/heads/main`, so `deploy-production` keeps
+the same subject as every other deploy job and the IAM role's trust policy
+needs no change.
+
+**Emergency path:** merge the fix to `main` as usual and let `build`,
+`deploy-staging` and `verify-staging` pass. Staging is never skipped. When
+`approve-production` is waiting, open the run and, as repo admin, use the
+bypass option on the pending deployment to start it before the 24 hours are
+up. The Staging history check and the Production meta-harness still run.
 
 Required GitHub secrets: `AWS_ROLE_ARN`, ECR repository URL, EC2 instance ID.
 

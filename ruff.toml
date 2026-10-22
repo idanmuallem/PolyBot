@@ -1,0 +1,21 @@
+# The single ruff configuration: CI's `ruff check` and the pre-commit hook
+# both read this file. Lint only, no `ruff format`.
+target-version = "py312"
+# Lint what CI checks out: skip local-only agent worktrees and scratch files
+# so a local `ruff check .` matches CI.
+extend-exclude = [".agents", ".claude", "scratch"]
+
+[lint]
+# Listed explicitly so a ruff upgrade can't widen the rule set by itself.
+select = [
+    # ruff's classic defaults: pyflakes plus the pycodestyle error subset
+    "E4", "E7", "E9", "F",
+    # A small bug-oriented set
+    "B006",   # mutable default argument
+    "B017",   # pytest.raises(Exception) that catches anything
+    "B018",   # useless expression (a statement that does nothing)
+    "B023",   # closure captures a loop variable late
+    "B033",   # duplicate item in a set literal
+    "PLE",    # pylint errors: code that fails at runtime
+    "RUF006", # asyncio task created and dropped, can be garbage-collected
+]

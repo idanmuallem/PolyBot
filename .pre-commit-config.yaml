@@ -1,0 +1,21 @@
+# Exactly four cheap checks that run before every commit (`pre-commit install`).
+# Anything heavier (the test suite) stays in CI.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # Leftover <<<<<<< / ======= / >>>>>>> lines from a half-resolved merge.
+      # --assume-in-merge checks every commit, not only the merge commit, so
+      # markers carried into a later commit are caught too.
+      - id: check-merge-conflict
+        args: [--assume-in-merge]
+      # Files over 500 KB, so a local database like trades.db is never committed
+      - id: check-added-large-files
+      # PEM private key headers, so a key never lands in this public repo
+      - id: detect-private-key
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Keep in step with ruff in config/requirements-dev.txt so the hook and CI
+    # run the same ruff; both read the repo-root ruff.toml.
+    rev: v0.17.1
+    hooks:
+      - id: ruff-check
